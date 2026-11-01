@@ -16,16 +16,19 @@ from tests.verdicts import CODE_FAIL as FAIL
 from tests.verdicts import CODE_PASS as PASS
 
 
-def line(ident="F1", severity="P2", category="evidence", rule="K-7", location="a.py:1") -> str:
-    return json.dumps(
-        {
-            "finding": ident,
-            "severity": severity,
-            "category": category,
-            "rule": rule,
-            "location": location,
-        }
-    )
+def line(
+    ident="F1", severity="P2", category="evidence", rule="K-7", location="a.py:1", summary=None
+) -> str:
+    obj = {
+        "finding": ident,
+        "severity": severity,
+        "category": category,
+        "rule": rule,
+        "location": location,
+    }
+    if summary is not None:
+        obj["summary"] = summary
+    return json.dumps(obj)
 
 
 def body(*findings: str, headings=None) -> str:
@@ -73,6 +76,21 @@ def test_a_pass_cannot_carry_a_p0_or_p1_finding(severity):
         _finding_lines(text, "PASS")
 
 
+def test_a_finding_line_without_a_summary_still_parses():
+    assert "summary" not in _finding_lines(body(line()), "PASS")[0]
+
+
+def test_a_summary_is_kept_trimmed():
+    found = _finding_lines(body(line(summary="  Old jobs lose a line.  ")), "PASS")
+    assert found[0]["summary"] == "Old jobs lose a line."
+
+
+@pytest.mark.parametrize("summary", ["", "  ", "x" * 161, "two\nlines", 5])
+def test_a_bad_summary_is_rejected(summary):
+    with pytest.raises(ValueError, match="summary"):
+        _finding_lines(body(line(summary=summary)), "PASS")
+
+
 # --- the review step records findings ------------------------------------------------------
 
 
@@ -100,6 +118,26 @@ def test_the_review_record_keeps_the_findings_and_a_bad_block_costs_a_round(unit
     )
     last = unit_env.get().reviews[-1]
     assert not last["ok"] and any("PASS cannot carry" in p for p in last["problems"])
+
+
+@pytest.mark.parametrize("severity", ["P2", "P3"])
+def test_a_pass_with_a_p2_or_p3_finding_needs_a_summary(unit_env, severity):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    assert unit_env.problems() == []
+    unit_env.scenario([{"reply": f"{PASS}\n{body(line(severity=severity))}"}])
+    assert unit_env.run("review") == 0
+    last = unit_env.get().reviews[-1]
+    assert not last["ok"]
+    assert any("F1 needs a summary" in p for p in last["problems"])
+
+
+def test_a_pass_with_a_summary_is_accepted(unit_env):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    assert unit_env.problems() == []
+    unit_env.scenario([{"reply": f"{PASS}\n{body(line(summary='Old jobs lose a line.'))}"}])
+    assert unit_env.run("review") == 0
+    last = unit_env.get().reviews[-1]
+    assert last["ok"] and last["findings"][0]["summary"] == "Old jobs lose a line."
 
 
 # --- the worker's record -------------------------------------------------------------------

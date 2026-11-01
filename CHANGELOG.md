@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Added
+- A review finding line may carry a `summary`, one sentence of at most 160 characters in the owner's words; a `PASS` with a P2 or P3 finding and no `summary` is not accepted. Older records and replies without it still parse (`docs/launch/taskwatch.md`, `docs/review/common.md` C-17).
 - Optional `commit_rules.bullet_one_line` in `jobs-config.json` (off by default): the commit check of a pull request unit fails a body bullet that continues on an indented line (`docs/configuration.md`, "Commit rules"; `docs/checks.md`).
 - The decision brief has a sixth required heading, `## Card`: a conclusion of one or two lines that says whether the owner must decide something, then at most 6 bullets of at most 160 characters, each about one change for the user, with no `file:line` pointer. The check fails more bullets as too big a job. The delivery message does not use it yet.
 - `Changed:` in `taskwatch brief` shows the size of a code job's diff, `Changed: 12 files, +340 -120: a, b, c, d (+8 more)`, from one `git diff --numstat`; a binary file counts as a file and adds no lines.

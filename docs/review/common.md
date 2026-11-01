@@ -69,7 +69,7 @@ P0 and P1 block. P2 and P3 do not. A rule break is P0 only when it is about runt
 
 ## Finding content
 
-**C-17.** A finding states the problem, what triggers it, its impact, whether the evidence is verified or unverified, and the fix, in a neutral tone. Offer a replacement only when it is concrete code or text that can be applied as written. Start each finding with a heading `### F<n>`, number them in order, and name the rule id the finding breaks, or `other` when no rule applies.
+**C-17.** A finding states the problem, what triggers it, its impact, whether the evidence is verified or unverified, and the fix, in a neutral tone. Offer a replacement only when it is concrete code or text that can be applied as written. Start each finding with a heading `### F<n>`, number them in order, and name the rule id the finding breaks, or `other` when no rule applies. A P2 or P3 finding of a `PASS` also has a `summary`: one sentence in the owner's words that says what is wrong for the user, as the owner would read it on a phone. It names no file, line or rule id, and it is not the `location` or the fix. "Old jobs lose their last progress line" is a summary; "brief.py:212 drops the tail" is not.
 
 ## Design questions
 

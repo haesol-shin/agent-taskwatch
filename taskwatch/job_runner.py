@@ -1087,6 +1087,13 @@ def _judge(ctx: Ctx, body: str, snapshot: Mapping) -> dict:
         verdict, blocking, reviewer = _verdict_line(body)
         record.update(verdict=verdict, blocking=blocking, reviewer=reviewer)
         record["findings"] = _finding_lines(body, verdict)
+        if verdict == "PASS":
+            record["problems"] += [
+                f"finding {f['finding']} needs a summary: a PASS shows its {f['severity']} "
+                "findings to the owner"
+                for f in record["findings"]
+                if f["severity"] in {"P2", "P3"} and "summary" not in f
+            ]
         record["checked"], record["not_checked"] = _scope(body)
         if job.review in {"code", "design"}:
             record["design_check"] = _design_check(body, record["findings"])
