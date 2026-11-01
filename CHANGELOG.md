@@ -5,6 +5,7 @@ All notable changes to hermes-taskwatch are documented here. The format is based
 ## [Unreleased]
 
 ### Added
+- The decision brief has a sixth required heading, `## Card`: a conclusion of one or two lines that says whether the owner must decide something, then at most 6 bullets of at most 160 characters, each about one change for the user, with no `file:line` pointer. The check fails more bullets as too big a job. The delivery message does not use it yet.
 - `Changed:` in `taskwatch brief` shows the size of a code job's diff, `Changed: 12 files, +340 -120: a, b, c, d (+8 more)`, from one `git diff --numstat`; a binary file counts as a file and adds no lines.
 - Design reviews judge how a plan is split into units, jobs and lanes (`docs/review/design.md`, "Splitting a plan", rules D-10 to D-18 with checks S1 to S8), and the spec template has a 13th heading, `Units`, that submit enforces like the other twelve.
 - `taskwatch brief` output is at most 80 lines in all, the worker-brief path and the reply template included, and a cut says how many lines were omitted from this output (it used to point at the worker brief, which does not hold the cut text, and ran to 82 lines).
