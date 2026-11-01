@@ -130,7 +130,7 @@ Pass a JSON file to `taskwatch --root <root> submit <file>`. Example:
 or comparisons). Only `code` also runs the work in a Git worktree, because a code review
 reads the Git diff.
 A job with `review` `code` or `design` and a work contract needs a spec that follows
-[docs/spec-template.md](spec-template.md): each of its twelve `## ` headings is present and
+[docs/spec-template.md](spec-template.md): each of its thirteen `## ` headings is present and
 answered, or says `n/a: <reason>`. Submit refuses a missing or empty heading by name, and a
 bare `n/a`. A `source` job and a review-only job skip this check. For these two kinds the
 reviewer's verdict line also carries a `design_check` of eight answers (`root_cause`,

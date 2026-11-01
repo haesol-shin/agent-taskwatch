@@ -327,6 +327,7 @@ SPEC_HEADINGS = (
     "Other users",
     "Writer choices",
     "Writes outside the workspace",
+    "Units",
     "Public text",
 )
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)

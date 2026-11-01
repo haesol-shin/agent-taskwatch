@@ -48,6 +48,10 @@ The reviewer finds your answer by heading. Headings 1, 2, 3, 4, 6, 7, 9 and 10 m
 
 <!-- Each path or system the change writes, deletes or changes outside the work folder, or `none`. The reviewer compares it with the approval scope. -->
 
+## Units
+
+<!-- A table of the units this work splits into, as [Splitting a plan](review/design.md#splitting-a-plan) asks, or `n/a: one unit`. -->
+
 ## Public text
 
 <!-- `public_text: none`, or the list of pull request units with `id`, `base` and `head`. -->

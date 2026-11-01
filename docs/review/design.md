@@ -26,6 +26,41 @@ Use this file with the common guidelines when the deliverable is a design: a pla
 
 **D-8.** When nothing in the design fails its purpose, the decision method, or the scope rules, the verdict is correct and there are no findings.
 
+## Splitting a plan
+
+Use this section when the design carries a table that splits work into units and jobs. Cite a rule by its id and a check by its code (`S1` to `S8`) in the finding. The numbers in the first two rules and the S1 row (400 lines, 10 files, 700 lines, 3 units) are provisional. They are a judgment from Google's "Small CLs" (about 100 lines is usual, 1000 too large), SmartBear's review study (200 to 400 lines at a time) and ten measured jobs of this project (sanitized owner record, 2026-11-01), which do not separate 400 from 700 lines. Change a number here only with a new measurement.
+
+**D-10.** A unit is one logical change and its tests. Aim at no more than 400 added plus deleted lines and 10 files.
+
+**D-11.** A job is what one review can judge: one unit, or at most 3 units that share a check, and at most about 700 lines in total.
+
+**D-12.** Bundle units when one cannot be verified without another, when they edit the same file in turn, or when a unit is a one-line change.
+
+**D-13.** Split a plan into jobs when any one of these holds: a limit of the two rules above is exceeded; the acceptance checks of two units are independent; two units share no file and no output.
+
+**D-14.** Parallel lanes are units that are not predecessors of each other, share no file in the table, and have different output or target folders. A list that is merged by hand and not by file content, such as `CHANGELOG.md`, is not a shared file. A `code` job that builds a result runs in its own worktree, so two such jobs may name the same target repository. Every other kind of job holds the target folder and cannot overlap another job on it. That exception lifts only the target-folder test: two worktrees that edit one file still end in a merge conflict, so the shared-file test applies. The lanes of a level are at most the slots minus the running jobs.
+
+**D-15.** Editing the same file is a predecessor relation. A predecessor with no shared file and no content dependency only sequences work to avoid conflicts, and is a finding.
+
+**D-16.** The unit table is reviewed before work starts, in the same design review pass. A plan without a design job gets a split-only review only when it breaks a request into several pull request units.
+
+**D-17.** An estimate counts only with a file or a function as its basis. Double it: in the measured case the estimates were 2.5 times too low (1240 lines estimated, 3110 actual).
+
+**D-18.** The table has the columns unit, title, real file paths, estimated lines with basis, predecessors with reason, bundling reason and acceptance check. Run `git ls-files` and `grep` on the paths and record the result of each check:
+
+| Check | Fails when |
+|---|---|
+| S1 size | the estimate times 2 is over 400 lines or 10 files for a unit, or a job totals over 700 lines or 3 units, with no written reason |
+| S2 files | two units that are not predecessors of each other share a file outside the merged-by-hand list |
+| S3 predecessor reason | a predecessor has no reason, or units share files and no predecessor |
+| S4 bundle reason | units in one job lack a sentence (not verifiable alone, same files in turn, same acceptance) |
+| S5 too small | a one-sentence or one-line unit sits in its own job while an adjacent unit edits the same file |
+| S6 time | a level of width 2 or more exists and the time was not computed: the agent time of the critical path plus the fixed cost of each job on it, against bundling |
+| S7 verification | a unit has no acceptance check written as a command and its expected output |
+| S8 lanes | a level is wider than the slots minus the running jobs, or two lanes share a target folder, unless both are `code` jobs that build a result in their own worktrees (shared files stay S2) |
+
+S1 to S5 failing is FAIL: the table must be fixed. S6 to S8 fail when there is no evidence for them. A fixed cost per job is not a rule here: it was measured with a five-minute timer and has to be measured again before a threshold is written. Measure it on code jobs without a fix round: wall is the last event minus the first event; agent is the sum, over the work steps, of `step_exit` minus `launched`; the fixed cost is median(wall) minus median(agent). Write a threshold only once ten such jobs are measured.
+
 ## Sources
 
 Generalized from a deliverable-review role and from the rule that a design is judged on purpose, decision method, and whether a simpler approach would do. Provenance is in the [folder README](README.md).

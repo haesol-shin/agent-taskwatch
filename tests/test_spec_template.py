@@ -85,7 +85,7 @@ def test_source_and_review_only_jobs_skip_the_check(tmp_path):
 def test_the_template_file_and_the_check_name_the_same_headings():
     text = (ROOT / "docs" / "spec-template.md").read_text(encoding="utf-8")
     assert tuple(spec_sections(text).keys()) == SPEC_HEADINGS
-    assert len(SPEC_HEADINGS) == 12
+    assert len(SPEC_HEADINGS) == 13
 
 
 # --- the design_check ----------------------------------------------------------------------

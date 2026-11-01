@@ -70,6 +70,10 @@ Use these rules when the assignment names public text: the commit messages, titl
 
 **K-14.** Once the prior blockers are resolved, the verdict must not get worse unless a new blocker has that reason. An unresolved prior blocker stays blocking. Do not broaden the scope, add a new requirement, or raise the severity of an item already reported beyond what resolves it.
 
+## A job with a unit table
+
+When the spec or a work input has a table of units, judge the split with the rules and checks of [Splitting a plan](design.md#splitting-a-plan). Do not copy its numbers here.
+
 ## Sources
 
 Generalized from a read-only code-review brief. The severity scale and the round rules are in the common guidelines. Provenance is in the [folder README](README.md).
