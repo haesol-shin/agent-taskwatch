@@ -235,3 +235,18 @@ def test_the_cli_prints_the_list(ledger: Ledger, capsys) -> None:
     out = capsys.readouterr().out
     assert out.splitlines()[0] == "needs: 1 need you, 0 gate, 0 blocked"
     assert f"job {job_id} research user_wait delivery_unknown" in out
+
+
+def test_a_gate_after_a_design_with_picks_shows_the_reply_template(ledger: Ledger) -> None:
+    work = ledger.tmp / "design-work"
+    work.mkdir()
+    pick = {"id": "a", "options": [{"key": "A"}, {"key": "B"}], "recommended": "A"}
+    (work / "choices.json").write_text(json.dumps({"picks": [pick, pick]}), encoding="utf-8")
+    design = ledger.add(stage="done", review="design", workspace=str(work))
+    gate = ledger.add(
+        stage="approval_wait", wait_reason="approval_required", submit={"predecessors": [design]}
+    )
+    _, text = ledger.list()
+    root = ledger.root.resolve()
+    approve = f"taskwatch --root {root} approve {gate} --reason <your words>"
+    assert f"  decisions: 2 picks   reply: ok | <id>=<key> | text   then: {approve}" in text

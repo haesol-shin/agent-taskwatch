@@ -12,6 +12,8 @@ Use this file with the common guidelines when the deliverable is a design: a pla
 
 **D-4.** Report a structure the purpose does not need. Do not ask for a design gate, a framework, or a process the assignment did not require.
 
+**D-9.** A pick in `choices.json` is an implementation choice that the owner decides. A request for permission, deploy, publish, spending or scope in `picks` is a finding: those belong to the approval scope and the approval gate.
+
 ## Decision method
 
 **D-5.** If you, reading only the deliverable, cannot explain a distinction or a design reason that the conclusions depend on, that is blocking, even when the large shape is clear.

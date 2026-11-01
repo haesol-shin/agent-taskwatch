@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import brief, job_findings, job_text, job_workspace
+from . import brief, choices, job_findings, job_text, job_workspace
 from .checks import checklist_problems, message_problems
 from .evidence import basis_of
 from .executor import _design_check, _finding_lines, _scope, _verdict_line
@@ -732,7 +732,7 @@ def _text_problems(job: JobState, workspace: Path, env: Mapping[str, str]) -> li
     return problems
 
 
-def _file_problems(job: JobState, workspace: Path, folder: Path) -> list[str]:
+def _file_problems(jobs: Jobs, job: JobState, workspace: Path, folder: Path) -> list[str]:
     problems = []
     for base, rel in [*((workspace, item) for item in job.outputs), (folder, job.progress)]:
         path = _inside(base, rel)
@@ -750,8 +750,24 @@ def _file_problems(job: JobState, workspace: Path, folder: Path) -> list[str]:
         for name in UNIT_FILES:
             if not job_text.unit_file(folder, unit["id"], name).is_file():
                 problems.append(f"required file is missing: pr/{unit['id']}/{name}")
-    problems += brief.problems(folder / "brief.md", (workspace, folder, Path(job.target)))
-    return problems
+    return problems + _brief_problems(jobs, job, workspace, folder)
+
+
+def _brief_problems(jobs: Jobs, job: JobState, workspace: Path, folder: Path) -> list[str]:
+    """The brief, and for a design job its `choices.json`; for an implement job after a design
+    job, that the owner's picks reached the brief."""
+    roots = (workspace, folder, Path(job.target))
+    problems = []
+    if choices.is_design(job):
+        if choices.FILE not in job.outputs:
+            problems.append(f"{choices.FILE} must be listed in outputs so the review covers it")
+        problems += choices.problems(workspace, roots, job.outputs)
+    awaiting, listed, unanswered = choices.brief_expectations(jobs, job, workspace)
+    return (
+        problems
+        + unanswered
+        + brief.problems(folder / "brief.md", roots, tuple(awaiting), tuple(listed))
+    )
 
 
 def _kill_group(pid: int) -> None:
@@ -832,7 +848,7 @@ def _check_step(ctx: Ctx) -> int:
     seq = len(job.checks) + len(job.reviews) + 1
     run, problems = _run_command(ctx, seq)
     # After the command: it may have changed or removed what the checks require.
-    problems += _file_problems(job, ctx.workspace, ctx.folder)
+    problems += _file_problems(ctx.jobs, job, ctx.workspace, ctx.folder)
     problems += _text_problems(job, ctx.workspace, ctx.env)
     texts = _public_texts(ctx, problems)
     fingerprint = basis = ""
@@ -995,7 +1011,7 @@ def _evidence_problems(ctx: Ctx, snapshot: Mapping) -> list[str]:
             return ["the public text changed since the check"]
     except (ValueError, OSError) as exc:
         return [f"the public text cannot be read: {exc}"]
-    return _file_problems(job, ctx.workspace, ctx.folder)
+    return _file_problems(ctx.jobs, job, ctx.workspace, ctx.folder)
 
 
 def _requeue(job: JobState) -> dict:

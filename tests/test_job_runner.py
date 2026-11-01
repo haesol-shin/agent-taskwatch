@@ -45,6 +45,10 @@ none
 ## Where to look
 out.txt:1
 """
+CHOICES = (
+    '{"picks": [], "decided": [], "existing_tools": [{"need": "x", "searched": ["a", "b", "c"],'
+    ' "found": []}]}'
+)
 GOOD_FILES = {
     "out.txt": "ok\n",
     "PROGRESS.md": "done\n",
