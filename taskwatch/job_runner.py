@@ -733,7 +733,9 @@ def _basis(job: JobState, folder: Path) -> str:
     return basis_of(Path(job.intent), Path(job.spec), _guidelines(job, folder))
 
 
-def _text_problems(job: JobState, workspace: Path, env: Mapping[str, str]) -> list[str]:
+def _text_problems(
+    job: JobState, workspace: Path, env: Mapping[str, str], bullet_one_line: bool
+) -> list[str]:
     """The common commit message rules for each unit's commits; refs resolve at every check."""
     problems = []
     for unit in job.public_text:
@@ -751,7 +753,10 @@ def _text_problems(job: JobState, workspace: Path, env: Mapping[str, str]) -> li
         if not commits:
             problems.append(f"{name}: no commits in {unit['base']}..{unit['head']}")
         for sha, message in commits:
-            problems += [f"{name}: commit {sha[:7]}: {p}" for p in message_problems(message)]
+            problems += [
+                f"{name}: commit {sha[:7]}: {p}"
+                for p in message_problems(message, bullet_one_line=bullet_one_line)
+            ]
     return problems
 
 
@@ -874,7 +879,7 @@ def _check_step(ctx: Ctx) -> int:
     run, problems = _run_command(ctx, seq)
     # After the command: it may have changed or removed what the checks require.
     problems += _file_problems(ctx.jobs, job, ctx.workspace, ctx.folder)
-    problems += _text_problems(job, ctx.workspace, ctx.env)
+    problems += _text_problems(job, ctx.workspace, ctx.env, ctx.config.bullet_one_line)
     texts = _public_texts(ctx, problems)
     fingerprint = basis = ""
     try:

@@ -1,5 +1,6 @@
 """Pull request units: submit validation and the commit message rules of the check step."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,38 @@ def test_submit_refuses_units_on_a_job_that_builds_no_commits(tmp_path):
         Jobs(tmp_path / "root").submit(data, 10)
 
 
+WRAPPED = "fix: x\n\n- the reason is long\n  and goes on here\n- another\n"
+
+
+def test_a_wrapped_bullet_is_found_only_when_asked():
+    assert message_problems(WRAPPED) == []
+    assert message_problems(WRAPPED, bullet_one_line=True) == [
+        "line 4 continues the bullet on line 3"
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "- one\n- two\n",
+        "* one\n* two\n",
+        "Plain paragraph\n  indented code\n",
+        "- one\n  - nested\n",
+        "- one\n\n  after a blank line\n",
+    ],
+)
+def test_one_line_bullets_and_other_layouts_pass_the_strict_rule(body):
+    assert message_problems(f"fix: x\n\n{body}", bullet_one_line=True) == []
+
+
+def test_every_continuation_line_names_its_bullet():
+    text = "fix: x\n\n* a\n  b\n\tc\n- d\n"
+    assert message_problems(text, bullet_one_line=True) == [
+        "line 4 continues the bullet on line 3",
+        "line 5 continues the bullet on line 3",
+    ]
+
+
 # --- the check step -------------------------------------------------------------------------
 
 
@@ -177,3 +210,12 @@ def test_an_unresolved_head_is_a_check_problem(unit_env):
     unit = {**unit_env.get().public_text[0], "head": "gone"}
     assert unit_env.run("check", public_text=(unit,)) == 0
     assert any("gone" in p for p in unit_env.get().checks[-1]["problems"])
+
+
+def test_the_commit_rule_switch_decides_whether_a_wrapped_bullet_fails(unit_env):
+    unit_env.commit("feat(x): add\n\n- the reason is long\n  and goes on")
+    assert unit_env.problems() == []
+    unit_env.config = replace(unit_env.config, bullet_one_line=True)
+    problems = unit_env.problems()
+    assert len(problems) == 1 and "continues the bullet on line 3" in problems[0]
+    assert unit_env.get().stage == "fix"

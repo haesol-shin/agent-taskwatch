@@ -137,12 +137,21 @@ class JobConfig:
     review_command: tuple[str, ...] | None = None
     env: Mapping[str, str] = field(default_factory=dict)
     branch_prefix: str = DEFAULT_BRANCH_PREFIX
+    bullet_one_line: bool = False
+
+
+COMMIT_RULES = ("bullet_one_line",)
 
 
 def load_job_config(root: Path) -> JobConfig:
     path = root / "taskwatch" / "jobs-config.json"
     obj = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(obj, dict) or set(obj) - {"review_command", "env", "branch_prefix"} != {
+    if not isinstance(obj, dict) or set(obj) - {
+        "review_command",
+        "env",
+        "branch_prefix",
+        "commit_rules",
+    } != {
         "version",
         "slots",
         "stall_seconds",
@@ -166,6 +175,13 @@ def load_job_config(root: Path) -> JobConfig:
     prefix = obj.get("branch_prefix", DEFAULT_BRANCH_PREFIX)
     if not isinstance(prefix, str) or not _PREFIX.fullmatch(prefix):
         raise ValueError("branch_prefix must be letters, digits, '_' and '-' parts joined by '/'")
+    rules = obj.get("commit_rules", {})
+    if not isinstance(rules, dict) or set(rules) - set(COMMIT_RULES):
+        raise ValueError(
+            f"commit_rules is an object with only these keys: {', '.join(COMMIT_RULES)}"
+        )
+    if any(type(value) is not bool for value in rules.values()):
+        raise ValueError("commit_rules values must be true or false")
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -181,6 +197,7 @@ def load_job_config(root: Path) -> JobConfig:
         tuple(obj["review_command"]) if "review_command" in obj else None,
         env,
         prefix,
+        rules.get("bullet_one_line", False),
     )
 
 

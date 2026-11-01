@@ -24,25 +24,22 @@ CI runs the same commands. A pull request must pass all of them.
 
 ## Code style
 
+CI enforces the Ruff rules `E`, `F`, `I`, `C901` (max complexity 15) and line length 100. The rest is the recommended style:
+
 - Python 3.11 or later, no runtime dependencies.
 - Checks are pure functions. Config and state are frozen dataclasses. No inheritance.
 - Keep changes minimal and focused. One function does one thing.
-- Tests must fail when the behavior they cover breaks.
+- Write tests that fail when the behavior they cover breaks.
 - Comments explain why, not what.
-- Ruff rules `E`, `F`, `I`, `C901` (max complexity 15), line length 100.
 
 ## Commits
 
-A commit message explains why the code is the way it is. The diff already shows what changed, so write only what the diff cannot tell a future reader.
+CI does not check commit messages. The recommended form explains why the code is the way it is; the diff already shows what changed.
 
 - Title: [Conventional Commits](https://www.conventionalcommits.org/), `type(scope): summary` in the imperative, in English, 72 characters or fewer (about 50 is best). No trailers.
-- Body: why the code is the way it is. There is no limit on the number of lines or bullets.
-  - Required: the problem or the reason for the change.
-  - Only when useful: a rejected alternative, when another approach looks more natural (`Rejected: ...`).
-  - Only when the title and the diff do not show it: the new behavior, described as behavior, not as a file list.
-  - Each line is 72 characters or fewer.
-- Do not list files, restate the diff, describe the review process, or paste test results. Test results, review and known limits go in the pull request.
-- The job runner checks these rules for the commits of a job's pull request units: title shape and length, one blank line after the title, lines of 72 characters or fewer, no trailer lines. A failure goes back to the worker like any failed check.
+- Body: the problem or the reason for the change, with lines of 72 characters or fewer. A rejected alternative (`Rejected: ...`) helps when another approach looks more natural.
+- Avoid listing files, restating the diff, describing the review process, or pasting test results. Those go in the pull request.
+- Maintainers who run jobs with taskwatch may enable stricter commit checks; see [docs/checks.md](docs/checks.md).
 
 Example:
 
@@ -56,7 +53,7 @@ Rejected: warn only, because delivery would already go ahead.
 
 ## Pull requests
 
-Pull request titles use the same `type(scope): summary` format as commit titles.
+Pull request titles should use the same `type(scope): summary` format as commit titles.
 
 The pull request body is the evidence for merging this change now: tests run, CI, review, linked issue if any, and known limits. It stays on GitHub and is reached through the `#number` in the commit title.
 
@@ -64,7 +61,7 @@ The pull request body is the evidence for merging this change now: tests run, CI
 - Add one line under `Unreleased` in [CHANGELOG.md](CHANGELOG.md) when the change is visible to users.
 - Do not commit secrets, personal values, or local paths. Use placeholders in examples.
 - Merging:
-  - Every pull request is squash merged, so `main` has one commit per pull request. Write the squash subject as the pull request title plus `(#number)` and the body by the commit rules above, replacing GitHub's commit list. Merge commits and rebase merging are off: a pull request is one change, and its step commits stay on the pull request page.
+  - Every pull request is squash merged, so `main` has one commit per pull request. Write the squash subject as the pull request title plus `(#number)` and the body by the commit form above, replacing GitHub's commit list. Merge commits and rebase merging are off: a pull request is one change, and its step commits stay on the pull request page.
   - Split a large change into pull requests that can each be reviewed and merged on their own ([Google, Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
   - Merge only after the maintainer approves the current head, and pin it: `gh pr merge <number> --match-head-commit <approved SHA>`. A new commit after approval needs a new approval.
 

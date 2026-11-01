@@ -370,3 +370,39 @@ def test_show_prints_the_lifecycle_fields(tmp_path, remote, capsys):
     shown = json.loads(capsys.readouterr().out)
     assert shown["branch"] == job.branch and shown["workspace_state"] == "active"
     assert shown["base"] == job.base and shown["branch_state"] == "kept"
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"bullet_one_line": True}, True),
+        ({"bullet_one_line": False}, False),
+    ],
+)
+def test_commit_rules_are_read_from_the_config(tmp_path, rules, expected):
+    assert _config_with(tmp_path, rules).bullet_one_line is expected
+
+
+@pytest.mark.parametrize("rules", [{"width": 80}, {"bullet_one_line": "yes"}, [], True])
+def test_bad_commit_rules_are_a_config_error(tmp_path, rules):
+    with pytest.raises(ValueError, match="commit_rules"):
+        _config_with(tmp_path, rules)
+
+
+def _config_with(root, rules):
+    folder = root / "taskwatch"
+    folder.mkdir(exist_ok=True)
+    config = {
+        "version": 1,
+        "slots": 1,
+        "stall_seconds": 1,
+        "omp_command": ["omp"],
+        "rpc_timeout": 1,
+        "deliver_command": ["x", "{message}"],
+    }
+    if rules is not None:
+        config["commit_rules"] = rules
+    (folder / "jobs-config.json").write_text(json.dumps(config), encoding="utf-8")
+    return load_job_config(root)

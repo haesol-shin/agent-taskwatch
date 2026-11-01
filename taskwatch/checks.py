@@ -33,9 +33,14 @@ _TRAILER = re.compile(
 )
 
 
-def message_problems(message: str) -> list[str]:
+_BULLET = re.compile(r"[-*] \S")
+_INDENTED_TEXT = re.compile(r"[ \t]+(?![-*] )\S")
+
+
+def message_problems(message: str, *, bullet_one_line: bool = False) -> list[str]:
     """The common commit message rules: subject shape and length, layout, line length, trailers.
 
+    `bullet_one_line` (opt-in) also fails a body bullet continued on an indented line.
     Meaning is not judged here; the reviewer reads what the message says.
     """
     lines = message.rstrip("\n").split("\n")
@@ -52,4 +57,19 @@ def message_problems(message: str) -> list[str]:
             problems.append(f"line {number} is {len(line)} characters, the limit is {LINE_MAX}")
         if _TRAILER.match(line):
             problems.append(f"line {number} is a trailer: {line.split(':', 1)[0]}")
+    if bullet_one_line:
+        problems += _wrapped_bullets(lines)
+    return problems
+
+
+def _wrapped_bullets(lines: list[str]) -> list[str]:
+    problems = []
+    bullet = 0
+    for number, line in enumerate(lines[1:], start=2):
+        if _BULLET.match(line):
+            bullet = number
+        elif bullet and _INDENTED_TEXT.match(line):
+            problems.append(f"line {number} continues the bullet on line {bullet}")
+        else:
+            bullet = 0
     return problems
