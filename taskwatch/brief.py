@@ -1,6 +1,6 @@
 """The worker's part of a job's decision brief: `brief.md` in the job folder.
 
-The contract is in docs/kinds/brief.md. `problems` checks only what code can check: the five
+The contract is in docs/kinds/brief.md. `problems` checks only what code can check: the six
 headings, the size limits, and that every `file:line` pointer names a file that has the line.
 Whether the brief is complete and honest is the reviewer's rule C-19.
 
@@ -27,10 +27,14 @@ SECTIONS = (
     "Choices made",
     "Decisions needed",
     "Where to look",
+    "Card",
 )
 MAX_LINES = 60
 MAX_WHY_LINES = 3
 MAX_ITEMS = 8
+MAX_CARD_CONCLUSION = 2
+MAX_CARD_BULLETS = 6
+MAX_CARD_BULLET_CHARS = 160
 _HEADING = re.compile(r"^##\s+(.*?)\s*$")
 
 
@@ -122,6 +126,36 @@ def _size_problems(found: dict[str, list[str]]) -> list[str]:
     ]
     if len(found.get("Where to look", [])) > MAX_ITEMS:
         issues.append(f"brief.md: Where to look has more than {MAX_ITEMS} lines")
+    return issues + _card_problems(found.get("Card", []))
+
+
+def _card_problems(lines: list[str]) -> list[str]:
+    """The card is a conclusion of one or two lines, then at most six short bullets."""
+    if not lines:
+        return []  # the empty heading is reported with the others
+    bullets = [line for line in lines if line.startswith("-")]
+    conclusion = len(lines) - len(bullets)
+    issues = []
+    if not 1 <= conclusion <= MAX_CARD_CONCLUSION:
+        issues.append(
+            f"brief.md: Card needs 1 to {MAX_CARD_CONCLUSION} conclusion lines "
+            f"(not bullets), found {conclusion}"
+        )
+    if len(bullets) > MAX_CARD_BULLETS:
+        issues.append(
+            f"brief.md: Card has more than {MAX_CARD_BULLETS} bullets: the job was too big; "
+            "split it (docs/review/design.md D-13)"
+        )
+    issues += [
+        f"brief.md: Card bullet is over {MAX_CARD_BULLET_CHARS} characters: {line[:60]}"
+        for line in bullets
+        if len(line) > MAX_CARD_BULLET_CHARS
+    ]
+    issues += [
+        f"brief.md: Card must not hold a file:line pointer: {line[:60]}"
+        for line in lines
+        if POINTER.search(line)
+    ]
     return issues
 
 

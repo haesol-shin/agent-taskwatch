@@ -44,6 +44,10 @@ none
 
 ## Where to look
 out.txt:1
+
+## Card
+Synthetic job done; nothing for you to decide.
+- The helper now exists.
 """
 CHOICES = (
     '{"picks": [], "decided": [], "existing_tools": [{"need": "x", "searched": ["a", "b", "c"],'

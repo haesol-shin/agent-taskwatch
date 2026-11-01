@@ -22,6 +22,10 @@ none
 
 ## Where to look
 src/a.py:3
+
+## Card
+Synthetic job done; nothing for you to decide.
+- The helper now exists.
 """
 
 
@@ -242,6 +246,48 @@ def test_changed_keeps_the_output_list_for_a_job_without_a_diff(tmp_path: Path) 
     jobs, config, job = _job(tmp_path, GOOD, [])
     line = next(x for x in brief.compose(jobs, config, job) if x.startswith("Changed:"))
     assert line == "Changed: 1 files: result.txt"
+
+
+def _card(roots, card: str) -> list[str]:
+    head = GOOD.split("## Card")[0]
+    return check(roots, head + "## Card\n" + card)
+
+
+def test_a_card_is_a_conclusion_and_short_bullets(roots) -> None:
+    assert _card(roots, "Done; nothing to decide.\n- One.\n- Two.\n") == []
+    assert _card(roots, "Done.\n") == []  # no bullets is allowed
+
+
+def test_a_card_needs_one_or_two_conclusion_lines(roots) -> None:
+    assert any("found 0" in p for p in _card(roots, "- Only a bullet.\n"))
+    assert any("found 3" in p for p in _card(roots, "a\nb\nc\n- One.\n"))
+    assert _card(roots, "a\nb\n- One.\n") == []
+
+
+def test_a_card_with_seven_bullets_says_the_job_was_too_big(roots) -> None:
+    bullets = "".join(f"- Change {n}.\n" for n in range(7))
+    problems = _card(roots, "Done.\n" + bullets)
+    assert problems == [
+        "brief.md: Card has more than 6 bullets: the job was too big; "
+        "split it (docs/review/design.md D-13)"
+    ]
+    assert _card(roots, "Done.\n" + bullets[: -len("- Change 6.\n")]) == []
+
+
+def test_a_card_bullet_is_at_most_160_characters(roots) -> None:
+    assert _card(roots, "Done.\n- " + "x" * 158 + "\n") == []
+    assert any("over 160" in p for p in _card(roots, "Done.\n- " + "x" * 159 + "\n"))
+
+
+def test_a_card_holds_no_pointer(roots) -> None:
+    problems = _card(roots, "Done.\n- The helper is new. See src/a.py:2\n")
+    assert len(problems) == 1 and "must not hold a file:line pointer" in problems[0]
+
+
+def test_a_missing_or_empty_card_fails(roots) -> None:
+    head = GOOD.split("## Card")[0]
+    assert check(roots, head) == ["brief.md: missing section `## Card`"]
+    assert check(roots, head + "## Card\n") == ["brief.md: section `Card` is empty"]
 
 
 def _changed_after(tmp_path: Path, before: dict[str, bytes], edit) -> str:
