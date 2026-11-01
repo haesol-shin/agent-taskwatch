@@ -150,7 +150,7 @@ def test_fail_is_the_result_of_a_review_only_job_not_a_reason_to_fix(review):
 
 
 def test_an_answer_without_a_verdict_costs_a_round_and_reviews_again(review):
-    review.scenario([{"reply": "looks fine"}, {"reply": PASS}])
+    review.scenario([{"reply": "looks fine"}, {"reply": "still fine"}, {"reply": PASS}])
     assert review.run() == 0
     job = review.get()
     assert (job.stage, job.fix_rounds, job.reviews[-1]["final"]) == ("review", 1, False)
@@ -162,7 +162,7 @@ def test_an_answer_without_a_verdict_costs_a_round_and_reviews_again(review):
 
 
 def test_rounds_are_capped_like_other_jobs(review):
-    review.scenario([{"reply": "no verdict"}])
+    review.scenario([{"reply": "no verdict"}] * 2)
     assert review.run("review", fix_rounds=MAX_FIX_ROUNDS) == 0
     job = review.get()
     assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")

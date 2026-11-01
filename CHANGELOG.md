@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Added
+- A review reply with a malformed verdict line, finding line or scope is answered with one follow-up prompt in the same reviewer session (the exact errors and the contract) instead of a new review round; a second malformed reply fails the round as before. The `reviewer` key of the verdict line is optional, and the review record holds the name of the command the runner started (`docs/launch/taskwatch.md`; `docs/checks.md`, "Review records").
 - `taskwatch check <job> [--run-command]` prints what the check step would reject about the shape of a result (files, checklist, brief, public text, commit messages, finding records, uncommitted changes) and exits non-zero when anything is left. The check step calls the same functions, and the End section of `WORKFLOW.md` names the command as the last step before the agent finishes (`docs/configuration.md`, "Checking a result before it ends"; `docs/checks.md`).
 - A review finding line may carry a `summary`, one sentence of at most 160 characters in the owner's words; a `PASS` with a P2 or P3 finding and no `summary` is not accepted. Older records and replies without it still parse (`docs/launch/taskwatch.md`, `docs/review/common.md` C-17).
 - Optional `commit_rules.bullet_one_line` in `jobs-config.json` (off by default): the commit check of a pull request unit fails a body bullet that continues on an indented line (`docs/configuration.md`, "Commit rules"; `docs/checks.md`).

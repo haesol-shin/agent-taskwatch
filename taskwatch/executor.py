@@ -1,8 +1,9 @@
 """Read the verdict line and the finding lines of a review output.
 
 A review output holds exactly one line that is a JSON object:
-{"verdict": "PASS" or "FAIL", "blocking": true or false, "reviewer": "<name>",
+{"verdict": "PASS" or "FAIL", "blocking": true or false,
 "checked": "<what you compared>", "not_checked": "<what you did not>"}.
+A `reviewer` key is accepted and ignored: the runner knows which command reviewed.
 
 Each finding has a heading `### F<n>` and one JSON line
 {"finding": "F<n>", "severity": "P0".."P3", "category": "<C-9 category>",
@@ -35,19 +36,17 @@ def _json_lines(body: str, key: str) -> list[dict]:
     return found
 
 
-def _verdict_line(body: str) -> tuple[str, bool, str]:
+def _verdict_line(body: str) -> tuple[str, bool]:
     found = _json_lines(body, "verdict")
     if len(found) != 1:
         raise ValueError("the review output needs exactly one verdict line")
     obj = found[0]
-    verdict, blocking, reviewer = obj.get("verdict"), obj.get("blocking"), obj.get("reviewer")
+    verdict, blocking = obj.get("verdict"), obj.get("blocking")
     if verdict not in {"PASS", "FAIL"} or not isinstance(blocking, bool):
         raise ValueError("the verdict line needs verdict PASS or FAIL and a boolean blocking")
-    if not isinstance(reviewer, str) or not reviewer.strip():
-        raise ValueError("the verdict line needs a reviewer")
     if verdict == "PASS" and blocking:
         raise ValueError("a PASS cannot carry a blocking finding")
-    return verdict, blocking, reviewer.strip()
+    return verdict, blocking
 
 
 def _finding_lines(body: str, verdict: str) -> list[dict]:
