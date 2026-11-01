@@ -8,8 +8,10 @@ then launches that next step under a new attempt while the job keeps its slot an
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -31,6 +33,9 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 # step ends can run seconds apart, so "unchanged on the next scan" no longer means minutes.
 STALL_GRACE_SECONDS = 300
 WAKE_DELAY = "2s"
+# A step writes logs, sessions, git objects and temporary files. Below this much free space a
+# relaunch is likely to die on ENOSPC again, so the scan stops instead of burning a recovery.
+DISK_FLOOR_BYTES = 256 * 1024 * 1024
 
 
 class Systemd:
@@ -307,8 +312,26 @@ class _Scan:
         self._save(job)
         return job
 
+    def _full_disk(self, job: JobState) -> str:
+        """The first of the job folder and TMPDIR whose filesystem is under the floor, or ''.
+
+        A filesystem that cannot be read is not reported full: nothing proves it.
+        """
+        temp = job_environment(self.config.env).get("TMPDIR") or tempfile.gettempdir()
+        for path in (self.jobs.folder(job), Path(temp)):
+            try:
+                free = shutil.disk_usage(path).free
+            except OSError:
+                continue
+            if free < DISK_FLOOR_BYTES:
+                return f"disk_full: {path} has {free} bytes free, the floor is {DISK_FLOOR_BYTES}"
+        return ""
+
     def _recover(self, job: JobState) -> None:
-        if job.stage == "fix" and job.fix_rounds > 0:
+        full = self._full_disk(job)
+        if full:
+            self._park(job, "disk_full", full)
+        elif job.stage == "fix" and job.fix_rounds > 0:
             self._retry_review_fix(job)
         elif job.recoveries >= MAX_RECOVERIES:
             self._park(job, "recoveries_exhausted")
