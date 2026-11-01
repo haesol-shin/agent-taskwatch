@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Added
+- `taskwatch check <job> [--run-command]` prints what the check step would reject about the shape of a result (files, checklist, brief, public text, commit messages, finding records, uncommitted changes) and exits non-zero when anything is left. The check step calls the same functions, and the End section of `WORKFLOW.md` names the command as the last step before the agent finishes (`docs/configuration.md`, "Checking a result before it ends"; `docs/checks.md`).
 - A review finding line may carry a `summary`, one sentence of at most 160 characters in the owner's words; a `PASS` with a P2 or P3 finding and no `summary` is not accepted. Older records and replies without it still parse (`docs/launch/taskwatch.md`, `docs/review/common.md` C-17).
 - Optional `commit_rules.bullet_one_line` in `jobs-config.json` (off by default): the commit check of a pull request unit fails a body bullet that continues on an indented line (`docs/configuration.md`, "Commit rules"; `docs/checks.md`).
 - The decision brief has a sixth required heading, `## Card`: a conclusion of one or two lines that says whether the owner must decide something, then at most 6 bullets of at most 160 characters, each about one change for the user, with no `file:line` pointer. The check fails more bullets as too big a job. The delivery message is built from it (see the card entry below).
