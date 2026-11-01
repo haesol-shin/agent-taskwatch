@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -202,3 +203,80 @@ def replace_job(job, review):
     from dataclasses import replace
 
     return replace(job, reviews=(review,))
+
+
+def _code_job(tmp_path: Path, files: dict[str, bytes]):
+    from dataclasses import replace
+
+    from tests.git_fixture import git, make_repo
+
+    jobs, config, job = _job(tmp_path, GOOD, [])
+    repo = make_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD")
+    for name, data in files.items():
+        (repo / name).write_bytes(data)
+        git(repo, "add", name)
+    git(repo, "commit", "-m", "work")
+    return jobs, config, replace(job, review="code", workspace=str(repo), base=base)
+
+
+def _changed(tmp_path: Path, files: dict[str, bytes]) -> str:
+    jobs, config, job = _code_job(tmp_path, files)
+    return next(line for line in brief.compose(jobs, config, job) if line.startswith("Changed:"))
+
+
+def test_changed_counts_files_and_lines_of_a_code_job(tmp_path: Path) -> None:
+    files = {"new.txt": b"a\nb\n"}
+    files["out.txt"] = b"uno\ntwo\n"  # replaces the fixture's "one": +2 -1
+    assert _changed(tmp_path, files) == "Changed: 2 files, +4 -1: new.txt, out.txt"
+
+
+def test_changed_shows_four_names_and_a_binary_file_adds_no_lines(tmp_path: Path) -> None:
+    files = {f"f{n}.txt": b"x\n" for n in range(5)} | {"blob.bin": b"\0\1\2"}
+    line = _changed(tmp_path, files)
+    assert line.startswith("Changed: 6 files, +5 -0: ")
+    assert line.endswith("(+2 more)")
+
+
+def test_changed_keeps_the_output_list_for_a_job_without_a_diff(tmp_path: Path) -> None:
+    jobs, config, job = _job(tmp_path, GOOD, [])
+    line = next(x for x in brief.compose(jobs, config, job) if x.startswith("Changed:"))
+    assert line == "Changed: 1 files: result.txt"
+
+
+def _changed_after(tmp_path: Path, before: dict[str, bytes], edit) -> str:
+    """The `Changed:` line for a commit that `edit(repo)` makes on top of `before`."""
+    from dataclasses import replace
+
+    from tests.git_fixture import git
+
+    jobs, config, job = _code_job(tmp_path, before)
+    repo = Path(job.workspace)
+    base = git(repo, "rev-parse", "HEAD")
+    edit(repo)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "edit")
+    job = replace(job, base=base)
+    return next(x for x in brief.compose(jobs, config, job) if x.startswith("Changed:"))
+
+
+def test_changed_counts_a_rename_as_one_file(tmp_path: Path) -> None:
+    from tests.git_fixture import git
+
+    def edit(repo: Path) -> None:
+        git(repo, "mv", "old.txt", "new.txt")
+        (repo / "new.txt").write_bytes(b"a\nb\nc\nd\n")
+        (repo / "sub").mkdir()
+        git(repo, "mv", "out.txt", "sub/out.txt")
+
+    line = _changed_after(tmp_path, {"old.txt": b"a\nb\nc\n"}, edit)
+    assert line == "Changed: 2 files, +1 -0: new.txt, sub/out.txt"
+
+
+def test_changed_survives_a_path_that_is_not_utf8(tmp_path: Path) -> None:
+    def edit(repo: Path) -> None:
+        (repo / os.fsdecode(b"caf\xe9.txt")).write_bytes(b"x\n")
+
+    assert _changed_after(tmp_path, {"keep.txt": b"k\n"}, edit).startswith(
+        "Changed: 1 files, +1 -0: "
+    )

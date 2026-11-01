@@ -260,16 +260,29 @@ def _result(job: JobState) -> str:
 def _changed(job: JobState, config: JobConfig) -> str:
     if job.review_target is not None:
         return "Changed: nothing (review only)"
-    names = _git_changed(job, config) if job.review == "code" else list(job.outputs)
-    if names is None:
+    if job.review != "code":
+        return _changed_line(list(job.outputs), None)
+    stat = _git_changed(job, config)
+    if stat is None:
         return "Changed: unavailable (no work folder or branch)"
+    names = [name for name, _, _ in stat]
+    # A binary file has no line counts (`-`): it is a file in the count and adds no lines.
+    return _changed_line(names, (sum(a for _, a, _ in stat), sum(d for _, _, d in stat)))
+
+
+def _changed_line(names: list[str], lines: tuple[int, int] | None) -> str:
+    if not names:
+        return "Changed: no files"
     shown = ", ".join(names[:_FILES_SHOWN])
     more = f" (+{len(names) - _FILES_SHOWN} more)" if len(names) > _FILES_SHOWN else ""
-    return f"Changed: {len(names)} files: {shown}{more}" if names else "Changed: no files"
+    stat = f", +{lines[0]} -{lines[1]}" if lines else ""
+    return f"Changed: {len(names)} files{stat}: {shown}{more}"
 
 
-def _git_changed(job: JobState, config: JobConfig) -> list[str] | None:
-    """Files changed since the base, from the work folder or else the job's branch."""
+def _git_changed(job: JobState, config: JobConfig) -> list[tuple[str, int, int]] | None:
+    """`(path, added, deleted)` per file changed since the base, from the work folder or else
+    the job's branch. One `git diff --numstat`: a rename is one file with its own counts, and
+    git's quoting keeps non-UTF-8 path bytes out of the decoded text."""
     folder = Path(job.workspace) if job.workspace else None
     if folder is not None and folder.is_dir():
         where, ref = folder, "HEAD"
@@ -281,7 +294,7 @@ def _git_changed(job: JobState, config: JobConfig) -> list[str] | None:
         return None
     try:
         proc = subprocess.run(
-            ["git", "-C", str(where), "diff", "--name-only", f"{job.base}..{ref}"],
+            ["git", "-C", str(where), "diff", "--numstat", f"{job.base}..{ref}"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -290,7 +303,31 @@ def _git_changed(job: JobState, config: JobConfig) -> list[str] | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return proc.stdout.split() if proc.returncode == 0 else None
+    if proc.returncode != 0:
+        return None
+    stat = []
+    for record in proc.stdout.splitlines():
+        added, deleted, path = record.split("\t", 2)
+        stat.append(
+            (
+                _renamed_to(path),
+                int(added) if added.isdigit() else 0,
+                int(deleted) if deleted.isdigit() else 0,
+            )
+        )
+    return stat
+
+
+_BRACES = re.compile(r"\{[^{}]* => ([^{}]*)\}")
+
+
+def _renamed_to(path: str) -> str:
+    """The new path of a numstat rename: `a => b` or `dir/{a => b}/f`; other paths as they are."""
+    if " => " not in path:
+        return path
+    if _BRACES.search(path):
+        return _BRACES.sub(r"\1", path, count=1).replace("//", "/")
+    return path.split(" => ", 1)[1]
 
 
 def count_findings(review: Mapping) -> str:
