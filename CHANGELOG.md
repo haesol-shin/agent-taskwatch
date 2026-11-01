@@ -5,6 +5,7 @@ All notable changes to hermes-taskwatch are documented here. The format is based
 ## [Unreleased]
 
 ### Added
+- A job with `predecessors` lists each predecessor's kind label, stage, result location, result fingerprint and `brief.md` path in its work and review messages, so the result no longer has to be pasted into the prompt by hand. Nothing is copied.
 - `approve --reason` appends `Gate <date>: <reason>` to the approval source instead of replacing it, so the original approval and the owner's words at the gate both reach the worker and the reviewer.
 - A scan runs two seconds after a step ends and after `submit`, `approve` and `resume` (a transient `systemd-run --user` timer), so the next step no longer waits for the five-minute timer. A failed step does not wake, which keeps the timer's retry spacing. The scan records a `launched` event per step, and a suspected stall is stopped only after 300 seconds.
 - Code jobs accept an optional `public_text` list of pull request units. The check fails a unit whose commit message has a subject that is not `type(scope): summary` or `type: summary`, a subject or line over 72 characters, no blank line after the subject, or a trailer line, and fails a missing `pr/<id>/title.txt` or `pr/<id>/body.md` in the job folder.
