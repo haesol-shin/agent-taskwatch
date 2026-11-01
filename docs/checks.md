@@ -10,6 +10,8 @@ The check service runs the approved `check_command` in the job workspace and rec
 
 The checklist is a JSON file with a nonempty `items` list. Each item has a boolean `passes`. A `false` item, a missing file, invalid JSON, or an empty list blocks progress.
 
+The commit message of every commit in a pull request unit (`public_text`) is checked: the title is `type(scope): summary` or `type: summary` and at most 72 characters, one blank line follows it, no body line is over 72 characters, and no line is a trailer such as `Co-authored-by:`. With `commit_rules.bullet_one_line` on in [jobs-config.json](configuration.md#commit-rules), a body bullet (a line that starts with `- ` or `* `) also fails when an indented text line follows it: `line N continues the bullet on line M`. The switch is off by default; a nested bullet and a blank line after a bullet are not continuations.
+
 Work and review sessions must settle and report no pending asynchronous work through public RPC state before the runner advances. Child transcripts and manifests are not acceptance evidence.
 
 Code results must be committed and clean. Other results use hashes of named output paths and file contents.

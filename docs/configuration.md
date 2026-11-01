@@ -44,6 +44,16 @@ reads the agent definition and those guidelines when the review starts:
                    "--guidelines", "{guidelines}", "--review", "{review}"]
 ```
 
+### Commit rules
+
+Optionally add `"commit_rules"`, an object of booleans, to turn on commit message checks beyond the common ones in [checks](checks.md). Unknown keys are a config error. The `init` draft omits it, so a host that sets nothing sees no change.
+
+- `bullet_one_line` (default `false`): a body bullet is one line. A bullet continued on an indented line fails the check of a pull request unit, with `line N continues the bullet on line M`.
+
+```json
+"commit_rules": {"bullet_one_line": true}
+```
+
 ### Job environment
 
 Optionally add `"env"`, an object of string keys and string values, to set the environment of

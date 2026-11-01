@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Added
+- Optional `commit_rules.bullet_one_line` in `jobs-config.json` (off by default): the commit check of a pull request unit fails a body bullet that continues on an indented line (`docs/configuration.md`, "Commit rules"; `docs/checks.md`).
 - The decision brief has a sixth required heading, `## Card`: a conclusion of one or two lines that says whether the owner must decide something, then at most 6 bullets of at most 160 characters, each about one change for the user, with no `file:line` pointer. The check fails more bullets as too big a job. The delivery message does not use it yet.
 - `Changed:` in `taskwatch brief` shows the size of a code job's diff, `Changed: 12 files, +340 -120: a, b, c, d (+8 more)`, from one `git diff --numstat`; a binary file counts as a file and adds no lines.
 - Design reviews judge how a plan is split into units, jobs and lanes (`docs/review/design.md`, "Splitting a plan", rules D-10 to D-18 with checks S1 to S8), and the spec template has a 13th heading, `Units`, that submit enforces like the other twelve.
@@ -55,6 +56,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 
 ### Changed
 
+- `CONTRIBUTING.md` uses "must" only for what CI enforces and gives the commit and pull request format as the recommended form, without describing the runner's own checks.
 - The distribution is renamed `agent-taskwatch`, and so are the systemd units (`agent-taskwatch-scan.service` and `.timer`) and the installed data path; the command and the import package stay `taskwatch`. An existing host reinstalls as `docs/configuration.md` says ("Reinstall after the rename").
 - Code jobs that build a result no longer wait for each other on one target, since each has its own branch and worktree; the slot limit still applies, and non-code and review-only jobs on one target still wait.
 - Docs describe the standalone job runner only: README, `docs/checks.md`, `docs/configuration.md`, principles, contributing notes, and the package description no longer mention the removed plugin, cards, or gate, or call the project experimental.
