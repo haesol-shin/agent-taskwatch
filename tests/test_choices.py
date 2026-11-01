@@ -131,11 +131,8 @@ def test_ok_means_the_recommended_key_and_a_missing_answer_stays_missing() -> No
 
 
 def test_the_pick_list_is_rendered_from_the_file() -> None:
-    card = choices.render_picks(VALID, card=True)
-    assert card == [
-        "1. python.dep_manager: Which dependency manager? (recommend A: uv)",
-    ]
-    full = choices.render_picks(VALID, card=False)
+    full = choices.render_picks(VALID)
+    assert "1. python.dep_manager: Which dependency manager? (recommend A: uv)" in full
     assert "   B) pip [https://example.invalid/pip]" in full
     assert "   why: The repo already has uv.lock." in full
 
@@ -188,18 +185,20 @@ def test_an_implement_job_after_a_design_must_carry_the_owner_picks(tmp_path: Pa
     ]
 
 
-def test_a_design_card_shows_the_picks_and_ends_with_the_reply_template(tmp_path: Path) -> None:
+def test_a_design_brief_shows_the_picks_and_the_card_does_not(tmp_path: Path) -> None:
     from taskwatch.jobs import JobConfig
 
     jobs, design, _ = _jobs(tmp_path)
     folder = jobs.folder(design)
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "brief.md").write_text(
-        "## Decisions needed\n1. worker text that the picks replace\n", encoding="utf-8"
+        "## Decisions needed\n1. worker text that the picks replace\n\n## Card\nPick one.\n",
+        encoding="utf-8",
     )
-    card = brief.compose(jobs, JobConfig(), design, card=True)
-    assert "1. python.dep_manager: Which dependency manager? (recommend A: uv)" in card
-    assert not any("worker text" in line for line in card)
+    full = brief.compose(jobs, JobConfig(), design)
+    assert "1. python.dep_manager: Which dependency manager? (recommend A: uv)" in full
+    assert not any("worker text" in line for line in full)
+    assert brief.card(jobs, JobConfig(), design) == ["Pick one."]
     assert brief.reply_template(design) == "reply: ok | <id>=<key|text> ... | free text"
     plain = replace(design, review="source")
     assert brief.reply_template(plain) is None

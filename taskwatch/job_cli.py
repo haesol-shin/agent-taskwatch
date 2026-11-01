@@ -137,7 +137,7 @@ def _needs(args: argparse.Namespace, root: Path) -> int:
 
 def _brief(args: argparse.Namespace, root: Path) -> int:
     """0 printed the brief, 2 unknown job. Read only; the brief is composed on every call."""
-    from .brief import cap, compose, reply_template
+    from .brief import cap, compose, reply_template, trailer
 
     try:
         jobs = Jobs(root)
@@ -149,7 +149,7 @@ def _brief(args: argparse.Namespace, root: Path) -> int:
     except (ValueError, OSError, RecordError) as exc:
         print(f"taskwatch: {exc}", file=sys.stderr)
         return 1
-    tail = (f"Worker brief: {jobs.folder(job) / 'brief.md'}",)
+    tail = (*trailer(jobs, job), f"Worker brief: {jobs.folder(job) / 'brief.md'}")
     if template := reply_template(job):
         tail += (template,)
     print("\n".join(cap(lines, tail)))
@@ -254,6 +254,7 @@ def _init(root: Path, unit_dir: Path | None) -> dict:
     data.pop("review_command")
     data.pop("env")
     data.pop("bullet_one_line")
+    data.pop("language")
     if not config.exists():
         _create_new(config, (json.dumps(data, indent=2) + "\n").encode(), 0o600)
     load_job_config(root)

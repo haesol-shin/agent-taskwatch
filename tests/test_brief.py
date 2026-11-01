@@ -146,19 +146,122 @@ def _finding(n: int, severity: str = "P2") -> dict:
     }
 
 
-def test_the_card_is_cut_to_25_lines_and_the_full_brief_keeps_everything(tmp_path: Path) -> None:
+def test_the_full_brief_keeps_every_decision_and_finding(tmp_path: Path) -> None:
     decisions = "".join(f"{n}. Choose option {n}\n" for n in range(1, 11))
     text = GOOD.replace("none\n", decisions, 1)
     jobs, config, job = _job(tmp_path, text, [_finding(n) for n in range(1, 8)])
-    card = brief.compose(jobs, config, job, card=True)
     full = brief.compose(jobs, config, job)
-    assert len(card) <= 25
-    assert "... 6 more in the full brief" in card
-    assert "... 5 more in the full brief" in card
     assert sum(line.startswith("- F") for line in full) == 7
     assert sum(line[:3] == "10." for line in full) == 1
     assert "Reviewer checked: the result against the spec" in full
-    assert not any(line.startswith("Reviewer") for line in card)
+    assert not any("more in the full brief" in line for line in full)
+
+
+R1_CARD = """## Card
+R1 bundle passed review.
+- A step starts within 2 seconds of the one before.
+- Approval is not asked before the earlier job ends.
+- Each result says why it was done and what was decided.
+"""
+
+
+def _card_job(tmp_path: Path, card: str, findings: list[dict], not_checked: str, language="en"):
+    from dataclasses import replace
+
+    jobs, config, job = _job(tmp_path, GOOD.split("## Card")[0] + card, findings)
+    review = {**job.reviews[0], "not_checked": not_checked}
+    return jobs, replace(config, language=language), replace_job(job, review)
+
+
+def _summary_finding(n: int, severity: str = "P2", summary: str | None = None) -> dict:
+    return {**_finding(n, severity), "summary": summary or f"Problem {n} for the user."}
+
+
+def test_the_card_is_the_conclusion_and_only_the_lists_that_have_content(tmp_path: Path) -> None:
+    jobs, config, job = _card_job(tmp_path, R1_CARD, [], "runtime")
+    assert brief.card(jobs, config, job) == [
+        "R1 bundle passed review.",
+        "",
+        "Changed",
+        "- A step starts within 2 seconds of the one before.",
+        "- Approval is not asked before the earlier job ends.",
+        "- Each result says why it was done and what was decided.",
+        "",
+        "Not checked",
+        "- runtime",
+    ]
+    jobs, config, job = _card_job(tmp_path, "## Card\nDone.\n", [], "")
+    assert brief.card(jobs, config, job) == ["Done."]
+
+
+def test_the_card_takes_small_problems_from_summaries_worst_first(tmp_path: Path) -> None:
+    findings = [_summary_finding(1, "P3"), _summary_finding(2, "P2"), _finding(3, "P3")]
+    jobs, config, job = _card_job(tmp_path, R1_CARD, findings, "x")
+    lines = brief.card(jobs, config, job)
+    start = lines.index("Small problems left")
+    assert lines[start : start + 4] == [
+        "Small problems left",
+        "- Problem 2 for the user.",
+        "- Problem 1 for the user.",
+        "",
+    ]
+    assert not any("doc.md" in line or "K-3" in line for line in lines)
+
+
+def test_a_finding_that_blocks_never_reaches_the_card(tmp_path: Path) -> None:
+    findings = [_summary_finding(1, "P1"), _summary_finding(2, "P0")]
+    jobs, config, job = _card_job(tmp_path, R1_CARD, findings, "x")
+    assert "Small problems left" not in brief.card(jobs, config, job)
+
+
+def test_a_summary_of_the_full_length_is_not_cut(tmp_path: Path) -> None:
+    summary = "s" * brief.MAX_CARD_BULLET_CHARS
+    jobs, config, job = _card_job(tmp_path, R1_CARD, [_summary_finding(1, summary=summary)], "x")
+    assert f"- {summary}" in brief.card(jobs, config, job)
+
+
+def test_not_checked_splits_on_semicolons(tmp_path: Path) -> None:
+    jobs, config, job = _card_job(tmp_path, R1_CARD, [], "the live host; the rollback;  ")
+    assert brief.card(jobs, config, job)[-3:] == [
+        "Not checked",
+        "- the live host",
+        "- the rollback",
+    ]
+
+
+def test_the_korean_labels(tmp_path: Path) -> None:
+    findings = [_summary_finding(1)]
+    jobs, config, job = _card_job(tmp_path, R1_CARD, findings, "x", language="ko")
+    lines = brief.card(jobs, config, job)
+    assert [x for x in lines if x and not x.startswith(("-", "R1"))] == [
+        "\ubc14\ub010 \uac83",
+        "\ub0a8\uc740 \uc791\uc740 \ubb38\uc81c",
+        "\ud655\uc778\ud558\uc9c0 \ubabb\ud55c \uac83",
+    ]
+
+
+def test_a_seventh_item_shows_as_a_count_and_a_long_item_is_cut(tmp_path: Path) -> None:
+    findings = [_summary_finding(n) for n in range(1, 9)]
+    jobs, config, job = _card_job(tmp_path, R1_CARD, findings, "w" * 300)
+    lines = brief.card(jobs, config, job)
+    start = lines.index("Small problems left")
+    assert lines[start + 6 : start + 8] == ["- Problem 6 for the user.", "- +2"]
+    cut = lines[-1]
+    assert len(cut) == brief.MAX_CARD_BULLET_CHARS + 2 and cut.endswith("\u2026")
+
+
+def test_the_worst_card_fits_a_telegram_message(tmp_path: Path) -> None:
+    summary = "s" * 150
+    items = "; ".join("n" * 300 for _ in range(9))
+    findings = [_summary_finding(n, summary=summary) for n in range(1, 10)]
+    jobs, config, job = _card_job(tmp_path, R1_CARD, findings, items, language="ko")
+    assert len("\n".join(brief.card(jobs, config, job))) < 4096
+
+
+def test_the_labels_exist_for_every_language() -> None:
+    from taskwatch.jobs import LANGUAGES
+
+    assert set(brief.LABELS) == set(LANGUAGES)
 
 
 def test_the_facts_count_open_findings_and_time(tmp_path: Path) -> None:
@@ -326,3 +429,18 @@ def test_changed_survives_a_path_that_is_not_utf8(tmp_path: Path) -> None:
     assert _changed_after(tmp_path, {"keep.txt": b"k\n"}, edit).startswith(
         "Changed: 1 files, +1 -0: "
     )
+
+
+def test_taskwatch_brief_ends_with_the_paths_that_left_the_card(tmp_path: Path, capsys) -> None:
+    from taskwatch.job_cli import main
+
+    jobs, _, job = _card_job(tmp_path, R1_CARD, [], "runtime")
+    assert main(["--root", str(tmp_path / "root"), "init"]) == 0
+    folder = jobs.folder(job)
+    (folder / "delivery-review.txt").write_text("body", encoding="utf-8")
+    capsys.readouterr()
+    assert main(["--root", str(tmp_path / "root"), "brief", job.id]) == 0
+    tail = capsys.readouterr().out.splitlines()[-3:]
+    assert tail[0] == f"Full brief: taskwatch --root {tmp_path / 'root'} brief {job.id}"
+    assert tail[1] == f"Review: {folder / 'delivery-review.txt'}"
+    assert tail[2] == f"Worker brief: {folder / 'brief.md'}"

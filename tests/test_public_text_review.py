@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from taskwatch import job_text
+from taskwatch import brief, job_text
 from taskwatch.fingerprint import text_fingerprint
 from taskwatch.job_cli import main
 from taskwatch.job_delivery import _message
@@ -255,24 +255,29 @@ def finding(ident, severity, rule, location, category="evidence"):
     }
 
 
-def delivery_text(env: UnitEnv, findings: list[dict]) -> str:
+def with_findings(env: UnitEnv, findings: list[dict]):
     record = {**env.get().reviews[-1], "findings": findings}
     env.put("deliver_pending", reviews=(record,))
-    return _message(env.jobs, env.config, env.get()).read_text(encoding="utf-8")
+    return env.get()
 
 
-def test_delivery_lists_text_units_and_their_fingerprints(unit_env):
+def test_the_brief_ends_with_text_units_and_their_fingerprints(unit_env):
     reviewed(unit_env)
-    message = delivery_text(unit_env, [])
-    state = unit_env.get().reviews[-1]["texts"]["pr"]
-    assert f"Public text pr: {unit_env.folder() / 'pr' / 'pr'}" in message
-    assert f"Text fingerprint pr: {state['fingerprint']}" in message
-    assert "Open findings: none" in message
+    job = with_findings(unit_env, [])
+    (unit_env.folder() / "delivery-review.txt").write_text("body", encoding="utf-8")
+    state = job.reviews[-1]["texts"]["pr"]
+    assert brief.trailer(unit_env.jobs, job)[1:] == [
+        f"Review: {unit_env.folder() / 'delivery-review.txt'}",
+        f"Public text pr: {unit_env.folder() / 'pr' / 'pr'}",
+        f"Text fingerprint pr: {state['fingerprint']}",
+    ]
+    message = _message(unit_env.jobs, unit_env.config, job).read_text(encoding="utf-8")
+    assert "Public text" not in message and "Text fingerprint" not in message
 
 
-def test_delivery_lists_each_finding_on_its_own_line(unit_env):
+def test_the_brief_lists_each_finding_on_its_own_line(unit_env):
     reviewed(unit_env)
-    message = delivery_text(
+    job = with_findings(
         unit_env,
         [
             finding("F1", "P2", "K-15", "body.md:3"),
@@ -280,17 +285,17 @@ def test_delivery_lists_each_finding_on_its_own_line(unit_env):
             finding("F3", "P2", "K-10", "README.md:4", "clarity"),
         ],
     )
-    lines = [x for x in message.splitlines() if x.startswith("- F")]
-    assert lines == [
+    lines = brief.compose(unit_env.jobs, unit_env.config, job)
+    assert [x for x in lines if x.startswith("- F")] == [
         "- F2 P1 K-15 (evidence): body.md:9",
         "- F1 P2 K-15 (evidence): body.md:3",
         "- F3 P2 K-10 (clarity): README.md:4",
     ]
 
 
-def test_delivery_lists_a_p3_finding_and_keeps_other_findings_apart(unit_env):
+def test_the_brief_lists_a_p3_finding_and_keeps_other_findings_apart(unit_env):
     reviewed(unit_env)
-    message = delivery_text(
+    job = with_findings(
         unit_env,
         [
             finding("F1", "P3", "K-6", "a.py:1", "clarity"),
@@ -298,6 +303,7 @@ def test_delivery_lists_a_p3_finding_and_keeps_other_findings_apart(unit_env):
             finding("F3", "P2", "other", "c.py:3", "other"),
         ],
     )
+    message = "\n".join(brief.compose(unit_env.jobs, unit_env.config, job))
     assert "- F1 P3 K-6 (clarity): a.py:1" in message
     assert "- F2 P2 other (other): b.py:2" in message and "- F3 P2 other (other): c.py:3" in message
 

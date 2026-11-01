@@ -54,6 +54,14 @@ Optionally add `"commit_rules"`, an object of booleans, to turn on commit messag
 "commit_rules": {"bullet_one_line": true}
 ```
 
+### Language
+
+Optionally add `"language"`, `"en"` (default) or `"ko"`, to choose the three headings of the delivery card: `Changed` / `Small problems left` / `Not checked`, or `바뀐 것` / `남은 작은 문제` / `확인하지 못한 것`. Any other value is a config error. The `init` draft omits it, so a host that sets nothing gets English. The key sets only the labels the runner writes; the worker and the reviewer write the rest of the card in the language of the intent.
+
+```json
+"language": "ko"
+```
+
 ### Job environment
 
 Optionally add `"env"`, an object of string keys and string values, to set the environment of
@@ -333,14 +341,19 @@ For a job at `deliver_pending`, `scan` runs this step under the state lock after
 the old unit has been released. It writes `delivery.txt` and `delivery-review.txt` in the
 job folder, records the attempt as `started` with the message file and the SHA-256 of
 `delivery.txt`, then runs the command with a fixed 60 second timeout. `delivery.txt` is
-the brief card, at most 25 lines (facts, why, what changed, decisions needed, remaining
-findings and where to look), followed by the command that prints the full brief, the
-review body file, and the `Public text` folder and `Text fingerprint` of each unit.
-The same text is composed on read by `taskwatch --root <root> brief <job>`, which adds
-what the reviewer checked and did not check; it is read only and exits `2` for an
-unknown job. The facts are written by the runner from the job record: kind, verdict,
-review rounds, check result, result location, changed files, open finding counts and
-time. Why, what changed, decisions and pointers come from the worker's `brief.md`.
+the card and nothing else: the conclusion from the worker's `## Card`, a blank line, then only the
+lists that have content under their [`language`](#language) headings: the worker's bullets
+(`Changed`), one bullet per P2 or P3 finding of the last review that has a `summary`, worst first (`Small
+problems left`), and the items of the reviewer's `not_checked`, split on `; ` (`Not checked`).
+A list shows at most 6 bullets of at most 160 characters; a seventh shows as `+N`. The message has
+no paths and no pick block, so it stays under Telegram's 4096 characters.
+`taskwatch --root <root> brief <job>` composes the full brief on read: the facts, the worker's
+sections, the picks with their reply line, what the reviewer checked and did not check, and at
+the end the command for the brief, the review body file (once delivery wrote it), the `Public
+text` folder and `Text fingerprint` of each unit, and the path of the worker's `brief.md`. It is
+read only and exits `2` for an unknown job. The facts are written by the runner from the job
+record: kind, verdict, review rounds, check result, result location, changed files, open finding
+counts and time. Why, what changed, decisions and pointers come from the worker's `brief.md`.
 
 Before sending, the result fingerprint, declared output content digest, review
 basis and the text fingerprint of each unit must match the accepted PASS. The output digest also covers Git-ignored files.

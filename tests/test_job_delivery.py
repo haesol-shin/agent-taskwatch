@@ -84,6 +84,22 @@ elif mode == "hang":
 
 PROMPT = "Write the synthetic report\nSecond line must not be the title"
 REVIEW_BODY = "Looks fine.\n" + json.dumps({"verdict": "PASS", "blocking": False, "reviewer": "r"})
+WORKER_BRIEF = """## Card
+The report is written; nothing for you to decide.
+- The synthetic report now exists.
+"""
+CARD = """The report is written; nothing for you to decide.
+
+Changed
+- The synthetic report now exists.
+
+Small problems left
+- The report has no title.
+
+Not checked
+- the live service
+- the rollback
+"""
 UNKNOWN_MODES = [
     "malformed",
     "array",
@@ -153,6 +169,7 @@ def finished_job(board: Board, **changes: object) -> JobState:
     log = folder / "logs" / "check-1.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("all green", encoding="utf-8")
+    (folder / "brief.md").write_text(WORKER_BRIEF, encoding="utf-8")
     job = replace(board.get(job_id), workspace=str(workspace))
     fingerprint = _fingerprint(job, workspace, job_environment({}))
     basis = _basis(job, folder)
@@ -169,6 +186,17 @@ def finished_job(board: Board, **changes: object) -> JobState:
                 "ok": True,
                 "verdict": "PASS",
                 "body": REVIEW_BODY,
+                "findings": [
+                    {
+                        "finding": "F1",
+                        "severity": "P3",
+                        "category": "clarity",
+                        "rule": "K-6",
+                        "location": "out.txt:1",
+                        "summary": "The report has no title.",
+                    }
+                ],
+                "not_checked": "the live service; the rollback",
                 "fingerprint": fingerprint,
                 "outputs_fingerprint": files_fingerprint(workspace, job.outputs),
                 "basis": basis,
@@ -230,17 +258,9 @@ def test_the_message_is_built_from_the_record_and_hashed_before_sending(
     assert message_path == folder / "delivery.txt"
     text = message_path.read_text(encoding="utf-8")
     assert text == call["text"]
-    lines = text.splitlines()
-    assert PROMPT.splitlines()[0] in lines[0]
-    assert "Second line must not be the title" not in lines[0]
-    assert job.id in text
-    assert "PASS" in text
-    workspace = Path(job.workspace if job.workspace else folder / "work")
-    assert str(folder / "work" / "out.txt") in text
-    assert str(workspace) in text or str(folder / "work") in text
-    review_file = folder / "delivery-review.txt"
-    assert str(review_file) in text
-    assert review_file.read_text(encoding="utf-8") == REVIEW_BODY
+    assert text == CARD
+    assert len(text) < 4096
+    assert (folder / "delivery-review.txt").read_text(encoding="utf-8") == REVIEW_BODY
     attempt = board.get(job.id).deliveries[0]
     assert attempt["message_file"] == str(message_path)
     assert attempt["message_sha256"] == hashlib.sha256(message_path.read_bytes()).hexdigest()

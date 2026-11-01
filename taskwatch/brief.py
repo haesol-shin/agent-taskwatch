@@ -168,14 +168,14 @@ def _ends_with_pointer(line: str) -> bool:
 
 # --- composition ---------------------------------------------------------------------------
 
-CARD_LINES = 25
-# Lines per section of the card, its heading included. Facts are five lines: 5 + 2 + 6 + 6 + 4 + 2.
-_CARD_CAPS = {
-    "Why": 2,
-    "What changed and why": 6,
-    "Decisions needed": 6,
-    "Remaining findings": 4,
-    "Where to look": 2,
+# The card's three labels, by `language` in jobs-config.json. The order is the card's order.
+LABELS = {
+    "en": ("Changed", "Small problems left", "Not checked"),
+    "ko": (
+        "\ubc14\ub010 \uac83",
+        "\ub0a8\uc740 \uc791\uc740 \ubb38\uc81c",
+        "\ud655\uc778\ud558\uc9c0 \ubabb\ud55c \uac83",
+    ),
 }
 _GOAL_CHARS = 100
 _FILES_SHOWN = 4
@@ -199,23 +199,93 @@ def read_worker_brief(jobs: Jobs, job: JobState) -> str:
         return ""
 
 
-def compose(jobs: Jobs, config: JobConfig, job: JobState, *, card: bool = False) -> list[str]:
-    """The brief of a job. `card` limits each section so the whole is at most 25 lines."""
+def compose(jobs: Jobs, config: JobConfig, job: JobState) -> list[str]:
+    """The full brief of a job: the runner's facts, the worker's sections, the review lists."""
     review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
     worker = sections(read_worker_brief(jobs, job))
     lines = _facts(jobs, config, job, review)
     for name in ("Why", "What changed and why"):
-        lines += _section(name, worker.get(name) or ["(none)"], card)
+        lines += _section(name, worker.get(name) or ["(none)"])
     lines += _section(
-        "Decisions needed", _picks(job, card) or worker.get("Decisions needed") or ["(none)"], card
+        "Decisions needed", _picks(job) or worker.get("Decisions needed") or ["(none)"]
     )
-    lines += _section("Remaining findings", _finding_lines(review), card)
-    if not card:
-        lines += [
-            "Reviewer checked: " + (review.get("checked") or "(not recorded)"),
-            "Reviewer did not check: " + (review.get("not_checked") or "(not recorded)"),
-        ]
-    lines += _section("Where to look", worker.get("Where to look") or ["(none)"], card)
+    lines += _section("Remaining findings", _finding_lines(review))
+    lines += [
+        "Reviewer checked: " + (review.get("checked") or "(not recorded)"),
+        "Reviewer did not check: " + (review.get("not_checked") or "(not recorded)"),
+    ]
+    lines += _section("Where to look", worker.get("Where to look") or ["(none)"])
+    return lines
+
+
+def card(jobs: Jobs, config: JobConfig, job: JobState) -> list[str]:
+    """The message the owner reads: the worker's conclusion, a blank line, then only the lists
+    that have content. `Changed` is the worker's `## Card` bullets; the other two come from the
+    last review: the `summary` of each P2 or P3 finding, and the items of `not_checked` split on
+    `; `."""
+    review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
+    own = sections(read_worker_brief(jobs, job)).get("Card", [])
+    conclusion = [line for line in own if not line.startswith("-")]
+    changed = [line for line in own if line.startswith("-")]
+    labels = LABELS[config.language]
+    lists = (
+        [line[1:].strip() for line in changed],
+        [f["summary"] for f in _ranked(review) if _small(f)],
+        _items(review.get("not_checked")),
+    )
+    # A job without a worker brief (a review-only job) has no conclusion: the verdict stands in.
+    verdict = review.get("verdict") or "none"
+    lines = conclusion or [f"{kind_label(job)} job {job.id}: verdict {verdict}."]
+    for label, bullets in zip(labels, lists):
+        if bullets:
+            lines += ["", label, *_bounded(bullets)]
+    return lines
+
+
+def _bounded(items: list[str]) -> list[str]:
+    """At most six bullets with at most 160 characters of text each; a seventh and later show
+    as `+N`."""
+    shown = [f"- {_cut(item)}" for item in items[:MAX_CARD_BULLETS]]
+    return (
+        [*shown, f"- +{len(items) - MAX_CARD_BULLETS}"] if len(items) > MAX_CARD_BULLETS else shown
+    )
+
+
+def _cut(text: str) -> str:
+    return (
+        text if len(text) <= MAX_CARD_BULLET_CHARS else text[: MAX_CARD_BULLET_CHARS - 1] + "\u2026"
+    )
+
+
+def _items(text: object) -> list[str]:
+    """The items of a `not_checked` text: short plain items joined by `; `."""
+    if not isinstance(text, str):
+        return []
+    return [item.strip() for item in text.split("; ") if item.strip()]
+
+
+def _ranked(review: Mapping) -> list[Mapping]:
+    return sorted(review.get("findings", []), key=lambda f: (f["severity"], f["finding"]))
+
+
+def _small(finding: Mapping) -> bool:
+    """A P2 or P3 finding with the reviewer's sentence. P0 and P1 never ride on a delivered
+    card, and a finding without a `summary` (an older record, a failed review) stays in the
+    full brief, where its rule and location are."""
+    return finding["severity"] in {"P2", "P3"} and bool(finding.get("summary"))
+
+
+def trailer(jobs: Jobs, job: JobState) -> list[str]:
+    """The lines that left the card and end `taskwatch brief`: where the full text is."""
+    review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
+    folder = jobs.folder(job)
+    lines = [f"Full brief: taskwatch --root {jobs.state.root} brief {job.id}"]
+    if (folder / "delivery-review.txt").exists():
+        lines.append(f"Review: {folder / 'delivery-review.txt'}")
+    for unit in job.public_text:
+        state = review.get("texts", {}).get(unit["id"], {})
+        lines.append(f"Public text {unit['id']}: {folder / 'pr' / unit['id']}")
+        lines.append(f"Text fingerprint {unit['id']}: {state.get('fingerprint', 'unavailable')}")
     return lines
 
 
@@ -230,13 +300,13 @@ def cap(lines: list[str], tail: tuple[str, ...] = ()) -> list[str]:
     return [*lines[: room - 1], f"... {hidden} more lines omitted from this output", *tail]
 
 
-def _picks(job: JobState, card: bool) -> list[str]:
+def _picks(job: JobState) -> list[str]:
     """The owner's picks of a design job, rendered from its validated `choices.json`."""
     if not choices.is_design(job) or not job.workspace:
         return []
     data, _ = choices.load(Path(job.workspace) / choices.FILE)
     try:
-        return choices.render_picks(data, card=card) if data else []
+        return choices.render_picks(data) if data else []
     except (KeyError, TypeError):
         return []  # an invalid file is the check's problem; the worker's text stands in
 
@@ -247,15 +317,8 @@ def reply_template(job: JobState) -> str | None:
     return choices.REPLY if count and job.workspace else None
 
 
-def _section(name: str, lines: list[str], card: bool) -> list[str]:
-    heading = f"{name}:"
-    if not card:
-        return [heading, *lines]
-    room = _CARD_CAPS[name] - 1
-    if len(lines) <= room:
-        return [heading, *lines]
-    shown = room - 1
-    return [heading, *lines[:shown], f"... {len(lines) - shown} more in the full brief"]
+def _section(name: str, lines: list[str]) -> list[str]:
+    return [f"{name}:", *lines]
 
 
 def _facts(jobs: Jobs, config: JobConfig, job: JobState, review: Mapping) -> list[str]:
@@ -377,9 +440,8 @@ def _finding_lines(review: Mapping) -> list[str]:
     """One line per finding, worst first: id, severity, rule, category, location, and the
     reviewer's fix sentence when the text under its heading gives one (rule C-17)."""
     body = review.get("body") or ""
-    ranked = sorted(review.get("findings", []), key=lambda f: (f["severity"], f["finding"]))
     lines = []
-    for f in ranked:
+    for f in _ranked(review):
         fix = _fix_text(body, f["finding"])
         tail = f" -- fix: {fix}" if fix else ""
         lines.append(
