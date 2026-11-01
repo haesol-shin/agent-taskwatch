@@ -137,7 +137,7 @@ def _needs(args: argparse.Namespace, root: Path) -> int:
 
 def _brief(args: argparse.Namespace, root: Path) -> int:
     """0 printed the brief, 2 unknown job. Read only; the brief is composed on every call."""
-    from .brief import compose, reply_template
+    from .brief import cap, compose, reply_template
 
     try:
         jobs = Jobs(root)
@@ -149,10 +149,10 @@ def _brief(args: argparse.Namespace, root: Path) -> int:
     except (ValueError, OSError, RecordError) as exc:
         print(f"taskwatch: {exc}", file=sys.stderr)
         return 1
-    lines.append(f"Worker brief: {jobs.folder(job) / 'brief.md'}")
+    tail = (f"Worker brief: {jobs.folder(job) / 'brief.md'}",)
     if template := reply_template(job):
-        lines.append(template)
-    print("\n".join(lines))
+        tail += (template,)
+    print("\n".join(cap(lines, tail)))
     return 0
 
 
