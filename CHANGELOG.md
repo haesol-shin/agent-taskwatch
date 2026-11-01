@@ -5,6 +5,7 @@ All notable changes to hermes-taskwatch are documented here. The format is based
 ## [Unreleased]
 
 ### Added
+- Every job with a work stage writes a decision brief, `brief.md` in its job folder: why the job ran, what changed, the choices made, the decisions the owner must make and where to look. The check fails a missing or empty heading, a file over 60 lines, a bullet without a `file:line` pointer, or a pointer to a file or line that does not exist. `WORKFLOW.md` carries the contract and the rules of the job's kind (`docs/kinds/`). The verdict line of a review needs nonempty `checked` and `not_checked`, and rule C-19 has the reviewer compare the brief with the result. P2 and P3 findings never cost a round: they are left to the owner in the brief.
 - A job with `predecessors` lists each predecessor's kind label, stage, result location, result fingerprint and `brief.md` path in its work and review messages, so the result no longer has to be pasted into the prompt by hand. Nothing is copied.
 - `approve --reason` appends `Gate <date>: <reason>` to the approval source instead of replacing it, so the original approval and the owner's words at the gate both reach the worker and the reviewer.
 - A scan runs two seconds after a step ends and after `submit`, `approve` and `resume` (a transient `systemd-run --user` timer), so the next step no longer waits for the five-minute timer. A failed step does not wake, which keeps the timer's retry spacing. The scan records a `launched` event per step, and a suspected stall is stopped only after 300 seconds.

@@ -20,14 +20,38 @@ from tests.git_fixture import make_repo
 from tests.spec_fixture import VALID_SPEC
 
 FAKE = Path(__file__).with_name("fake_omp.py")
-PASS = '{"verdict": "PASS", "blocking": false, "reviewer": "reviewer.invalid"}'
-FAIL = '{"verdict": "FAIL", "blocking": true, "reviewer": "reviewer.invalid"}'
+PASS = (
+    '{"verdict": "PASS", "blocking": false, "reviewer": "reviewer.invalid",'
+    ' "checked": "the diff", "not_checked": "runtime"}'
+)
+FAIL = (
+    '{"verdict": "FAIL", "blocking": true, "reviewer": "reviewer.invalid",'
+    ' "checked": "the diff", "not_checked": "runtime"}'
+)
+BRIEF = """## Why
+Synthetic job.
+
+## What changed and why
+- Wrote the result file. See out.txt:1
+
+## Choices made
+| choice | picked | reason | source | who |
+|---|---|---|---|---|
+| format | text | synthetic | none | agent |
+
+## Decisions needed
+none
+
+## Where to look
+out.txt:1
+"""
 GOOD_FILES = {
     "out.txt": "ok\n",
     "PROGRESS.md": "done\n",
     "checklist.json": '{"items": [{"id": "a", "passes": true}]}',
+    "brief.md": BRIEF,
 }
-RECORDS = {"PROGRESS.md", "checklist.json"}
+RECORDS = {"PROGRESS.md", "checklist.json", "brief.md"}
 CHECK = [
     sys.executable,
     "-c",

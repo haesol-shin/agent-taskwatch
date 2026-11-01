@@ -86,6 +86,10 @@ P0 and P1 block. P2 and P3 do not. A rule break is P0 only when it is about runt
 
 You may judge a writer's choice. You may not override an owner decision: when a quoted owner decision covers the choice, answer `ok` and state any concern as P3. When the decision rests on a premise you can show is false, report it as a P2 finding with the rule `premise` (category `evidence`) for the owner, not as a blocker. A writer's choice is P1 only when you show that it contradicts the intent, the approval scope or a verified fact; otherwise it is P2, and the fix is a spec revision.
 
+## Brief
+
+**C-19.** Compare `brief.md` with the real result. Every bullet of What changed and every pointer must exist in the result. A decision the result made and the brief omits is a finding: P1 if the owner would decide differently knowing it, else P2. Name in `checked` what you compared and in `not_checked` what you did not.
+
 ## Sources
 
 Generalized from a shared review checklist and a deliverable-review role. Provenance is in the [folder README](README.md).

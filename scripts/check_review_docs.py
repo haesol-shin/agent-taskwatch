@@ -31,6 +31,7 @@ REQUIRED_SECTIONS = {
         "Repository conventions",
         "Finding content",
         "Design questions",
+        "Brief",
         "Sources",
     ),
     "code.md": (

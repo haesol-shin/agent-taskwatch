@@ -21,6 +21,7 @@ packages = ["taskwatch"]
 [tool.setuptools.data-files]
 "share/hermes-taskwatch/review" = ["docs/review/*.md"]
 "share/hermes-taskwatch/launch" = ["docs/launch/*.md"]
+"share/hermes-taskwatch/kinds" = ["docs/kinds/*.md"]
 
 [project.urls]
 Repository = "https://github.com/haesol-shin/hermes-taskwatch"

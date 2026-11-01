@@ -1,7 +1,8 @@
 """Read the verdict line and the finding lines of a review output.
 
 A review output holds exactly one line that is a JSON object:
-{"verdict": "PASS" or "FAIL", "blocking": true or false, "reviewer": "<name>"}.
+{"verdict": "PASS" or "FAIL", "blocking": true or false, "reviewer": "<name>",
+"checked": "<what you compared>", "not_checked": "<what you did not>"}.
 
 Each finding has a heading `### F<n>` and one JSON line
 {"finding": "F<n>", "severity": "P0".."P3", "category": "<C-9 category>",
@@ -117,3 +118,15 @@ def _design_check(body: str, findings: list[dict]) -> dict[str, dict[str, str]]:
         answers[key] = {"answer": answer, "evidence": evidence.strip()}
         before = evidence.strip()
     return answers
+
+
+def _scope(body: str) -> tuple[str, str]:
+    """What the reviewer says it checked and did not check; the brief shows both."""
+    obj = _json_lines(body, "verdict")[0]
+    values = []
+    for key in ("checked", "not_checked"):
+        value = obj.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"the verdict line needs a nonempty {key}")
+        values.append(value.strip())
+    return values[0], values[1]

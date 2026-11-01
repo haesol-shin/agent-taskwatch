@@ -90,10 +90,11 @@ A `code` job that builds a result works in `state/jobs/<id>/worktree`, on its ow
 
 ### Job records
 
-A job keeps its checklist and progress files in its job folder (`state/jobs/<id>/`), next to
+A job keeps its checklist, progress and brief files in its job folder (`state/jobs/<id>/`), next to
 the logs and reviews, not in the workspace. The worker prompt and `WORKFLOW.md` give their
 absolute paths. The records are therefore never part of a result, and the clean-tree check of a
-`code` job needs no exception. A job submitted earlier whose paths name `.taskwatch/...` still
+`code` job needs no exception. `WORKFLOW.md` also carries the brief contract and the rules of the
+job's kind from `docs/kinds/`. A job submitted earlier whose paths name `.taskwatch/...` still
 loads; those paths now resolve inside the job folder as well.
 
 ### Submit an approved job
@@ -197,7 +198,7 @@ invalid JSON, or empty list blocks progress. The independent reviewer returns
 exactly one verdict JSON line followed by findings, for example:
 
 ```text
-{"verdict": "PASS", "blocking": false, "reviewer": "independent-review"}
+{"verdict": "PASS", "blocking": false, "reviewer": "independent-review", "checked": "the diff against the spec", "not_checked": "runtime behavior"}
 No blocking findings.
 ```
 
