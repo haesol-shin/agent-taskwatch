@@ -75,6 +75,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 
 ### Fixed
 
+- The wake that starts the next stage sets the timer accuracy to 1 s (`--timer-property=AccuracySec=1s`); systemd's default of 1 minute let the next stage start 20 to 52 s late.
 - A dead step on a full disk no longer burns three relaunches. If the job folder's or `TMPDIR`'s filesystem has under 256 MiB free, the scan parks the job as `user_wait` with reason `disk_full`, the path and the free bytes in `error`, and uses no recovery. Test runs also leave no read-only snapshot folders in the pytest base temp.
 - A job with `approval_required` and `predecessors` asked the owner before its predecessors finished. It now stays queued until every predecessor is `done`.
 - Verify declared output contents, including Git-ignored files, against PASS before delivery, and send stop notices without holding the global state lock.
