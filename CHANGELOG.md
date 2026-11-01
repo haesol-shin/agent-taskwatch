@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Added
+- `WORKFLOW.md` tells the worker to run only the tests for the files it changed while working and the whole check once, with `taskwatch check <job> --run-command`, just before it ends (`docs/configuration.md`, "Checking a result before it ends").
 - A check whose result fingerprint and basis equal those of an earlier check of the job whose command exited 0 does not run the command again; it records `reused_check` and still runs the file, text and finding checks (`docs/checks.md`, "Job checks").
 - A review reply with a malformed verdict line, finding line or scope is answered with one follow-up prompt in the same reviewer session (the exact errors and the contract) instead of a new review round; a second malformed reply fails the round as before. The `reviewer` key of the verdict line is optional, and the review record holds the name of the command the runner started (`docs/launch/taskwatch.md`; `docs/checks.md`, "Review records").
 - `taskwatch check <job> [--run-command]` prints what the check step would reject about the shape of a result (files, checklist, brief, public text, commit messages, finding records, uncommitted changes) and exits non-zero when anything is left. The check step calls the same functions, and the End section of `WORKFLOW.md` names the command as the last step before the agent finishes (`docs/configuration.md`, "Checking a result before it ends"; `docs/checks.md`).

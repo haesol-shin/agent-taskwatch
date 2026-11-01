@@ -388,6 +388,8 @@ response with only `skipped` is unknown, not done.
 
 `taskwatch --root <root> check <job-id> [--run-command]` prints, one `- ` line each, what the check step would reject about the shape of the job's result now: required files, progress and checklist, the brief, the public text files and commit messages, the finding records, and uncommitted changes. It calls the same functions as the check step, so there is no second rule. Exit codes: `0` no problem (it prints `no problems`), `1` problems printed, `2` unknown job, a review-only job, or a job that has no workspace yet. It reads the result and the records only. `--run-command` also runs the job's `check_command`, with its output in `logs/precheck.log`; without it the test command is not run, because the check step runs it anyway. `WORKFLOW.md` names the command in its End section as the last step before the agent finishes.
 
+`WORKFLOW.md` tells the worker to run only the tests that cover the files it changed while working, and `check <job> --run-command` once just before it ends.
+
 ### Watching a job
 
 `taskwatch --root <root> watch <job-id> [--timeout <seconds>] [--interval <seconds>]` blocks
