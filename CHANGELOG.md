@@ -5,6 +5,7 @@ All notable changes to hermes-taskwatch are documented here. The format is based
 ## [Unreleased]
 
 ### Added
+- `Changed:` in `taskwatch brief` shows the size of a code job's diff, `Changed: 12 files, +340 -120: a, b, c, d (+8 more)`, from one `git diff --numstat`; a binary file counts as a file and adds no lines.
 - Design reviews judge how a plan is split into units, jobs and lanes (`docs/review/design.md`, "Splitting a plan", rules D-10 to D-18 with checks S1 to S8), and the spec template has a 13th heading, `Units`, that submit enforces like the other twelve.
 - `taskwatch brief` output is at most 80 lines in all, the worker-brief path and the reply template included, and a cut says how many lines were omitted from this output (it used to point at the worker brief, which does not hold the cut text, and ran to 82 lines).
 - Documentation for chains: the four job kinds and what each checks, the gate rule (`approval_required` with `predecessors` opens after every predecessor is `done`), the rule for submitting ordered units, and how the reply to a pick list reaches the next job.
