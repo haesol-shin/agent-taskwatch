@@ -44,7 +44,13 @@ REQUIRED_SECTIONS = {
         "Re-review",
         "Sources",
     ),
-    "design.md": ("What to review", "Decision method", "Scope", "Sources"),
+    "design.md": (
+        "What to review",
+        "Decision method",
+        "Scope",
+        "Splitting a plan",
+        "Sources",
+    ),
     "source.md": ("What to review", "Coverage", "Sources"),
 }
 
