@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import brief, choices, job_findings, job_text, job_workspace
+from . import brief, choices, job_findings, job_text, job_workspace, source_check
 from .checks import checklist_problems, message_problems
 from .evidence import basis_of
 from .executor import _design_check, _finding_lines, _scope, _verdict_line
@@ -48,6 +48,7 @@ from .kinds import kind_label
 from .review_docs import docs_dir, profile_names
 
 STEPS = frozenset({"work", "fix", "check", "review"})
+SOURCE_TABLE = "source-table.md"
 EVIDENCE_EVERY = 15.0
 SETTLE_POLL = 2.0
 WATCH_EVERY = 2.0
@@ -223,7 +224,7 @@ def _layer(name: str) -> str:
 
 def _guidelines(job: JobState, folder: Path) -> tuple[Path, ...]:
     """The job's own copy of the review profile, so a basis cannot drift while it runs."""
-    names = profile_names(job.review)
+    names = profile_names(job.review, job.outputs)
     target = folder / "review-docs"
     target.mkdir(parents=True, exist_ok=True)
     source = None
@@ -437,6 +438,7 @@ def _subject_lines(ctx: Ctx) -> list[str]:
             f"Reviewed result: {ctx.workspace} (files: {', '.join(job.outputs)})",
             f"Result fingerprint: {job.fingerprint}",
             f"Check output: {log}",
+            *_source_lines(ctx),
             f"Brief: {ctx.folder / 'brief.md'} (compare it with the result, rule C-19)",
         ]
     if "commit" in target:
@@ -444,6 +446,27 @@ def _subject_lines(ctx: Ctx) -> list[str]:
     else:
         what = f"files {', '.join(target['files'])} under {ctx.workspace}"
     return [f"Review target: {what}", f"Target fingerprint: {job.fingerprint}"]
+
+
+def _source_lines(ctx: Ctx) -> list[str]:
+    if source_check.CLAIMS not in ctx.job.outputs:
+        return []
+    return [
+        f"Source table: {ctx.folder / SOURCE_TABLE} (claim, quote, source, quote found; "
+        "judge support only for the pairs the check found present, rule S-9)"
+    ]
+
+
+def _source_record(ctx: Ctx) -> dict:
+    """The counts the brief shows, and the table the reviewer reads, from the saved sources."""
+    if source_check.CLAIMS not in ctx.job.outputs:
+        return {}
+    result = source_check.check(ctx.workspace, ctx.job.outputs)
+    try:
+        _write_durable(ctx.folder / SOURCE_TABLE, source_check.table(result.rows))
+    except OSError:
+        pass  # the next check writes it; the problems above already fail this one
+    return {"sources": {"claims": result.claims, "snippet_only": result.snippet_only}}
 
 
 def _text_lines(job: JobState, review_root: Path) -> list[str]:
@@ -750,6 +773,8 @@ def _file_problems(jobs: Jobs, job: JobState, workspace: Path, folder: Path) -> 
         for name in UNIT_FILES:
             if not job_text.unit_file(folder, unit["id"], name).is_file():
                 problems.append(f"required file is missing: pr/{unit['id']}/{name}")
+    if source_check.CLAIMS in job.outputs:
+        problems += source_check.check(workspace, job.outputs).problems
     return problems + _brief_problems(jobs, job, workspace, folder)
 
 
@@ -869,6 +894,7 @@ def _check_step(ctx: Ctx) -> int:
         "basis": basis,
         "texts": texts,
         **notes,
+        **_source_record(ctx),
     }
 
     def build(current: dict) -> dict:

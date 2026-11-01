@@ -11,8 +11,16 @@ PROFILES = {
 COMMON = ("README.md", "common.md")
 
 
-def profile_names(review: str) -> tuple[str, ...]:
-    return (*COMMON, PROFILES[review])
+SOURCE_OUTPUT = "claims.json"
+
+
+def profile_names(review: str, outputs: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """The documents a review reads. A job whose outputs include the claims file also answers to
+    the source rules, whatever its own review kind (a design with research included)."""
+    names = (*COMMON, PROFILES[review])
+    if SOURCE_OUTPUT in outputs and PROFILES["source"] not in names:
+        names = (*names, PROFILES["source"])
+    return names
 
 
 def all_names() -> tuple[str, ...]:

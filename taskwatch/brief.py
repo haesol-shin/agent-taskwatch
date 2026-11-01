@@ -227,8 +227,13 @@ def _facts(jobs: Jobs, config: JobConfig, job: JobState, review: Mapping) -> lis
         f"Verdict: {verdict}; {rounds}; {check}; {_elapsed(job)}",
         _result(job),
         _changed(job, config),
-        f"Open findings: {count_findings(review)}",
+        f"Open findings: {count_findings(review)}{_snippets(checks)}",
     ]
+
+
+def _snippets(check: Mapping | None) -> str:
+    count = ((check or {}).get("sources") or {}).get("snippet_only", 0)
+    return f"; {count} claims rest on snippets only" if count else ""
 
 
 def _result(job: JobState) -> str:
