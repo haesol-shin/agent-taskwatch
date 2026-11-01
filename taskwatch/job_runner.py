@@ -338,6 +338,8 @@ Work inputs:
 - The progress, checklist and brief files are outside the workspace; never copy them into it.
 - Code jobs: commit everything in the workspace. The checks accept only a clean, committed
   result.
+- While working, run only the tests that cover the files you changed. Run the whole check once,
+  with the `--run-command` option of the command in the End section, just before you end.
 - If you delegate to subagents, wait until each one finished.
 
 {_kind_text(job)}
