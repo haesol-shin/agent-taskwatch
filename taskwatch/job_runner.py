@@ -646,7 +646,15 @@ def _command(ctx: Ctx) -> tuple[str, ...]:
     return tuple(fields.get(part, part) for part in config.review_command)
 
 
-def _converse(ctx: Ctx, session_dir: Path, message: Callable[[bool], str], text: bool) -> str:
+def _converse(
+    ctx: Ctx,
+    session_dir: Path,
+    message: Callable[[bool], str],
+    text: bool,
+    repair: Callable[[str], str | None] | None = None,
+) -> str:
+    """One session: the prompt, and with `repair` at most one follow-up in the same session
+    when `repair(reply)` returns a prompt."""
     timeout = float(ctx.config.rpc_timeout)
     recorder = Recorder(ctx)
     argv = [*_command(ctx), "--mode", "rpc", "--no-ui"]
@@ -678,6 +686,10 @@ def _converse(ctx: Ctx, session_dir: Path, message: Callable[[bool], str], text:
             )
             client.prompt_and_wait(message(resumed), timeout)
             reply = client.last_assistant_text(timeout) if text else ""
+            follow_up = repair(reply) if repair else None
+            if follow_up:
+                client.prompt_and_wait(follow_up, timeout)
+                reply = client.last_assistant_text(timeout)
             client.finish()
     finally:
         recorder.done.set()
@@ -1032,6 +1044,7 @@ def _review_step(ctx: Ctx) -> int:
         ctx.folder / "sessions" / name,
         lambda r: _review_message(ctx, guidelines, r, review_root),
         True,
+        lambda body: _repair_prompt(ctx, body),
     )
     try:
         ctx.jobs.verify_inputs(job)
@@ -1095,6 +1108,52 @@ def _requeue(job: JobState) -> dict:
     return {**changes, "recoveries": job.recoveries + 1}
 
 
+def _reviewer_name(ctx: Ctx) -> str:
+    """Who reviewed, from the command the runner started: its program, or the module of
+    `python -m <module>`. The reply does not need to say it."""
+    argv = _command(ctx)
+    name = argv[2] if len(argv) > 2 and argv[1] == "-m" else argv[0]
+    return Path(name).name
+
+
+def _read_reply(job: JobState, body: str, record: dict) -> None:
+    """Parse the verdict, findings, scope and design check of a reply into `record`.
+
+    Raises ValueError with the first shape error; what parsed before it stays in `record`.
+    """
+    verdict, blocking = _verdict_line(body)
+    record.update(verdict=verdict, blocking=blocking)
+    record["findings"] = _finding_lines(body, verdict)
+    if verdict == "PASS":
+        record["problems"] += [
+            f"finding {f['finding']} needs a summary: a PASS shows its {f['severity']} "
+            "findings to the owner"
+            for f in record["findings"]
+            if f["severity"] in {"P2", "P3"} and "summary" not in f
+        ]
+    record["checked"], record["not_checked"] = _scope(body)
+    if job.review in {"code", "design"}:
+        record["design_check"] = _design_check(body, record["findings"])
+
+
+def _repair_prompt(ctx: Ctx, body: str) -> str | None:
+    """The one follow-up for a reply whose shape is wrong: the exact errors and the contract.
+    None when the reply parses. Content is never judged here."""
+    scratch: dict = {"problems": [], "findings": []}
+    try:
+        _read_reply(ctx.job, body, scratch)
+    except ValueError as exc:
+        scratch["problems"].append(str(exc))
+    if not scratch["problems"]:
+        return None
+    errors = "\n".join(f"- {problem}" for problem in scratch["problems"])
+    return (
+        f"Your reply was not accepted, because of its shape:\n{errors}\n\n"
+        "Answer again in this session. Send the complete review, not only the corrected "
+        "line, in the shape below. Do not change what you found.\n\n" + _layer("taskwatch.md")
+    )
+
+
 def _judge(ctx: Ctx, body: str, snapshot: Mapping) -> dict:
     job = ctx.job
     seq = len(job.checks) + len(job.reviews) + 1
@@ -1104,7 +1163,7 @@ def _judge(ctx: Ctx, body: str, snapshot: Mapping) -> dict:
         "round": len(job.reviews) + 1,
         "verdict": "",
         "blocking": True,
-        "reviewer": "",
+        "reviewer": _reviewer_name(ctx),
         "fingerprint": job.fingerprint,
         "outputs_fingerprint": "",
         "basis": job.basis,
@@ -1117,19 +1176,7 @@ def _judge(ctx: Ctx, body: str, snapshot: Mapping) -> dict:
         **snapshot,
     }
     try:
-        verdict, blocking, reviewer = _verdict_line(body)
-        record.update(verdict=verdict, blocking=blocking, reviewer=reviewer)
-        record["findings"] = _finding_lines(body, verdict)
-        if verdict == "PASS":
-            record["problems"] += [
-                f"finding {f['finding']} needs a summary: a PASS shows its {f['severity']} "
-                "findings to the owner"
-                for f in record["findings"]
-                if f["severity"] in {"P2", "P3"} and "summary" not in f
-            ]
-        record["checked"], record["not_checked"] = _scope(body)
-        if job.review in {"code", "design"}:
-            record["design_check"] = _design_check(body, record["findings"])
+        _read_reply(job, body, record)
     except ValueError as exc:
         record["problems"].append(str(exc))
     try:

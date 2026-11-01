@@ -390,12 +390,35 @@ def test_review_stops_after_three_fix_rounds(env):
 
 
 def test_incomplete_review_output_cannot_pass(env):
-    env.scenario([{"reply": "looks fine to me"}])
+    env.scenario([{"reply": "looks fine to me"}] * 2)
     env.to_review()
     assert env.run("review") == 0
     job = env.get()
     assert (job.stage, job.fix_rounds) == ("fix", 1)
     assert "exactly one verdict line" in job.error
+    assert len(env.prompts()) == 2  # the review prompt and one follow-up, then the round fails
+
+
+def test_a_malformed_verdict_is_fixed_in_the_same_session(env):
+    env.scenario([{"reply": "looks fine to me"}, {"reply": f"{PASS}\nNo findings."}])
+    env.to_review()
+    assert env.run("review") == 0
+    job = env.get()
+    assert (job.stage, job.fix_rounds, len(job.reviews)) == ("deliver_pending", 0, 1)
+    assert job.reviews[-1]["ok"] and "No findings." in job.reviews[-1]["body"]
+    first, follow_up = env.prompts()
+    assert "independent reviewer" in first
+    assert "exactly one verdict line" in follow_up and '"verdict": "PASS" or "FAIL"' in follow_up
+
+
+def test_a_reply_without_reviewer_is_accepted_and_the_runner_names_it(env):
+    reply = json.dumps({"verdict": "PASS", "blocking": False, "checked": "x", "not_checked": "y"})
+    env.scenario([{"reply": reply}])
+    env.to_review()
+    assert env.run("review") == 0
+    record = env.get().reviews[-1]
+    assert record["ok"] and record["reviewer"] == Path(sys.executable).name
+    assert len(env.prompts()) == 1
 
 
 def test_result_changed_during_review_rejects_pass(env):

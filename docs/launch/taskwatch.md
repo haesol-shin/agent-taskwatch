@@ -10,7 +10,9 @@ This text applies only when a taskwatch job started the review. It adds to the r
 
 **Verdict.** Answer in your final message. It must contain exactly one line that is a JSON object:
 
-{"verdict": "PASS" or "FAIL", "blocking": true or false, "reviewer": "<name>", "checked": "<text>", "not_checked": "<text>"}
+{"verdict": "PASS" or "FAIL", "blocking": true or false, "checked": "<text>", "not_checked": "<text>"}
+
+A `reviewer` key is not needed: taskwatch records the command that reviewed. An older line that carries one still parses.
 
 - `checked` is what you compared or ran, `not_checked` is what you did not, each a nonempty text. The owner reads both in the decision brief, so name concrete things, and write what you could not reach rather than leaving it empty.
 - `PASS` means no P0 or P1 finding remains. A `PASS` cannot be blocking.
@@ -29,4 +31,4 @@ After that line, give every finding with its location. Each finding has a headin
 - Write `not_checked` as short plain items joined by `; `: the card shows each item as one bullet.
 - Taskwatch reads only these lines and the verdict line, never the free text.
 
-Taskwatch records your whole message as the review; a missing or second verdict line, or a finding that breaks these rules, makes the answer unacceptable and costs a round.
+Taskwatch records your whole message as the review. A missing or second verdict line, or a finding that breaks these rules, makes the answer unacceptable. Taskwatch then sends you one follow-up in the same session with the exact errors and this contract; answer it with the complete review. A second answer that is still unacceptable costs a round.

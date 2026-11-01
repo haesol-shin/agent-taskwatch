@@ -215,7 +215,7 @@ def test_a_design_review_needs_the_design_check(tmp_path, monkeypatch):
         tmp_path, monkeypatch, review="design", target=target, outputs=["out.txt", "choices.json"]
     )
     ready(env)
-    env.scenario([{"reply": NO_CHECK}, {"reply": CODE_PASS}])
+    env.scenario([{"reply": NO_CHECK}, {"reply": NO_CHECK}, {"reply": CODE_PASS}])
     assert env.run("review") == 0
     record = env.get().reviews[-1]
     assert not record["ok"] and any("design_check" in p for p in record["problems"])
@@ -247,7 +247,7 @@ def test_a_review_must_say_what_it_checked_and_did_not_check(tmp_path, monkeypat
     ready(env)
     partial = json.loads(NO_CHECK)
     partial[missing] = " "
-    env.scenario([{"reply": json.dumps(partial)}, {"reply": NO_CHECK}])
+    env.scenario([{"reply": json.dumps(partial)}] * 2 + [{"reply": NO_CHECK}])
     assert env.run("review") == 0
     record = env.get().reviews[-1]
     assert not record["ok"] and f"the verdict line needs a nonempty {missing}" in record["problems"]

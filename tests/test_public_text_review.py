@@ -309,7 +309,7 @@ def test_the_brief_lists_a_p3_finding_and_keeps_other_findings_apart(unit_env):
 
 
 def test_a_code_review_without_a_design_check_is_not_accepted(unit_env):
-    unit_env.scenario([{"reply": PLAIN_PASS}])
+    unit_env.scenario([{"reply": PLAIN_PASS}] * 2)
     unit_env.commit("feat(x): add\n\nWhy.")
     assert unit_env.problems() == []
     assert unit_env.run("review") == 0

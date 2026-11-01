@@ -111,7 +111,7 @@ def test_the_review_record_keeps_the_findings_and_a_bad_block_costs_a_round(unit
     job = unit_env.get()
     assert [f["rule"] for f in job.reviews[-1]["findings"]] == ["K-15", "K-7"]
     assert job.stage == "fix"
-    unit_env.scenario([{"reply": f"{PASS}\n{body(line('F1', 'P1'))}"}])
+    unit_env.scenario([{"reply": f"{PASS}\n{body(line('F1', 'P1'))}"}] * 2)
     unit_env.put("review")
     assert (
         job_runner.run_job(unit_env.jobs, unit_env.config, unit_env.job.id, unit_env.attempt) == 0
@@ -124,7 +124,7 @@ def test_the_review_record_keeps_the_findings_and_a_bad_block_costs_a_round(unit
 def test_a_pass_with_a_p2_or_p3_finding_needs_a_summary(unit_env, severity):
     unit_env.commit("feat(x): add\n\nWhy.")
     assert unit_env.problems() == []
-    unit_env.scenario([{"reply": f"{PASS}\n{body(line(severity=severity))}"}])
+    unit_env.scenario([{"reply": f"{PASS}\n{body(line(severity=severity))}"}] * 2)
     assert unit_env.run("review") == 0
     last = unit_env.get().reviews[-1]
     assert not last["ok"]
