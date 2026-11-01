@@ -928,10 +928,45 @@ def shape_problems(
     return problems
 
 
+def _passing_run(ctx: Ctx) -> dict | None:
+    """The latest earlier check whose command exited 0 on this very result and basis, if any.
+
+    The fingerprint covers the result and the basis covers intent, spec and guidelines, so the
+    command would see the same input; only the file, text and finding checks run again.
+    """
+    try:
+        fingerprint = _fingerprint(ctx.job, ctx.workspace, ctx.env)
+        basis = _basis(ctx.job, ctx.folder)
+    except (ValueError, OSError):
+        return None
+    if not fingerprint:
+        return None
+    for check in reversed(ctx.job.checks):
+        if (
+            check.get("exit_code") == 0
+            and check.get("fingerprint") == fingerprint
+            and check.get("basis") == basis
+            and check.get("log")
+            and Path(check["log"]).is_file()
+        ):
+            return check
+    return None
+
+
 def _check_step(ctx: Ctx) -> int:
     job = ctx.job
     seq = len(job.checks) + len(job.reviews) + 1
-    run, problems = _run_command(ctx, ctx.folder / "logs" / f"check-{seq}.log")
+    reused = _passing_run(ctx)
+    if reused is None:
+        run, problems = _run_command(ctx, ctx.folder / "logs" / f"check-{seq}.log")
+    else:
+        run = {
+            "exit_code": 0,
+            "log": reused["log"],
+            "log_sha256": reused["log_sha256"],
+            "reused_check": reused.get("reused_check", reused["seq"]),
+        }
+        problems = []
     # After the command: it may have changed or removed what the checks require.
     fingerprint, basis, texts, notes = _shape(ctx, problems)
     record = {
