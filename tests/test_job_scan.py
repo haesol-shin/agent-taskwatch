@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from taskwatch import job_runner, job_scan
 from taskwatch.job_cli import main as cli_main
 from taskwatch.job_env import job_environment
 from taskwatch.job_runner import run_job
-from taskwatch.job_scan import Systemd, scan_jobs
+from taskwatch.job_scan import STALL_GRACE_SECONDS, Systemd, scan_jobs
 from taskwatch.jobs import (
     MAX_FIX_ROUNDS,
     MAX_RECOVERIES,
@@ -20,6 +21,8 @@ from taskwatch.jobs import (
     progress_fingerprint,
 )
 from tests.spec_fixture import VALID_SPEC
+
+REAL_WAKE = Systemd.wake
 
 BOOT = "boot-1"
 STALL = 100
@@ -68,6 +71,11 @@ class Board:
         self.count = 0
 
     def add(self, target: str = "", **extra: object) -> str:
+        payload = self.payload(target, **extra)
+        self.clock += 1
+        return self.jobs.submit(payload, self.clock).id
+
+    def payload(self, target: str = "", **extra: object) -> dict:
         self.count += 1
         base = self.root / "src"
         base.mkdir(exist_ok=True)
@@ -75,7 +83,7 @@ class Board:
         (base / "spec.md").write_text(VALID_SPEC, encoding="utf-8")
         target_dir = self.root / (target or f"target-{self.count}")
         target_dir.mkdir(exist_ok=True)
-        payload = {
+        return {
             "receipt_key": f"k{self.count}",
             "approval_source": "msg-1",
             "approval_scope": "task-1",
@@ -90,8 +98,6 @@ class Board:
             "progress": "progress.md",
             **extra,
         }
-        self.clock += 1
-        return self.jobs.submit(payload, self.clock).id
 
     def get(self, job_id: str) -> JobState:
         return self.jobs.load()[job_id]
@@ -303,10 +309,30 @@ def test_stall_is_suspected_first_then_stopped_and_recovered(board: Board) -> No
     job = board.get(job_id)
     assert job.stall_suspected is True
     assert board.service.stopped == []
-    assert board.scan() == [job_id]
+    assert board.scan(STALL_GRACE_SECONDS) == [job_id]
     assert board.service.stopped == [f"taskwatch-{job_id}-a1.service"]
     job = board.get(job_id)
     assert (job.attempt, job.recoveries, job.stall_suspected) == (2, 1, False)
+
+
+def test_a_scan_seconds_after_the_suspicion_does_not_stop_the_service(board: Board) -> None:
+    job_id = board.add()
+    board.scan()
+    board.scan(STALL + 1)
+    assert board.scan(10) == []
+    assert board.service.stopped == []
+    assert board.get(job_id).stall_suspected is True
+    assert board.scan(STALL_GRACE_SECONDS - 10 - 1) == []
+    assert board.service.stopped == []
+
+
+def test_launch_records_the_stage_it_started(board: Board) -> None:
+    job_id = board.add()
+    board.scan()
+    board.finish_step(job_id, "check")
+    board.scan()
+    launched = [e for e in board.get(job_id).events if e.get("kind") == "launched"]
+    assert [(e["stage"], e["attempt"]) for e in launched] == [("work", 1), ("check", 2)]
 
 
 def test_progress_clears_a_stall_suspicion(board: Board) -> None:
@@ -391,7 +417,7 @@ def test_unconfirmed_stall_stop_parks_but_keeps_slot_until_confirmed(tmp_path: P
     board.scan()
     board.scan(STALL + 1)
     board.service.stop_ok = False
-    assert board.scan() == []
+    assert board.scan(STALL_GRACE_SECONDS) == []
     job = board.get(job_id)
     assert (job.stage, job.wait_reason, job.attempt) == (
         "user_wait",
@@ -651,7 +677,7 @@ def test_scan_events_record_why_a_step_was_relaunched(board: Board) -> None:
     board.kill(job_id)
     board.scan()
     kinds = [e["kind"] for e in board.get(job_id).events if e.get("source") == "scan"]
-    assert kinds == ["service_dead"]
+    assert kinds == ["launched", "service_dead", "launched"]
 
 
 # -- production adapter, with systemctl faked at the subprocess boundary ----------------------
@@ -784,3 +810,76 @@ def test_review_fix_lost_start_consumes_a_round(board: Board) -> None:
     board.service.start_error = None
     assert board.scan() == [job_id]
     assert board.get(job_id).fix_rounds == 3
+
+
+def test_wake_schedules_one_scan_two_seconds_later(monkeypatch, tmp_path: Path) -> None:
+    seen = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: seen.append(argv))
+    REAL_WAKE(Systemd(tmp_path))
+    assert seen == [
+        [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--on-active=2s",
+            sys.executable,
+            "-m",
+            "taskwatch.job_cli",
+            "--root",
+            str(tmp_path),
+            "scan",
+        ]
+    ]
+
+
+def _run_cli(board: Board, *argv: str) -> int:
+    return cli_main(["--root", str(board.jobs.state.root), *argv])
+
+
+def test_commands_that_start_work_wake_once_and_the_others_never(
+    board: Board, monkeypatch, no_real_wake
+) -> None:
+    submit_file = board.root / "job.json"
+    submit_file.write_text(json.dumps(board.payload(approval_required=True)), encoding="utf-8")
+    assert _run_cli(board, "submit", str(submit_file)) == 0
+    job_id = next(iter(board.jobs.load()))
+    assert len(no_real_wake) == 1
+    board.scan()
+    assert _run_cli(board, "init") == 0
+    monkeypatch.setattr(job_scan, "scan_jobs", lambda *a, **k: [])
+    assert _run_cli(board, "scan") == 0
+    assert len(no_real_wake) == 1
+    assert _run_cli(board, "approve", job_id, "--reason", "ok") == 0
+    assert len(no_real_wake) == 2
+    board.scan()
+    board.kill(job_id)
+    board.set(job_id, stage="user_wait", resume_stage="work")
+    assert _run_cli(board, "resume", job_id, "--reason", "retry") == 0
+    assert len(no_real_wake) == 3
+    monkeypatch.setattr(job_runner, "run_job", lambda *a: 0)
+    assert _run_cli(board, "run", job_id, "--attempt", "1") == 0
+    assert len(no_real_wake) == 4
+    assert _run_cli(board, "wait", job_id, "--reason", "need input") == 0
+    assert _run_cli(board, "cancel", job_id, "--reason", "stop") == 0
+    assert len(no_real_wake) == 4
+
+
+def test_a_failed_step_does_not_wake_so_recovery_keeps_its_backoff(
+    board: Board, monkeypatch, no_real_wake
+) -> None:
+    job_id = board.add()
+    monkeypatch.setattr(job_runner, "run_job", lambda *a: 1)
+    assert _run_cli(board, "run", job_id, "--attempt", "1") == 1
+    assert no_real_wake == []
+
+
+def test_a_failing_wake_keeps_the_exit_code_and_warns(board: Board, monkeypatch, capsys) -> None:
+    def fail(self) -> None:
+        raise subprocess.CalledProcessError(1, "systemd-run")
+
+    monkeypatch.setattr(Systemd, "wake", fail)
+    job_id = board.add()
+    board.set(job_id, stage="user_wait", resume_stage="work")
+    assert _run_cli(board, "resume", job_id, "--reason", "retry") == 0
+    assert "warning: wake failed" in capsys.readouterr().err

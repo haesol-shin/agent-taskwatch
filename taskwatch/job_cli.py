@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import asdict, replace
@@ -10,6 +11,9 @@ from pathlib import Path
 
 from .jobs import JobConfig, Jobs, load_job_config
 from .state import RecordError, _create_new, _make_dirs
+
+# Commands after which a scan runs at once: a step ended, or a job became startable.
+WAKE_COMMANDS = frozenset({"run", "submit", "approve", "resume"})
 
 
 def parser() -> argparse.ArgumentParser:
@@ -67,9 +71,21 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError, RecordError, KeyError) as exc:
         print(f"taskwatch: {exc}", file=sys.stderr)
         return 1
+    if args.command in WAKE_COMMANDS:
+        _wake(root)
     if result is not None:
         print(json.dumps(result, sort_keys=True))
     return 0
+
+
+def _wake(root: Path) -> None:
+    """A failed wake only costs the wait for the timer, so it never changes the exit code."""
+    from .job_scan import Systemd
+
+    try:
+        Systemd(root).wake()
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"taskwatch: warning: wake failed: {exc}", file=sys.stderr)
 
 
 def _watch(args: argparse.Namespace, root: Path) -> int:
