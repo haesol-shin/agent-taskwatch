@@ -311,13 +311,17 @@ confirms sending. Every other outcome is unknown, including a nonzero exit with
 a readable JSON `error`: a timeout or partial send may already have delivered content.
 
 For a job at `deliver_pending`, `scan` runs this step under the state lock after
-the old unit has been released. It writes `delivery.txt` (title from the first
-prompt line, job id, latest review verdict, absolute output paths, result
-workspace, review body file, check log path, every P0, P1 and P2 finding with
-findings of one rule on one line, and the `Public text` folder and `Text fingerprint`
-of each unit) and `delivery-review.txt` in the
-job folder, records the attempt as `started` with the message file and the
-SHA-256 of `delivery.txt`, then runs the command with a fixed 60 second timeout.
+the old unit has been released. It writes `delivery.txt` and `delivery-review.txt` in the
+job folder, records the attempt as `started` with the message file and the SHA-256 of
+`delivery.txt`, then runs the command with a fixed 60 second timeout. `delivery.txt` is
+the brief card, at most 25 lines (facts, why, what changed, decisions needed, remaining
+findings and where to look), followed by the command that prints the full brief, the
+review body file, and the `Public text` folder and `Text fingerprint` of each unit.
+The same text is composed on read by `taskwatch --root <root> brief <job>`, which adds
+what the reviewer checked and did not check; it is read only and exits `2` for an
+unknown job. The facts are written by the runner from the job record: kind, verdict,
+review rounds, check result, result location, changed files, open finding counts and
+time. Why, what changed, decisions and pointers come from the worker's `brief.md`.
 
 Before sending, the result fingerprint, declared output content digest, review
 basis and the text fingerprint of each unit must match the accepted PASS. The output digest also covers Git-ignored files.

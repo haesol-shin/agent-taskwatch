@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 
+from . import brief
 from .evidence import basis_of
 from .fingerprint import files_fingerprint
 from .job_env import job_environment
@@ -64,7 +65,7 @@ def deliver_job(jobs: Jobs, config: JobConfig, job: JobState, now: float) -> Job
         except BlockingIOError:
             return job
         try:
-            message = _message(jobs, job)
+            message = _message(jobs, config, job)
         except OSError as exc:
             stopped = replace(
                 job,
@@ -93,36 +94,6 @@ def deliver_job(jobs: Jobs, config: JobConfig, job: JobState, now: float) -> Job
         return _finish(jobs, job, {**record, **_send(command, lock.fileno())}, now)
 
 
-def _subject(job: JobState) -> list[str]:
-    target = job.review_target
-    if target is None:
-        return ["Outputs:", *(f"- {Path(job.workspace) / name}" for name in job.outputs)]
-    if "commit" in target:
-        return [f"Reviewed: commit {target['commit']}"]
-    return ["Reviewed files:", *(f"- {Path(job.workspace) / name}" for name in target["files"])]
-
-
-def _finding_lines(review: dict) -> list[str]:
-    """Every P0, P1 and P2 finding, one line per kind; P3 stays in the review record.
-
-    A kind is a rule id. `other` names no kind, so each such finding keeps its own line.
-    """
-    groups: dict[str, list[dict]] = {}
-    for finding in review.get("findings", []):
-        if finding["severity"] != "P3":
-            key = finding["rule"] if finding["rule"] != "other" else f"other {finding['finding']}"
-            groups.setdefault(key, []).append(finding)
-    ranked = sorted(groups.items(), key=lambda g: (min(f["severity"] for f in g[1]), g[0]))
-    lines = []
-    for _key, items in ranked:
-        severity = min(f["severity"] for f in items)
-        categories = "/".join(sorted({f["category"] for f in items}))
-        count = f" x{len(items)}" if len(items) > 1 else ""
-        places = "; ".join(dict.fromkeys(f["location"] for f in items))
-        lines.append(f"- {severity} {items[0]['rule']} ({categories}){count}: {places}")
-    return ["Findings (P0 to P2):", *lines] if lines else ["Findings (P0 to P2): none"]
-
-
 def _text_lines(jobs: Jobs, job: JobState, review: dict) -> list[str]:
     lines = []
     for unit in job.public_text:
@@ -132,22 +103,18 @@ def _text_lines(jobs: Jobs, job: JobState, review: dict) -> list[str]:
     return lines
 
 
-def _message(jobs: Jobs, job: JobState) -> Path:
+def _message(jobs: Jobs, config: JobConfig, job: JobState) -> Path:
+    """The brief card the owner reads, then the paths: the full brief, the review, the text."""
     folder = jobs.folder(job)
     review = job.reviews[-1] if job.reviews else {}
     review_file = folder / "delivery-review.txt"
     _write_durable(review_file, review.get("body", ""))
     lines = [
-        f"Job {job.id}: {job.prompt.strip().splitlines()[0]}",
-        f"Verdict: {review.get('verdict', 'unavailable')}",
-        *_subject(job),
-        f"Result: {job.workspace}",
+        *brief.compose(jobs, config, job, card=True),
+        f"Full brief: taskwatch --root {jobs.state.root} brief {job.id}",
         f"Review: {review_file}",
+        *_text_lines(jobs, job, review),
     ]
-    if job.checks:
-        lines.append(f"Check: {job.checks[-1]['log']}")
-    lines += _finding_lines(review)
-    lines += _text_lines(jobs, job, review)
     message = folder / "delivery.txt"
     _write_durable(message, "\n".join(lines) + "\n")
     return message
