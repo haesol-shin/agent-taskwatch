@@ -34,6 +34,13 @@ def parser() -> argparse.ArgumentParser:
     watch.add_argument("job")
     watch.add_argument("--timeout", type=_seconds(1), default=82800, help="Seconds (default 82800)")
     watch.add_argument("--interval", type=_seconds(5), default=30, help="Poll seconds (min 5)")
+    needs = commands.add_parser("needs", help="List what needs the owner; read only, no lock")
+    needs.add_argument(
+        "--from", dest="cursor", type=_seconds(0), help="Cursor from an earlier list"
+    )
+    needs.add_argument("--wait", action="store_true", help="Block until something new needs you")
+    needs.add_argument("--timeout", type=_seconds(1), default=82800, help="Seconds (default 82800)")
+    needs.add_argument("--interval", type=_seconds(5), default=30, help="Poll seconds (min 5)")
     brief = commands.add_parser("brief", help="Print the decision brief of a job, composed on read")
     brief.add_argument("job")
     text = commands.add_parser("text", help="Write the reviewed title and body of a pull request")
@@ -70,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         return _text(args, root)
     if args.command == "brief":
         return _brief(args, root)
+    if args.command == "needs":
+        return _needs(args, root)
     try:
         result = _dispatch(args, root)
     except (ValueError, OSError, RecordError, KeyError) as exc:
@@ -101,6 +110,28 @@ def _watch(args: argparse.Namespace, root: Path) -> int:
         print(f"taskwatch: {exc}", file=sys.stderr)
         return 1
     print(report, file=sys.stderr if code == 2 else sys.stdout)
+    return code
+
+
+def _needs(args: argparse.Namespace, root: Path) -> int:
+    """0 listed, 3 time limit, 2 usage error, 1 other error. Nothing is written."""
+    from .job_watch import needs
+
+    if args.wait and args.cursor is None:
+        print("taskwatch: needs --wait needs --from <cursor>", file=sys.stderr)
+        return 2
+    try:
+        code, report = needs(
+            root,
+            cursor=args.cursor,
+            wait=args.wait,
+            timeout=args.timeout,
+            interval=args.interval,
+        )
+    except (ValueError, OSError, RecordError) as exc:
+        print(f"taskwatch: {exc}", file=sys.stderr)
+        return 1
+    print(report)
     return code
 
 

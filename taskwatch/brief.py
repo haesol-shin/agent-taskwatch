@@ -210,7 +210,7 @@ def _facts(jobs: Jobs, config: JobConfig, job: JobState, review: Mapping) -> lis
         f"Verdict: {verdict}; {rounds}; {check}; {_elapsed(job)}",
         _result(job),
         _changed(job, config),
-        _open_counts(review),
+        f"Open findings: {count_findings(review)}",
     ]
 
 
@@ -263,12 +263,13 @@ def _git_changed(job: JobState, config: JobConfig) -> list[str] | None:
     return proc.stdout.split() if proc.returncode == 0 else None
 
 
-def _open_counts(review: Mapping) -> str:
+def count_findings(review: Mapping) -> str:
+    """`P2 1, P3 2` for the findings of a review, or `none`."""
     counts = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
     for finding in review.get("findings", []):
         counts[finding["severity"]] += 1
     shown = [f"{name} {n}" for name, n in counts.items() if n]
-    return "Open findings: " + (", ".join(shown) if shown else "none")
+    return ", ".join(shown) if shown else "none"
 
 
 def _finding_lines(review: Mapping) -> list[str]:
