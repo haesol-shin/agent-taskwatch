@@ -182,14 +182,35 @@ class _Scan:
         for identifier in self.order:
             self._tend(self.all[identifier])
         for identifier in self.order:
+            self._gate(self.all[identifier])
+        for identifier in self.order:
             job = self.all[identifier]
             if _is_gap(job) and self._confirm_dead(job):
                 self._launch(job, job.stage)
         for identifier in self.order:
             job = self.all[identifier]
-            if _is_pending(job):
+            if _is_pending(job) and not (job.stage == "queued" and job.approval_required):
                 self._admit(job)
         return self.launched
+
+    def _gate(self, job: JobState) -> None:
+        """Ask the owner only once every predecessor is `done`, so the brief exists first."""
+        if job.stage != "queued" or not job.approval_required:
+            return
+        waiting = next((p for p in job.predecessors if self._stage(p) != "done"), None)
+        if waiting is not None:
+            reason = f"predecessor:{waiting}"
+            if job.wait_reason != reason:
+                self._save(replace(job, wait_reason=reason))
+            return
+        first = "review" if job.review_target is not None else "work"
+        job = replace(
+            job, stage="approval_wait", resume_stage=first, wait_reason="approval_required"
+        )
+        self._save(self._event(job, "approval_wait"))
+
+    def _stage(self, identifier: str) -> str:
+        return self.all[identifier].stage if identifier in self.all else "missing"
 
     # -- existing jobs ----------------------------------------------------------------------
 
@@ -200,12 +221,6 @@ class _Scan:
         elif job.unit:
             self._release(job)
         job = self.all[job.id]
-        if job.stage == "queued" and job.approval_required:
-            first = "review" if job.review_target is not None else "work"
-            job = replace(
-                job, stage="approval_wait", resume_stage=first, wait_reason="approval_required"
-            )
-            self._save(self._event(job, "approval_wait"))
         if job.stage == "deliver_pending" and not job.unit:
             self.all[job.id] = deliver_job(self.jobs, self.config, job, self.now)
         self._settle(self.all[job.id])

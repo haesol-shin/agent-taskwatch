@@ -158,7 +158,7 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
             job = replace(
                 job,
                 approval_required=False,
-                approval_source=args.reason,
+                approval_source=f"{job.approval_source}\nGate {_date(now)}: {args.reason}",
                 approval_scope=args.scope if args.scope is not None else job.approval_scope,
                 stage="queued",
                 wait_reason="",
@@ -184,6 +184,10 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
         )
         jobs.save(job, now)
         return job.to_json()
+
+
+def _date(now: float) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(now))
 
 
 def _init(root: Path, unit_dir: Path | None) -> dict:

@@ -151,8 +151,12 @@ The command records the caller's approval assertion; it cannot authenticate
 the conversation.
 
 `approval_required` defaults to `false`. If `true`, the first scan moves the job
-to `approval_wait` before its first work run. `approve` clears that flag and
-allows work to start. A later `wait` records the current step for approval.
+to `approval_wait` before its first work run. With `predecessors`, the job stays
+`queued` (wait reason `predecessor:<id>`) until every predecessor is `done`, so the
+owner has the predecessor's result before the question; a cancelled or
+`user_wait` predecessor leaves it queued. A job without `approval_required`
+still starts once its predecessors reach `deliver_pending`. `approve` clears the
+flag and allows work to start. A later `wait` records the current step for approval.
 
 `approval_scope` is a recorded boundary, not operating-system isolation.
 The runner's shell tools have the user's permissions; instructions and
@@ -388,9 +392,11 @@ reserves its first round before launch. Check repairs keep the separate recovery
 budget. Commands do not send messages themselves; scans send results and stop
 notices. The runner does not reconcile an external outcome.
 
-`approve --scope` records a replacement approved scope together with the approval
-source. Omit it to preserve the original scope, such as an initial approval wait.
-Do not use a broader scope than the user actually approved.
+`approve --reason` appends `Gate <date>: <reason>` to the approval source; the
+original approval stays and the worker and reviewer see both. `approve --scope`
+records a replacement approved scope. Omit it to preserve the original scope,
+such as an initial approval wait. Do not use a broader scope than the user
+actually approved.
 
 After checks and review pass, the stage is `deliver_pending`, not `done`; see
 [Delivery](#delivery).
