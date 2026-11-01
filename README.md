@@ -53,13 +53,14 @@ taskwatch --root <root> scan                       # schedule job steps once
 taskwatch --root <root> run <job> --attempt <n>    # one reserved step; started by scan
 taskwatch --root <root> show [<job>]               # print job state
 taskwatch --root <root> watch <job>                # block until the job needs attention
+taskwatch --root <root> brief <job>                # print the decision brief, composed on read
 taskwatch --root <root> cancel <job> --reason <text>
 taskwatch --root <root> wait <job> --reason <text>   # park the job for approval
 taskwatch --root <root> approve <job> --reason <text> [--scope <text>]
 taskwatch --root <root> resume <job> --reason <text> # open a new recovery or fix cycle
 ```
 
-`--root` defaults to `HERMES_HOME`, then `~/.hermes`. `watch` exits `0` when the job needs attention, `3` when its own `--timeout` passes, `2` on a usage error or unknown job, and `1` on another error. `run` is started by `scan`; do not run it alongside the service.
+`--root` defaults to `HERMES_HOME`, then `~/.hermes`. `brief` exits `2` for an unknown job. `watch` exits `0` when the job needs attention, `3` when its own `--timeout` passes, `2` on a usage error or unknown job, and `1` on another error. `run` is started by `scan`; do not run it alongside the service.
 
 ## Limits
 

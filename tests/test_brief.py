@@ -99,3 +99,101 @@ def test_a_bullet_needs_a_pointer_and_the_lists_are_bounded(roots) -> None:
 def test_the_brief_is_at_most_sixty_lines(roots) -> None:
     padded = GOOD.replace("none\n", "none\n" + "\n" * 60, 1)
     assert check(roots, padded) == ["brief.md: more than 60 lines"]
+
+
+# --- composition ---------------------------------------------------------------------------
+
+
+def _job(tmp_path: Path, brief_text: str, findings: list[dict]):
+    from dataclasses import replace
+
+    from taskwatch.jobs import JobConfig, Jobs
+    from tests.test_jobs import payload
+
+    jobs = Jobs(tmp_path / "root")
+    job = jobs.submit(payload(tmp_path), 1000.0)
+    folder = jobs.folder(job)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "brief.md").write_text(brief_text, encoding="utf-8")
+    review = {
+        "verdict": "PASS",
+        "findings": findings,
+        "checked": "the result against the spec",
+        "not_checked": "other sources",
+    }
+    job = replace(
+        job,
+        stage="done",
+        reviews=(review,),
+        events=({"type": "submit", "at": 1000.0},),
+        ended_at=1000.0 + 3 * 3600 + 60,
+    )
+    return jobs, JobConfig(), job
+
+
+def _finding(n: int, severity: str = "P2") -> dict:
+    return {
+        "finding": f"F{n}",
+        "severity": severity,
+        "category": "clarity",
+        "rule": f"K-{n}",
+        "location": f"doc.md:{n}",
+    }
+
+
+def test_the_card_is_cut_to_25_lines_and_the_full_brief_keeps_everything(tmp_path: Path) -> None:
+    decisions = "".join(f"{n}. Choose option {n}\n" for n in range(1, 11))
+    text = GOOD.replace("none\n", decisions, 1)
+    jobs, config, job = _job(tmp_path, text, [_finding(n) for n in range(1, 8)])
+    card = brief.compose(jobs, config, job, card=True)
+    full = brief.compose(jobs, config, job)
+    assert len(card) <= 25
+    assert "... 6 more in the full brief" in card
+    assert "... 5 more in the full brief" in card
+    assert sum(line.startswith("- F") for line in full) == 7
+    assert sum(line[:3] == "10." for line in full) == 1
+    assert "Reviewer checked: the result against the spec" in full
+    assert not any(line.startswith("Reviewer") for line in card)
+
+
+def test_the_facts_count_open_findings_and_time(tmp_path: Path) -> None:
+    jobs, config, job = _job(tmp_path, GOOD, [_finding(1), _finding(2, "P3"), _finding(3, "P3")])
+    facts = brief.compose(jobs, config, job)[:5]
+    assert facts[1] == "Verdict: PASS; review round 1; no check; 3h 1m"
+    assert facts[4] == "Open findings: P2 1, P3 2"
+
+
+@pytest.mark.parametrize(
+    ("body", "count"),
+    [
+        ("none\n", 0),
+        ("1. a\n2. b\n3) c\n", 3),
+        ("Pick a layout.\n", 1),
+    ],
+)
+def test_decision_count_reads_numbered_items(body: str, count: int) -> None:
+    assert brief.decision_count(GOOD.replace("none\n", body, 1)) == count
+    assert brief.decision_count("") == 0
+
+
+def test_a_finding_line_has_its_id_and_the_reviewers_fix(tmp_path: Path) -> None:
+    jobs, config, job = _job(tmp_path, GOOD, [_finding(1), _finding(2, "P3")])
+    body = (
+        "### F1\nThe text is vague. Fix: name the file in the sentence.\n{json}\n### F2\nNo fix.\n"
+    )
+    review = {**job.reviews[0], "body": body}
+    out = brief.compose(jobs, config, replace_job(job, review))
+    assert "- F1 P2 K-1 (clarity): doc.md:1 -- fix: name the file in the sentence." in out
+    assert "- F2 P3 K-2 (clarity): doc.md:2" in out
+
+
+def test_the_full_brief_is_cut_at_80_lines(tmp_path: Path) -> None:
+    jobs, config, job = _job(tmp_path, GOOD, [_finding(n) for n in range(1, 90)])
+    out = brief.compose(jobs, config, job)
+    assert len(out) == 80 and out[-1].startswith("... ") and "more lines" in out[-1]
+
+
+def replace_job(job, review):
+    from dataclasses import replace
+
+    return replace(job, reviews=(review,))

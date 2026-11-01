@@ -238,7 +238,6 @@ def test_the_message_is_built_from_the_record_and_hashed_before_sending(
     workspace = Path(job.workspace if job.workspace else folder / "work")
     assert str(folder / "work" / "out.txt") in text
     assert str(workspace) in text or str(folder / "work") in text
-    assert str(folder / "logs" / "check-1.log") in text
     review_file = folder / "delivery-review.txt"
     assert str(review_file) in text
     assert review_file.read_text(encoding="utf-8") == REVIEW_BODY

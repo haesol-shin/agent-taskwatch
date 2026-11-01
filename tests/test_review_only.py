@@ -257,7 +257,7 @@ def test_delivery_sends_the_verdict_whatever_it_is(review, monkeypatch, reply, v
     assert review.run() == 0
     job, text = deliver(review, monkeypatch)
     assert job.stage == "done"
-    assert f"Verdict: {verdict}" in text and "Reviewed files:" in text and "Outputs:" not in text
+    assert f"Verdict: {verdict}" in text and "Reviewed:" in text and "Outputs:" not in text
 
 
 def test_a_target_changed_after_the_review_is_reviewed_again_not_delivered(review, monkeypatch):
