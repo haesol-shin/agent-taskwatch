@@ -9,7 +9,7 @@ from taskwatch.job_env import job_environment
 from taskwatch.jobs import load_job_config
 from tests.git_fixture import make_repo
 from tests.test_job_delivery import write_config
-from tests.test_job_runner import GIT, GOOD_FILES, Env, work_turn
+from tests.test_job_runner import GIT, GOOD_FILES, PASS, Env, work_turn
 
 PROBE = "TW_PROBE"
 
@@ -112,6 +112,28 @@ def test_workflow_tells_the_worker_to_run_changed_tests_and_the_full_check_once(
     assert "only the tests that cover the files you changed" in working
     assert "whole check once" in working and "--run-command" in working
     assert "--run-command" in end
+
+
+@pytest.mark.parametrize(("language", "name"), [("ko", "Korean"), ("en", "English"), (None, None)])
+def test_the_configured_language_reaches_the_worker_and_the_reviewer(
+    tmp_path, monkeypatch, language, name
+):
+    env = Env(tmp_path, monkeypatch)
+    env.config = replace(env.config, language=language)
+    env.scenario([work_turn(), {"reply": PASS}])
+    assert env.run("work") == 0
+    workflow = (env.folder() / "WORKFLOW.md").read_text(encoding="utf-8")
+    card = f"`Card` section in {name}"
+    note = f"`summary` of each finding and the items of `not_checked` in {name}"
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    review = env.prompts()[-1]
+    assert "reviewer" in review
+    if name is None:
+        assert "`Card` section in" not in workflow
+        assert "items of `not_checked` in" not in review
+    else:
+        assert card in workflow and note in review
 
 
 def test_old_record_naming_taskwatch_paths_still_loads_and_resolves_in_the_folder(
