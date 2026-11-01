@@ -5,6 +5,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -238,6 +239,65 @@ def test_recoveries_are_capped_then_the_job_waits_for_the_user(board: Board) -> 
         "work",
     )
     assert job.unit == ""
+
+
+def _free_space(monkeypatch, free_by_path: dict[Path, int]) -> list[Path]:
+    """Report the given free bytes for the folder (or its parent) asked about."""
+    asked: list[Path] = []
+
+    def usage(path):
+        asked.append(Path(path))
+        for root, free in free_by_path.items():
+            if Path(path) == root or root in Path(path).parents:
+                return SimpleNamespace(free=free)
+        return SimpleNamespace(free=10**12)
+
+    monkeypatch.setattr(job_scan.shutil, "disk_usage", usage)
+    return asked
+
+
+@pytest.mark.parametrize("where", ["folder", "tmpdir"])
+def test_a_dead_step_on_a_full_disk_parks_without_using_a_recovery(
+    board: Board, monkeypatch, tmp_path: Path, where: str
+) -> None:
+    job_id = board.add()
+    board.scan()
+    temp = tmp_path / "tmp"
+    board.config = replace(board.config, env={"TMPDIR": str(temp)})
+    full = board.jobs.folder(board.get(job_id)) if where == "folder" else temp
+    _free_space(monkeypatch, {full: 1234})
+    board.kill(job_id)
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason, job.recoveries, job.resume_stage) == (
+        "user_wait",
+        "disk_full",
+        0,
+        "work",
+    )
+    assert str(full) in job.error and "1234 bytes free" in job.error
+    assert (job.unit, board.service.started) == ("", [board.service.started[0]])
+
+
+def test_enough_free_space_still_recovers(board: Board, monkeypatch) -> None:
+    job_id = board.add()
+    board.scan()
+    _free_space(monkeypatch, {})
+    board.kill(job_id)
+    assert board.scan() == [job_id]
+    assert board.get(job_id).recoveries == 1
+
+
+def test_a_full_disk_is_reported_even_when_recoveries_are_used_up(
+    board: Board, monkeypatch
+) -> None:
+    job_id = board.add()
+    board.scan()
+    board.set(job_id, recoveries=MAX_RECOVERIES)
+    _free_space(monkeypatch, {board.root: 0})
+    board.kill(job_id)
+    board.scan()
+    assert board.get(job_id).wait_reason == "disk_full"
 
 
 def test_resume_into_review_fix_reserves_a_round_and_keeps_the_cap(board: Board) -> None:

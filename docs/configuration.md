@@ -455,6 +455,12 @@ Unchanged progress and output content first produces a stall suspicion;
 an unchanged scan at least 300 seconds later stops the service and recovers.
 Log growth alone is not progress. Expected waits delay stall recovery.
 
+When a run is found dead and the filesystem of the job folder or of `TMPDIR` (the configured
+`env` value, else the system temporary folder) has less than 256 MiB free, the scan does not
+relaunch. It parks the job as `user_wait` with `wait_reason: disk_full` and
+`error: disk_full: <path> has <n> bytes free, the floor is <bytes>`, and uses no recovery. Free
+space, then `resume` the job.
+
 Three consecutive failed recoveries stop for user judgment. Passing checks
 reset that recovery budget. The independent review has a separate per-cycle
 cap of three automatic fix rounds. A fresh review uses `docs/review/` profiles
