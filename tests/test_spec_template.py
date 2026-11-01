@@ -9,7 +9,7 @@ from taskwatch.executor import DESIGN_KEYS, _design_check, _finding_lines, _verd
 from taskwatch.job_runner import run_job
 from taskwatch.jobs import SPEC_HEADINGS, Jobs, spec_sections
 from tests.spec_fixture import VALID_SPEC
-from tests.test_job_runner import BRIEF, Env
+from tests.test_job_runner import BRIEF, CHOICES, Env
 from tests.test_jobs import payload
 from tests.verdicts import CODE_FAIL, CODE_PASS, DESIGN_CHECK
 
@@ -196,6 +196,7 @@ def ready(env: Env) -> None:
             "PROGRESS.md": "done\n",
             "checklist.json": '{"items": [{"id": "a", "passes": true}]}',
             "brief.md": BRIEF,
+            "choices.json": CHOICES,
         }
     )
     assert env.run("check") == 0
@@ -210,7 +211,9 @@ NO_CHECK = (
 def test_a_design_review_needs_the_design_check(tmp_path, monkeypatch):
     target = tmp_path / "tgt"
     target.mkdir()
-    env = Env(tmp_path, monkeypatch, review="design", target=target)
+    env = Env(
+        tmp_path, monkeypatch, review="design", target=target, outputs=["out.txt", "choices.json"]
+    )
     ready(env)
     env.scenario([{"reply": NO_CHECK}, {"reply": CODE_PASS}])
     assert env.run("review") == 0
