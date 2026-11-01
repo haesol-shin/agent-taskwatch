@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to hermes-taskwatch are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to agent-taskwatch are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
@@ -55,6 +55,7 @@ All notable changes to hermes-taskwatch are documented here. The format is based
 
 ### Changed
 
+- The distribution is renamed `agent-taskwatch`, and so are the systemd units (`agent-taskwatch-scan.service` and `.timer`) and the installed data path; the command and the import package stay `taskwatch`. An existing host reinstalls as `docs/configuration.md` says ("Reinstall after the rename").
 - Code jobs that build a result no longer wait for each other on one target, since each has its own branch and worktree; the slot limit still applies, and non-code and review-only jobs on one target still wait.
 - Docs describe the standalone job runner only: README, `docs/checks.md`, `docs/configuration.md`, principles, contributing notes, and the package description no longer mention the removed plugin, cards, or gate, or call the project experimental.
 - The plugin no longer changes environment variables, reads Hermes source, or writes the board database directly; profile and paths come from the plugin context and Hermes helpers.

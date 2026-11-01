@@ -1,4 +1,4 @@
-# hermes-taskwatch
+# agent-taskwatch
 
 A job runner for approved agent work. It schedules each job, runs it through omp's public RPC, checks the result with plain code, requests an independent review, and delivers the outcome. A person is asked only when judgment is needed.
 
@@ -41,7 +41,7 @@ Requires Linux with user systemd, Python 3.11 or later, git, and an omp executab
 From a checkout, run `uv sync --locked`, then use `uv run taskwatch`. The examples below assume the virtual environment is active.
 
 1. `taskwatch --root <root> init` writes `<root>/taskwatch/jobs-config.json`. Edit it, including `omp_command` and `deliver_command`; the draft `deliver_command` cannot send.
-2. `taskwatch --root <root> init --unit-dir <empty-dir>` stages the scan service and timer without installing them. Install them into `~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then `systemctl --user enable --now hermes-taskwatch-scan.timer`.
+2. `taskwatch --root <root> init --unit-dir <empty-dir>` stages the scan service and timer without installing them. Install them into `~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then `systemctl --user enable --now agent-taskwatch-scan.timer`.
 3. Submit jobs with `submit`.
 
 See [installation](docs/configuration.md#installation) for the full steps. To remove, disable and delete the two units; the state directory is kept.

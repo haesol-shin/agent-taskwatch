@@ -1,11 +1,11 @@
 # Contributing
 
-Thank you for your interest in hermes-taskwatch. The rules are short.
+Thank you for your interest in agent-taskwatch. The rules are short.
 
 ## Before you start
 
 - Open an issue to report a bug or to propose work you are not going to implement yourself.
-- If you are going to implement a change yourself, do not open an issue for it first. Open the pull request directly. For a new feature or a larger change, start a discussion in [Discussions](https://github.com/haesol-shin/hermes-taskwatch/discussions) before you write code, so the approach is agreed.
+- If you are going to implement a change yourself, do not open an issue for it first. Open the pull request directly. For a new feature or a larger change, start a discussion in [Discussions](https://github.com/haesol-shin/agent-taskwatch/discussions) before you write code, so the approach is agreed.
 - If an issue for the change already exists, link it from the pull request.
 
 ## Development

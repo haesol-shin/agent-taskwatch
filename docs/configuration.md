@@ -256,7 +256,7 @@ wake only prints a warning. A failed step does not wake, so the timer spaces
 its retries.
 
 `taskwatch --root <root> init --unit-dir <empty-unit-staging-directory>` writes
-`hermes-taskwatch-scan.service` and `.timer` without installing, reloading, or
+`agent-taskwatch-scan.service` and `.timer` without installing, reloading, or
 enabling them. Existing files are refused. The service calls the standalone
 `scan` with the current interpreter and explicit root. Inspect the staged files
 and replace the existing service only as part of an approved installation.
@@ -278,9 +278,18 @@ Do these steps in order on the intended host. Stop at the first failure.
 1. If `<root>/taskwatch/jobs-config.json` already exists, add `deliver_command` to it before running `init` (see [Delivery](#delivery)); `init` validates existing config without changing it. Fresh installations can keep the init-then-edit order below.
 2. Stage the units: `taskwatch --root <root> init --unit-dir <empty-unit-staging-directory>`. This also writes `jobs-config.json` if absent. Nothing is installed or enabled.
 3. Edit `<root>/taskwatch/jobs-config.json`, including `deliver_command` (see [Delivery](#delivery)).
-4. Inspect the staged `hermes-taskwatch-scan.service` and `.timer`, install them into `~/.config/systemd/user/`, then run `systemctl --user daemon-reload`.
-5. Enable the timer with `systemctl --user enable --now hermes-taskwatch-scan.timer`. Confirm it is enabled and active, and confirm linger with `loginctl show-user <user> -p Linger` if jobs must survive logout.
+4. Inspect the staged `agent-taskwatch-scan.service` and `.timer`, install them into `~/.config/systemd/user/`, then run `systemctl --user daemon-reload`.
+5. Enable the timer with `systemctl --user enable --now agent-taskwatch-scan.timer`. Confirm it is enabled and active, and confirm linger with `loginctl show-user <user> -p Linger` if jobs must survive logout.
 6. Submit jobs with `taskwatch --root <root> submit <approved-job.json>`.
+
+### Reinstall after the rename
+
+The distribution is `agent-taskwatch` and the units are `agent-taskwatch-scan.service` and `.timer`. The command `taskwatch` and the import package `taskwatch` keep their names. On a host that runs the old units, with no job running:
+
+1. Install the new distribution with `uv tool install --force <checkout>`; the old tool directory no longer matches the name.
+2. Stop and disable the old timer: `systemctl --user disable --now hermes-taskwatch-scan.timer`, then remove the old `hermes-taskwatch-scan.*` files from `~/.config/systemd/user/`.
+3. Stage new units with `taskwatch --root <root> init --unit-dir <empty-unit-staging-directory>`, install them, run `systemctl --user daemon-reload`, and enable `agent-taskwatch-scan.timer`.
+4. Point `review_command[0]` in `jobs-config.json` at the new tool directory, then run `uv tool uninstall hermes-taskwatch`.
 
 ### Delivery
 

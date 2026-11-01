@@ -1,5 +1,5 @@
 [project]
-name = "hermes-taskwatch"
+name = "agent-taskwatch"
 version = "0.0.0"
 description = "Standalone job runner for approved agent work: schedule, check, review, and deliver."
 readme = "README.md"
@@ -19,14 +19,14 @@ taskwatch = "taskwatch.job_cli:main"
 packages = ["taskwatch"]
 
 [tool.setuptools.data-files]
-"share/hermes-taskwatch/review" = ["docs/review/*.md"]
-"share/hermes-taskwatch/launch" = ["docs/launch/*.md"]
-"share/hermes-taskwatch/kinds" = ["docs/kinds/*.md"]
+"share/agent-taskwatch/review" = ["docs/review/*.md"]
+"share/agent-taskwatch/launch" = ["docs/launch/*.md"]
+"share/agent-taskwatch/kinds" = ["docs/kinds/*.md"]
 
 [project.urls]
-Repository = "https://github.com/haesol-shin/hermes-taskwatch"
-Changelog = "https://github.com/haesol-shin/hermes-taskwatch/blob/main/CHANGELOG.md"
-Issues = "https://github.com/haesol-shin/hermes-taskwatch/issues"
+Repository = "https://github.com/haesol-shin/agent-taskwatch"
+Changelog = "https://github.com/haesol-shin/agent-taskwatch/blob/main/CHANGELOG.md"
+Issues = "https://github.com/haesol-shin/agent-taskwatch/issues"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
