@@ -187,7 +187,7 @@ def test_the_shipped_guidelines_and_launch_layers_load_for_every_review():
 def test_the_job_copy_and_the_source_folder_give_the_same_guideline_text(tmp_path):
     copy = tmp_path / "job"
     copy.mkdir()
-    _guidelines(SimpleNamespace(review="code"), copy)  # type: ignore[arg-type]
+    _guidelines(SimpleNamespace(review="code", outputs=()), copy)  # type: ignore[arg-type]
     source = _guideline_files(docs_dir("review"), ["code"])
     assert _guideline_files(copy / "review-docs", ["code"]) == source
 
