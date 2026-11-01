@@ -36,6 +36,7 @@ from .fingerprint import (
 from .job_env import job_environment
 from .job_rpc import RpcAborted, RpcClient, RpcError
 from .jobs import (
+    LANGUAGE_NAMES,
     MAX_FIX_ROUNDS,
     MAX_RECOVERIES,
     UNIT_FILES,
@@ -308,11 +309,29 @@ def _kind_text(job: JobState) -> str:
         raise StepError(f"kind documents are unreadable: {exc}") from exc
 
 
+def _language_name(config: JobConfig) -> str | None:
+    return LANGUAGE_NAMES[config.language] if config.language else None
+
+
+def _language_lines(config: JobConfig) -> list[str]:
+    """What the reviewer writes that the owner reads in the card; none when no language is set."""
+    name = _language_name(config)
+    if name is None:
+        return []
+    return [f"Write the `summary` of each finding and the items of `not_checked` in {name}."]
+
+
 def _workflow(ctx: Ctx) -> str:
     job = ctx.job
     progress = ctx.folder / job.progress
     checklist = ctx.folder / job.checklist
     work_inputs = "\n".join(f"- {p}" for p in job.inputs.get("work", [])) or "- (none)"
+    name = _language_name(ctx.config)
+    card_language = (
+        f"- Write the lines of the brief's `Card` section in {name}: the owner reads them.\n"
+        if name
+        else ""
+    )
     return f"""# Workflow for job {job.id} ({job.review})
 
 Work only in the workspace: {ctx.workspace}
@@ -340,7 +359,7 @@ Work inputs:
   result.
 - While working, run only the tests that cover the files you changed. Run the whole check once,
   with the `--run-command` option of the command in the End section, just before you end.
-- If you delegate to subagents, wait until each one finished.
+{card_language}- If you delegate to subagents, wait until each one finished.
 
 {_kind_text(job)}
 
@@ -574,6 +593,7 @@ def _review_message(
         *_subject_lines(ctx),
         *_text_lines(job, review_root),
         "If you delegate to subagents, wait until each one finished.",
+        *_language_lines(ctx.config),
         "",
         "Original request, in full:",
         job.prompt,

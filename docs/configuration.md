@@ -56,7 +56,7 @@ Optionally add `"commit_rules"`, an object of booleans, to turn on commit messag
 
 ### Language
 
-Optionally add `"language"`, `"en"` (default) or `"ko"`, to choose the three headings of the delivery card: `Changed` / `Small problems left` / `Not checked`, or `바뀐 것` / `남은 작은 문제` / `확인하지 못한 것`. Any other value is a config error. The `init` draft omits it, so a host that sets nothing gets English. The key sets only the labels the runner writes; the worker and the reviewer write the rest of the card in the language of the intent.
+Optionally add `"language"`, `"en"` or `"ko"`, to choose the language of the card; the three headings of the delivery card are `Changed` / `Small problems left` / `Not checked`, or `바뀐 것` / `남은 작은 문제` / `확인하지 못한 것`. Any other value is a config error. The `init` draft omits it. The key also names the language of the card text: `WORKFLOW.md` tells the worker to write the lines of the brief's `Card` section in that language, and the review prompt tells the reviewer to write each finding `summary` and the items of `not_checked` in it. Without the key, the labels are English and the worker and the reviewer write in the language of the intent.
 
 ```json
 "language": "ko"

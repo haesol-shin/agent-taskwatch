@@ -227,7 +227,7 @@ def card(jobs: Jobs, config: JobConfig, job: JobState) -> list[str]:
     own = sections(read_worker_brief(jobs, job)).get("Card", [])
     conclusion = [line for line in own if not line.startswith("-")]
     changed = [line for line in own if line.startswith("-")]
-    labels = LABELS[config.language]
+    labels = LABELS[config.language or "en"]
     lists = (
         [line[1:].strip() for line in changed],
         [f["summary"] for f in _ranked(review) if _small(f)],

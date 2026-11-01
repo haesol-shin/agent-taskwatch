@@ -391,7 +391,7 @@ def test_bad_commit_rules_are_a_config_error(tmp_path, rules):
         _config_with(tmp_path, rules)
 
 
-@pytest.mark.parametrize(("value", "expected"), [(None, "en"), ("en", "en"), ("ko", "ko")])
+@pytest.mark.parametrize(("value", "expected"), [(None, None), ("en", "en"), ("ko", "ko")])
 def test_language_is_read_from_the_config(tmp_path, value, expected):
     assert _config_with(tmp_path, None, value).language == expected
 
