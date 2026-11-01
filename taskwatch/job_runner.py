@@ -252,19 +252,20 @@ def _prepare(ctx: Ctx) -> dict[str, str]:
     return {str(p): _file_sha(p) for p in _guidelines(job, folder)}
 
 
-def _wait_command(ctx: Ctx) -> str:
+def _cli_command(ctx: Ctx, *words: str) -> str:
     argv = [
         sys.executable,
         "-m",
         "taskwatch.job_cli",
         "--root",
         str(ctx.jobs.state.root),
-        "wait",
-        ctx.job.id,
-        "--reason",
-        "<what you need approved>",
+        *words,
     ]
     return " ".join(shlex.quote(part) for part in argv)
+
+
+def _wait_command(ctx: Ctx) -> str:
+    return _cli_command(ctx, "wait", ctx.job.id, "--reason", "<what you need approved>")
 
 
 _APPROVAL_RULES = """## Approval
@@ -344,8 +345,13 @@ Work inputs:
 {_approval_text(ctx)}
 
 ## End
-Finish only when the checklist is complete and the required files exist. The check command runs
-outside your session: {json.dumps(job.check_command)}. A passing claim by you is not evidence.
+Before you finish, run this command. It prints what the runner's checks would reject (missing
+files, checklist, brief, public text, commit messages, finding records) and exits 0 when
+nothing is left; fix what it names and run it again:
+  {_cli_command(ctx, "check", job.id)}
+Add `--run-command` to also run the check command. Finish only when the checklist is complete
+and the required files exist. The check command runs outside your session:
+{json.dumps(job.check_command)}. A passing claim by you is not evidence.
 """
 
 
@@ -807,9 +813,8 @@ def _kill_group(pid: int) -> None:
         pass
 
 
-def _run_command(ctx: Ctx, seq: int) -> tuple[dict, list[str]]:
+def _run_command(ctx: Ctx, log: Path) -> tuple[dict, list[str]]:
     """Run the check argv in its own process group, and kill the whole group afterwards."""
-    log = ctx.folder / "logs" / f"check-{seq}.log"
     code, problems = -1, []
     try:
         with log.open("wb") as out:
@@ -873,11 +878,13 @@ def _finding_problems(ctx: Ctx, fingerprint: str, texts: dict) -> tuple[list[str
     }
 
 
-def _check_step(ctx: Ctx) -> int:
+def _shape(ctx: Ctx, problems: list[str]) -> tuple[str, str, dict, dict]:
+    """The shape checks of a result: files, texts, fingerprint and finding records.
+
+    The check step and `shape_problems` both call it, so the agent runs the rules the runner
+    applies. Problems are appended to `problems`; the rest is what the check record keeps.
+    """
     job = ctx.job
-    seq = len(job.checks) + len(job.reviews) + 1
-    run, problems = _run_command(ctx, seq)
-    # After the command: it may have changed or removed what the checks require.
     problems += _file_problems(ctx.jobs, job, ctx.workspace, ctx.folder)
     problems += _text_problems(job, ctx.workspace, ctx.env, ctx.config.bullet_one_line)
     texts = _public_texts(ctx, problems)
@@ -889,6 +896,32 @@ def _check_step(ctx: Ctx) -> int:
         problems.append(str(exc))
     found, notes = _finding_problems(ctx, fingerprint, texts)
     problems += found
+    return fingerprint, basis, texts, notes
+
+
+def shape_problems(
+    jobs: Jobs, config: JobConfig, job: JobState, run_command: bool = False
+) -> list[str]:
+    """What the check step would report about the shape of the result now. The result and the
+    records are only read; the check command runs only when asked, into its own log."""
+    if job.review_target is not None:
+        raise ValueError("a review-only job has no result to check")
+    if not job.workspace or not Path(job.workspace).is_dir():
+        raise ValueError("the job has no workspace yet")
+    ctx = Ctx(jobs, config, job, jobs.folder(job), Path(job.workspace))
+    problems: list[str] = []
+    if run_command:
+        problems += _run_command(ctx, ctx.folder / "logs" / "precheck.log")[1]
+    _shape(ctx, problems)
+    return problems
+
+
+def _check_step(ctx: Ctx) -> int:
+    job = ctx.job
+    seq = len(job.checks) + len(job.reviews) + 1
+    run, problems = _run_command(ctx, ctx.folder / "logs" / f"check-{seq}.log")
+    # After the command: it may have changed or removed what the checks require.
+    fingerprint, basis, texts, notes = _shape(ctx, problems)
     record = {
         "seq": seq,
         "at": _now(),

@@ -1,10 +1,12 @@
 """Pull request units: submit validation and the commit message rules of the check step."""
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from taskwatch import job_cli
 from taskwatch.checks import message_problems
 from taskwatch.jobs import Jobs
 from tests.git_fixture import git, make_repo
@@ -219,3 +221,45 @@ def test_the_commit_rule_switch_decides_whether_a_wrapped_bullet_fails(unit_env)
     problems = unit_env.problems()
     assert len(problems) == 1 and "continues the bullet on line 3" in problems[0]
     assert unit_env.get().stage == "fix"
+
+
+# --- the check command ----------------------------------------------------------------------
+
+
+def run_check(env, capsys, *extra) -> tuple[int, str]:
+    if not (env.jobs.state.root / "taskwatch" / "jobs-config.json").exists():
+        assert job_cli.main(["--root", str(env.jobs.state.root), "init"]) == 0
+        capsys.readouterr()
+    code = job_cli.main(["--root", str(env.jobs.state.root), "check", env.job.id, *extra])
+    return code, capsys.readouterr().out
+
+
+def test_the_check_command_names_a_missing_body_and_passes_once_it_is_added(unit_env, capsys):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    body = unit_env.folder() / "pr" / "pr" / "body.md"
+    body.unlink()
+    before = unit_env.get()
+    assert run_check(unit_env, capsys) == (1, "- required file is missing: pr/pr/body.md\n")
+    assert unit_env.get() == before  # read only: no check record, no stage change
+    unit_env.write_text("body.md", "body\n")
+    assert run_check(unit_env, capsys) == (0, "no problems\n")
+
+
+def test_the_check_command_runs_the_test_command_only_when_asked(unit_env, capsys):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    marker = unit_env.tmp / "ran"
+    script = f"open({str(marker)!r}, 'w').close()"
+    unit_env.run("check", check_command=(sys.executable, "-c", script))
+    marker.unlink()
+    assert run_check(unit_env, capsys)[0] == 0 and not marker.exists()
+    assert run_check(unit_env, capsys, "--run-command")[0] == 0 and marker.exists()
+
+
+def test_the_check_command_refuses_an_unknown_job(unit_env, capsys):
+    code = job_cli.main(["--root", str(unit_env.jobs.state.root), "check", "nope"])
+    assert code == 2 and "unknown job" in capsys.readouterr().err
+
+
+def test_the_workflow_end_section_names_the_check_command(unit_env):
+    end = (unit_env.folder() / "WORKFLOW.md").read_text(encoding="utf-8").split("## End")[1]
+    assert "taskwatch.job_cli" in end and f"check {unit_env.job.id}" in end

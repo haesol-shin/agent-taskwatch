@@ -6,7 +6,7 @@ A check that cannot read its input is not a pass. An unreadable progress or outp
 
 ## Job checks
 
-The check service runs the approved `check_command` in the job workspace and records its exit code and complete combined output. It then verifies required outputs, progress, and checklist.
+The check service runs the approved `check_command` in the job workspace and records its exit code and complete combined output. It then verifies required outputs, progress, and checklist. The agent can run the same shape checks inside its session with [`taskwatch check <job>`](configuration.md#checking-a-result-before-it-ends), so a missing file or field is fixed before the session ends instead of costing a fix round.
 
 The checklist is a JSON file with a nonempty `items` list. Each item has a boolean `passes`. A `false` item, a missing file, invalid JSON, or an empty list blocks progress.
 

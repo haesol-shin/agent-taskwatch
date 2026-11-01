@@ -43,6 +43,13 @@ def parser() -> argparse.ArgumentParser:
     needs.add_argument("--interval", type=_seconds(5), default=30, help="Poll seconds (min 5)")
     brief = commands.add_parser("brief", help="Print the decision brief of a job, composed on read")
     brief.add_argument("job")
+    check = commands.add_parser(
+        "check", help="Print what the runner's shape checks reject now; read only for the result"
+    )
+    check.add_argument("job")
+    check.add_argument(
+        "--run-command", action="store_true", help="Also run the job's check command"
+    )
     text = commands.add_parser("text", help="Write the reviewed title and body of a pull request")
     text.add_argument("job")
     text.add_argument("--pr", help="Unit id; optional when the job has one unit")
@@ -79,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         return _brief(args, root)
     if args.command == "needs":
         return _needs(args, root)
+    if args.command == "check":
+        return _check(args, root)
     try:
         result = _dispatch(args, root)
     except (ValueError, OSError, RecordError, KeyError) as exc:
@@ -133,6 +142,27 @@ def _needs(args: argparse.Namespace, root: Path) -> int:
         return 1
     print(report)
     return code
+
+
+def _check(args: argparse.Namespace, root: Path) -> int:
+    """0 no problem, 1 problems printed, 2 unknown job or nothing to check."""
+    from .job_runner import shape_problems
+
+    try:
+        jobs = Jobs(root)
+        job = jobs.load().get(args.job)
+        if job is None:
+            print(f"taskwatch: unknown job {args.job}", file=sys.stderr)
+            return 2
+        problems = shape_problems(jobs, load_job_config(root), job, args.run_command)
+    except (ValueError, OSError, RecordError) as exc:
+        print(f"taskwatch: {exc}", file=sys.stderr)
+        return 2
+    if problems:
+        print("\n".join(f"- {problem}" for problem in problems))
+        return 1
+    print("no problems")
+    return 0
 
 
 def _brief(args: argparse.Namespace, root: Path) -> int:
