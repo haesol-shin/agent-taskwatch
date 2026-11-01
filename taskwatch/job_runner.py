@@ -20,10 +20,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import job_findings, job_text, job_workspace
+from . import brief, job_findings, job_text, job_workspace
 from .checks import checklist_problems, message_problems
 from .evidence import basis_of
-from .executor import _design_check, _finding_lines, _verdict_line
+from .executor import _design_check, _finding_lines, _scope, _verdict_line
 from .fingerprint import (
     FingerprintError,
     _git_ok,
@@ -285,7 +285,7 @@ def _approval_text(ctx: Ctx) -> str:
     exception = (
         ""
         if job.review_target is not None
-        else " (except this job's progress and checklist files, named in the workflow)"
+        else " (except this job's progress, checklist and brief files, named in the workflow)"
     )
     return _APPROVAL_RULES.format(
         source=job.approval_source,
@@ -293,6 +293,17 @@ def _approval_text(ctx: Ctx) -> str:
         command=_wait_command(ctx),
         exception=exception,
     )
+
+
+def _kind_text(job: JobState) -> str:
+    """The brief contract and the kind's own rules, read from docs/kinds when the step starts."""
+    names = ("brief.md", f"{kind_label(job)}.md")
+    try:
+        return "\n\n".join(
+            (_docs_source("kinds") / name).read_text(encoding="utf-8").strip() for name in names
+        )
+    except OSError as exc:
+        raise StepError(f"kind documents are unreadable: {exc}") from exc
 
 
 def _workflow(ctx: Ctx) -> str:
@@ -303,7 +314,7 @@ def _workflow(ctx: Ctx) -> str:
     return f"""# Workflow for job {job.id} ({job.review})
 
 Work only in the workspace: {ctx.workspace}
-Exception: the progress and checklist files named below, which are in the job folder.
+Exception: the progress, checklist and brief files named below, which are in the job folder.
 
 ## Start
 1. Read the intent: {job.intent}
@@ -320,10 +331,14 @@ Work inputs:
 - Keep `{progress}` current: what is done, what remains, evidence.
 - Keep `{checklist}` as JSON: {{"items": [{{"id": "...", "passes": true or false}}]}}.
   Set `passes` to true only when the evidence for that item exists.
-- The progress and checklist files are outside the workspace; never copy them into it.
+- Write the decision brief `{ctx.folder / "brief.md"}` for the owner, as the brief contract
+  below says. The check fails without it. State every choice you made, even a small one.
+- The progress, checklist and brief files are outside the workspace; never copy them into it.
 - Code jobs: commit everything in the workspace. The checks accept only a clean, committed
   result.
 - If you delegate to subagents, wait until each one finished.
+
+{_kind_text(job)}
 
 {_approval_text(ctx)}
 
@@ -381,6 +396,7 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
     if job.review_target is None:
         lines += [f"Progress file: {ctx.folder / job.progress}"]
         lines += [f"Checklist file: {ctx.folder / job.checklist}"]
+        lines += [f"Brief file: {ctx.folder / 'brief.md'}"]
     for path in job.inputs.get("work", []):
         lines.append(f"Work input: {path}")
     lines += _predecessor_lines(ctx)
@@ -421,6 +437,7 @@ def _subject_lines(ctx: Ctx) -> list[str]:
             f"Reviewed result: {ctx.workspace} (files: {', '.join(job.outputs)})",
             f"Result fingerprint: {job.fingerprint}",
             f"Check output: {log}",
+            f"Brief: {ctx.folder / 'brief.md'} (compare it with the result, rule C-19)",
         ]
     if "commit" in target:
         what = f"commit {target['commit']} of the repository at {ctx.workspace}"
@@ -733,6 +750,7 @@ def _file_problems(job: JobState, workspace: Path, folder: Path) -> list[str]:
         for name in UNIT_FILES:
             if not job_text.unit_file(folder, unit["id"], name).is_file():
                 problems.append(f"required file is missing: pr/{unit['id']}/{name}")
+    problems += brief.problems(folder / "brief.md", (workspace, folder, Path(job.target)))
     return problems
 
 
@@ -1014,12 +1032,15 @@ def _judge(ctx: Ctx, body: str, snapshot: Mapping) -> dict:
         "session_path": ctx.jobs.load()[job.id].session_path,
         "problems": [],
         "findings": [],
+        "checked": "",
+        "not_checked": "",
         **snapshot,
     }
     try:
         verdict, blocking, reviewer = _verdict_line(body)
         record.update(verdict=verdict, blocking=blocking, reviewer=reviewer)
         record["findings"] = _finding_lines(body, verdict)
+        record["checked"], record["not_checked"] = _scope(body)
         if job.review in {"code", "design"}:
             record["design_check"] = _design_check(body, record["findings"])
     except ValueError as exc:

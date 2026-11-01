@@ -18,7 +18,10 @@ from tests.test_public_text import UnitEnv
 from tests.verdicts import CODE_PASS
 
 REPLY = {"reply": f"{CODE_PASS}\nNo findings."}
-PLAIN_PASS = '{"verdict": "PASS", "blocking": false, "reviewer": "r"}'
+PLAIN_PASS = (
+    '{"verdict": "PASS", "blocking": false, "reviewer": "r",'
+    ' "checked": "the diff", "not_checked": "runtime"}'
+)
 
 
 @pytest.fixture

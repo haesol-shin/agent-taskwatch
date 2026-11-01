@@ -11,7 +11,13 @@ DESIGN_CHECK = {
 
 def verdict(kind: str = "PASS", **extra) -> str:
     blocking = kind == "FAIL"
-    obj = {"verdict": kind, "blocking": blocking, "reviewer": "reviewer.invalid"}
+    obj = {
+        "verdict": kind,
+        "blocking": blocking,
+        "reviewer": "reviewer.invalid",
+        "checked": "the diff",
+        "not_checked": "runtime",
+    }
     return json.dumps({**obj, "design_check": DESIGN_CHECK, **extra})
 
 

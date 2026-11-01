@@ -6,9 +6,10 @@ from pathlib import Path
 import pytest
 
 from taskwatch.executor import DESIGN_KEYS, _design_check, _finding_lines, _verdict_line
+from taskwatch.job_runner import run_job
 from taskwatch.jobs import SPEC_HEADINGS, Jobs, spec_sections
 from tests.spec_fixture import VALID_SPEC
-from tests.test_job_runner import Env
+from tests.test_job_runner import BRIEF, Env
 from tests.test_jobs import payload
 from tests.verdicts import CODE_FAIL, CODE_PASS, DESIGN_CHECK
 
@@ -92,7 +93,14 @@ def test_the_template_file_and_the_check_name_the_same_headings():
 
 def with_check(check) -> str:
     return json.dumps(
-        {"verdict": "PASS", "blocking": False, "reviewer": "r", "design_check": check}
+        {
+            "verdict": "PASS",
+            "blocking": False,
+            "reviewer": "r",
+            "checked": "the diff",
+            "not_checked": "runtime",
+            "design_check": check,
+        }
     )
 
 
@@ -187,12 +195,16 @@ def ready(env: Env) -> None:
             "out.txt": "ok\n",
             "PROGRESS.md": "done\n",
             "checklist.json": '{"items": [{"id": "a", "passes": true}]}',
+            "brief.md": BRIEF,
         }
     )
     assert env.run("check") == 0
 
 
-NO_CHECK = '{"verdict": "PASS", "blocking": false, "reviewer": "r"}'
+NO_CHECK = (
+    '{"verdict": "PASS", "blocking": false, "reviewer": "r",'
+    ' "checked": "the diff", "not_checked": "runtime"}'
+)
 
 
 def test_a_design_review_needs_the_design_check(tmp_path, monkeypatch):
@@ -224,3 +236,20 @@ def test_the_review_message_carries_the_approval_but_not_the_wait_command(tmp_pa
     prompt = env.prompts()[-1]
     assert "Approval source: msg-1" in prompt and "Approval scope: task-1" in prompt
     assert "job_cli" not in prompt and "--reason" not in prompt
+
+
+@pytest.mark.parametrize("missing", ["checked", "not_checked"])
+def test_a_review_must_say_what_it_checked_and_did_not_check(tmp_path, monkeypatch, missing):
+    env = Env(tmp_path, monkeypatch)
+    ready(env)
+    partial = json.loads(NO_CHECK)
+    partial[missing] = " "
+    env.scenario([{"reply": json.dumps(partial)}, {"reply": NO_CHECK}])
+    assert env.run("review") == 0
+    record = env.get().reviews[-1]
+    assert not record["ok"] and f"the verdict line needs a nonempty {missing}" in record["problems"]
+    assert env.get().stage == "fix"
+    env.put("review")
+    assert run_job(env.jobs, env.config, env.job.id, env.attempt) == 0
+    record = env.get().reviews[-1]
+    assert (record["ok"], record["checked"], record["not_checked"]) == (True, "the diff", "runtime")
