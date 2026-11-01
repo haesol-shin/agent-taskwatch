@@ -15,9 +15,11 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+from . import choices
 from .job_env import job_environment
 from .jobs import JobConfig, Jobs, JobState
 from .kinds import kind_label
+from .pointers import POINTER, pointer_problem, pointers
 
 SECTIONS = (
     "Why",
@@ -29,9 +31,6 @@ SECTIONS = (
 MAX_LINES = 60
 MAX_WHY_LINES = 3
 MAX_ITEMS = 8
-# A path with an extension, then `:line` or `:first-last`. A URL or a clock time does not match:
-# the path must start at a boundary that is not `/`, `:`, `.`, `-` or a word character.
-POINTER = re.compile(r"(?<![\w.:/-])(/?(?:[\w.-]+/)*[\w-][\w.-]*\.\w+):(\d+)(?:-(\d+))?")
 _HEADING = re.compile(r"^##\s+(.*?)\s*$")
 
 
@@ -49,8 +48,17 @@ def sections(text: str) -> dict[str, list[str]]:
     return found
 
 
-def problems(path: Path, roots: tuple[Path, ...]) -> list[str]:
-    """Why the brief at `path` fails the contract; empty when it passes."""
+def problems(
+    path: Path,
+    roots: tuple[Path, ...],
+    awaiting: tuple[str, ...] = (),
+    listed: tuple[str, ...] = (),
+) -> list[str]:
+    """Why the brief at `path` fails the contract; empty when it passes.
+
+    `awaiting` are pick ids that `Choices made` must mark as awaiting the owner; `listed` are
+    ids it must list.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -67,9 +75,30 @@ def problems(path: Path, roots: tuple[Path, ...]) -> list[str]:
     if len(text.splitlines()) > MAX_LINES:
         issues.append(f"{path.name}: more than {MAX_LINES} lines")
     issues += _size_problems(found)
-    for rel, first, last in _pointers(text):
-        issues += _pointer_problem(rel, first, last, roots)
+    issues += _choice_problems(found.get("Choices made", []), awaiting, listed)
+    for rel, first, last in pointers(text):
+        issues += [f"brief.md: {p}" for p in pointer_problem(rel, first, last, roots)]
     return issues
+
+
+def _mentions(ident: str, text: str) -> bool:
+    return re.search(rf"(?<![\w.]){re.escape(ident)}(?![\w.])", text) is not None
+
+
+def _choice_problems(
+    lines: list[str], awaiting: tuple[str, ...], listed: tuple[str, ...]
+) -> list[str]:
+    issues = [
+        f"brief.md: Choices made must mark pick {ident} as `{choices.AWAITING}`"
+        for ident in awaiting
+        if not any(_mentions(ident, line) and choices.AWAITING in line for line in lines)
+    ]
+    text = "\n".join(lines)
+    return issues + [
+        f"brief.md: Choices made does not list {ident}"
+        for ident in listed
+        if not _mentions(ident, text)
+    ]
 
 
 def _empty(name: str, lines: list[str]) -> bool:
@@ -101,38 +130,6 @@ def _ends_with_pointer(line: str) -> bool:
     for last in POINTER.finditer(line):
         pass
     return last is not None and not line[last.end() :].strip(" .,;:)`*_")
-
-
-def _pointers(text: str) -> list[tuple[str, int, int]]:
-    return [
-        (m.group(1), int(m.group(2)), int(m.group(3) or m.group(2))) for m in POINTER.finditer(text)
-    ]
-
-
-def resolve(rel: str, roots: tuple[Path, ...]) -> Path | None:
-    """The existing file `rel` names under one of the roots, else None."""
-    for root in roots:
-        try:
-            base = root.resolve()
-            candidate = (base / rel).resolve()
-        except OSError:
-            continue
-        if candidate.is_file() and (candidate == base or base in candidate.parents):
-            return candidate
-    return None
-
-
-def _pointer_problem(rel: str, first: int, last: int, roots: tuple[Path, ...]) -> list[str]:
-    path = resolve(rel, roots)
-    if path is None:
-        return [f"brief.md: pointer names no file: {rel}"]
-    try:
-        count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
-    except OSError as exc:
-        return [f"brief.md: pointer file cannot be read: {rel}: {exc}"]
-    if first < 1 or last < first or last > count:
-        return [f"brief.md: pointer {rel}:{first}-{last} is outside the file ({count} lines)"]
-    return []
 
 
 # --- composition ---------------------------------------------------------------------------
@@ -173,8 +170,11 @@ def compose(jobs: Jobs, config: JobConfig, job: JobState, *, card: bool = False)
     review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
     worker = sections(read_worker_brief(jobs, job))
     lines = _facts(jobs, config, job, review)
-    for name in ("Why", "What changed and why", "Decisions needed"):
+    for name in ("Why", "What changed and why"):
         lines += _section(name, worker.get(name) or ["(none)"], card)
+    lines += _section(
+        "Decisions needed", _picks(job, card) or worker.get("Decisions needed") or ["(none)"], card
+    )
     lines += _section("Remaining findings", _finding_lines(review), card)
     if not card:
         lines += [
@@ -186,6 +186,23 @@ def compose(jobs: Jobs, config: JobConfig, job: JobState, *, card: bool = False)
         hidden = len(lines) - MAX_FULL_LINES + 1
         lines = [*lines[: MAX_FULL_LINES - 1], f"... {hidden} more lines in the worker brief"]
     return lines
+
+
+def _picks(job: JobState, card: bool) -> list[str]:
+    """The owner's picks of a design job, rendered from its validated `choices.json`."""
+    if not choices.is_design(job) or not job.workspace:
+        return []
+    data, _ = choices.load(Path(job.workspace) / choices.FILE)
+    try:
+        return choices.render_picks(data, card=card) if data else []
+    except (KeyError, TypeError):
+        return []  # an invalid file is the check's problem; the worker's text stands in
+
+
+def reply_template(job: JobState) -> str | None:
+    """The one line that ends a message with picks in it: how the owner answers."""
+    count = choices.pick_count(Path(job.workspace)) if choices.is_design(job) else 0
+    return choices.REPLY if count and job.workspace else None
 
 
 def _section(name: str, lines: list[str], card: bool) -> list[str]:

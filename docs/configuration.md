@@ -377,7 +377,7 @@ move the job to `queued`, so a watcher started after them waits for the next sto
 `taskwatch --root <root> needs` lists what waits for the owner and prints a `cursor` (the
 byte size of `jobs.jsonl` it read). It is read only: no lock, nothing written, derived on
 every call. Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and
-their briefs and counts the decisions in their `brief.md`; otherwise it shows the reason),
+their briefs and counts the decisions in their `brief.md`, or the picks of a design predecessor with the reply template `ok | <id>=<key> | text`; otherwise it shows the reason),
 `NEEDS YOU` (a job in `user_wait`: reason, review round, open findings, rules that repeated
 in earlier reviews), `BLOCKED` (a queued job behind a cancelled or `user_wait` predecessor)
 and, only with `--from`, `FINISHED SINCE THE CURSOR` (a job that is `done` now and was not at

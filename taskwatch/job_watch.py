@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import choices
 from .brief import count_findings, decision_count
 from .jobs import JobState, _digest, _upgrade_record, _validate_record
 from .kinds import kind_label
@@ -333,7 +334,11 @@ def _gate_lines(root: Path, rows: dict[str, dict], job: JobState, kind: str, cmd
         lines += [f"  brief: {cmd} brief {p.id}" for p in preds]
     else:
         lines = [f"job {job.id} {kind}  gate: {_line(job.wait_reason)}", f"  goal: {_goal(job)}"]
-    decisions = sum(decision_count(_brief_text(root, p.id)) for p in preds)
+    picks = sum(choices.pick_count(Path(p.workspace)) for p in preds if choices.is_design(p))
+    if picks:
+        decisions = f"{picks} picks   reply: ok | <id>=<key> | text"
+    else:
+        decisions = str(sum(decision_count(_brief_text(root, p.id)) for p in preds))
     lines.append(f"  decisions: {decisions}   then: {cmd} approve {job.id} --reason <your words>")
     return lines
 

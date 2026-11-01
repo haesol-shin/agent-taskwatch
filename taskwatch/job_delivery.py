@@ -115,6 +115,8 @@ def _message(jobs: Jobs, config: JobConfig, job: JobState) -> Path:
         f"Review: {review_file}",
         *_text_lines(jobs, job, review),
     ]
+    if template := brief.reply_template(job):
+        lines.append(template)
     message = folder / "delivery.txt"
     _write_durable(message, "\n".join(lines) + "\n")
     return message
