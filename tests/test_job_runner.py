@@ -270,6 +270,64 @@ def test_check_failures_route_to_fix_then_user_wait(env):
     assert (job.stage, job.wait_reason) == ("user_wait", "check_failed")
 
 
+def _counting_check(env, counter: Path) -> None:
+    script = (
+        f"open({str(counter)!r}, 'a').write('x')\n"
+        "import sys\nsys.exit(0 if open('out.txt').read().strip() == 'ok' else 1)\n"
+    )
+    with env.jobs.state.lock():
+        env.jobs.save(replace(env.get(), check_command=(sys.executable, "-c", script)), 1500.0)
+
+
+def test_check_reuses_a_passing_command_run_for_the_same_result(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.seed({k: v for k, v in GOOD_FILES.items() if k != "PROGRESS.md"})
+    assert env.run("check") == 0
+    first = env.get().checks[-1]
+    assert counter.read_text() == "x" and first["exit_code"] == 0 and not first["ok"]
+    assert any("PROGRESS.md" in p for p in first["problems"])
+    # Only a record outside the result was missing: the command is not run again.
+    (env.folder() / "PROGRESS.md").write_text("done\n", encoding="utf-8")
+    assert env.run("check") == 0
+    job = env.get()
+    second = job.checks[-1]
+    assert counter.read_text() == "x"
+    assert second["ok"] and second["reused_check"] == first["seq"]
+    assert (second["log"], second["log_sha256"]) == (first["log"], first["log_sha256"])
+    assert job.stage == "review"
+    # Later reuse points at the run that happened, not at the reuse.
+    assert env.run("check") == 0
+    assert env.get().checks[-1]["reused_check"] == first["seq"]
+    # Reused checks still run the file checks.
+    (env.folder() / "PROGRESS.md").unlink()
+    assert env.run("check") == 0
+    assert any("PROGRESS.md" in p for p in env.get().checks[-1]["problems"])
+
+
+def test_check_runs_the_command_when_the_result_or_basis_changed(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.seed(GOOD_FILES)
+    assert env.run("check") == 0
+    assert counter.read_text() == "x"
+    (env.folder() / "work" / "out.txt").write_text("ok\nmore\n", encoding="utf-8")
+    assert env.run("check") == 0
+    assert counter.read_text() == "xx" and "reused_check" not in env.get().checks[-1]
+    (tmp_path / "spec.md").write_text(VALID_SPEC + "\nchanged\n", encoding="utf-8")
+    assert env.run("check") == 0
+    assert counter.read_text() == "xxx" and "reused_check" not in env.get().checks[-1]
+
+
+def test_check_does_not_reuse_a_failed_command_run(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.seed({**GOOD_FILES, "out.txt": "bad\n"})
+    assert env.run("check") == 0
+    assert env.run("check") == 0
+    assert counter.read_text() == "xx"
+
+
 def test_check_requires_files_checklist_and_progress(env):
     env.seed({"out.txt": "ok\n", "checklist.json": '{"items": [{"id": "a", "passes": false}]}'})
     assert env.run("check") == 0
