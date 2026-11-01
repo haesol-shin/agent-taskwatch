@@ -290,14 +290,13 @@ def _unanswered(job: JobState, ident: str, data: dict | None) -> list[str]:
 # --- what the owner reads ------------------------------------------------------------------
 
 
-def render_picks(data: Mapping, *, card: bool) -> list[str]:
-    """The pick list. The card has one line per pick; the full brief adds options and why."""
+def render_picks(data: Mapping) -> list[str]:
+    """The pick list of the full brief: each pick with its options and why."""
     lines = []
     for number, pick in enumerate(data.get("picks", []), 1):
         labels = {o["key"]: o["label"] for o in pick["options"]}
         rec = pick["recommended"]
         lines.append(f"{number}. {pick['id']}: {pick['question']} (recommend {rec}: {labels[rec]})")
-        if not card:
-            lines += [f"   {o['key']}) {o['label']} [{o['evidence']}]" for o in pick["options"]]
-            lines.append(f"   why: {pick['why']}")
+        lines += [f"   {o['key']}) {o['label']} [{o['evidence']}]" for o in pick["options"]]
+        lines.append(f"   why: {pick['why']}")
     return lines

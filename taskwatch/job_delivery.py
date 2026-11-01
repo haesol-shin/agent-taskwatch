@@ -94,31 +94,13 @@ def deliver_job(jobs: Jobs, config: JobConfig, job: JobState, now: float) -> Job
         return _finish(jobs, job, {**record, **_send(command, lock.fileno())}, now)
 
 
-def _text_lines(jobs: Jobs, job: JobState, review: dict) -> list[str]:
-    lines = []
-    for unit in job.public_text:
-        state = review.get("texts", {}).get(unit["id"], {})
-        lines.append(f"Public text {unit['id']}: {jobs.folder(job) / 'pr' / unit['id']}")
-        lines.append(f"Text fingerprint {unit['id']}: {state.get('fingerprint', 'unavailable')}")
-    return lines
-
-
 def _message(jobs: Jobs, config: JobConfig, job: JobState) -> Path:
-    """The brief card the owner reads, then the paths: the full brief, the review, the text."""
+    """The card the owner reads and nothing else; the paths are at the end of `taskwatch brief`."""
     folder = jobs.folder(job)
     review = job.reviews[-1] if job.reviews else {}
-    review_file = folder / "delivery-review.txt"
-    _write_durable(review_file, review.get("body", ""))
-    lines = [
-        *brief.compose(jobs, config, job, card=True),
-        f"Full brief: taskwatch --root {jobs.state.root} brief {job.id}",
-        f"Review: {review_file}",
-        *_text_lines(jobs, job, review),
-    ]
-    if template := brief.reply_template(job):
-        lines.append(template)
+    _write_durable(folder / "delivery-review.txt", review.get("body", ""))
     message = folder / "delivery.txt"
-    _write_durable(message, "\n".join(lines) + "\n")
+    _write_durable(message, "\n".join(brief.card(jobs, config, job)) + "\n")
     return message
 
 

@@ -391,7 +391,18 @@ def test_bad_commit_rules_are_a_config_error(tmp_path, rules):
         _config_with(tmp_path, rules)
 
 
-def _config_with(root, rules):
+@pytest.mark.parametrize(("value", "expected"), [(None, "en"), ("en", "en"), ("ko", "ko")])
+def test_language_is_read_from_the_config(tmp_path, value, expected):
+    assert _config_with(tmp_path, None, value).language == expected
+
+
+@pytest.mark.parametrize("value", ["fr", "", "KO", 1, None])
+def test_an_unknown_language_is_a_config_error(tmp_path, value):
+    with pytest.raises(ValueError, match="language"):
+        _config_with(tmp_path, None, value, explicit=True)
+
+
+def _config_with(root, rules, language=None, explicit=False):
     folder = root / "taskwatch"
     folder.mkdir(exist_ok=True)
     config = {
@@ -404,5 +415,7 @@ def _config_with(root, rules):
     }
     if rules is not None:
         config["commit_rules"] = rules
+    if language is not None or explicit:
+        config["language"] = language
     (folder / "jobs-config.json").write_text(json.dumps(config), encoding="utf-8")
     return load_job_config(root)
