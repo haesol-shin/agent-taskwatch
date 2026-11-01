@@ -24,6 +24,12 @@ Jobs that share a target folder cannot overlap; code jobs each have their own wo
 
 Details: [checks](docs/checks.md) and [configuration](docs/configuration.md).
 
+## Job kinds and chains
+
+A kind is a label over fields a job already has; there is no `kind` field. `review: source` is a research job, `review: design` a design job, `review: code` an implement job, and a job with a `review_target` is a review. Every job with a work stage writes a decision brief, `taskwatch brief <job>` prints it, and `taskwatch needs` lists what waits for you.
+
+A design job lists the choices that are yours to make (language, runtime, packages, layout, an existing tool) as picks with a recommended option; it never asks for permission, deploy or publish. Chain jobs with `predecessors`; a job that needs your decision on an earlier result carries `approval_required` and opens only after every predecessor is `done`. See [chains and gates](docs/configuration.md#chains-and-gates) and [kinds](docs/kinds/brief.md).
+
 ## Work folder lifecycle
 
 A `code` job works in `state/jobs/<id>/worktree` on its own branch, started from a freshly fetched `origin/<default branch>`. Its checklist and progress files live in the job folder, outside the result. When the job reaches `done` or `cancelled`, the scan removes a clean worktree, keeps a dirty one and records why, and deletes the branch only after it is merged or squash merged into `origin/<default branch>`. Job folders, records, reviews, and logs are never deleted. See [code job work folders](docs/configuration.md#code-job-work-folders).

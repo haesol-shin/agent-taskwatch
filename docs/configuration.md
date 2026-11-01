@@ -372,6 +372,27 @@ terminal(background=True, notify_on_complete=True, command="taskwatch --root <ro
 The report is a hint; re-read the state with `show` before acting. `approve` and `resume`
 move the job to `queued`, so a watcher started after them waits for the next stop.
 
+### Chains and gates
+
+A kind is a label derived from `review` and `review_target`; it names the contract in `docs/kinds/` that `WORKFLOW.md` carries.
+
+| Kind | Fields | Result | Checked by code |
+|---|---|---|---|
+| research | `review: source` | `result.md`, `claims.json`, `sources/` | source check (when `outputs` has `claims.json`), checklist, brief |
+| design | `review: design` | `design.md`, `choices.json` | `choices.json`, `check_command`, checklist, brief |
+| implement | `review: code` | committed branch | the repository's tests as `check_command`, clean commit, brief |
+| review | `review_target` set | the review record | none (no work stage) |
+
+Publishing is a gate, not a kind. The common chain is research, a gate, design, a gate, implement; a small change can skip the first two, and a design job with `claims.json` in `outputs` includes its own research.
+
+The submit rule for a caller that sends ordered units under one approval:
+
+1. Submit the first unit and read its id. Submit each next unit with `predecessors` naming the unit before it and the receipt key `<approval message>:<n>`. The message of the successor lists each predecessor's result, so the prompt needs no pasted path; for a stacked code unit set `base` to the predecessor's branch `<branch_prefix><first 8 characters of its id>`. Units with no order between them are submitted together without `predecessors`.
+2. A unit that needs the owner's decision on an earlier result (a design before its implementation) carries `approval_required: true`. It stays queued until every predecessor is `done`, then waits in `approval_wait` with the brief of the predecessor ready. Show the owner the output of `taskwatch brief <predecessor>`, then pass the owner's reply to `approve --reason`, preceded for picks by one line `PICKS: ok` or `PICKS: <id>=<key|text> ...`. The reply is appended to the approval source, so the worker and the reviewer see it as the owner's decision.
+3. A unit whose `spec`, `intent` or `inputs` must be a predecessor's output cannot be submitted early: those files are copied and hashed at submit. Submit it after the output exists.
+4. A cancelled or stopped predecessor leaves its successors queued; `needs` lists them as blocked. Cancel or resubmit them.
+5. Arm one `needs --wait --from <cursor>` for the room instead of one `watch` per job.
+
 ### What needs the owner
 
 `taskwatch --root <root> needs` lists what waits for the owner and prints a `cursor` (the
