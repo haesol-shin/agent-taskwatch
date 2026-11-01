@@ -5,6 +5,7 @@ All notable changes to hermes-taskwatch are documented here. The format is based
 ## [Unreleased]
 
 ### Added
+- `approve --reason` appends `Gate <date>: <reason>` to the approval source instead of replacing it, so the original approval and the owner's words at the gate both reach the worker and the reviewer.
 - A scan runs two seconds after a step ends and after `submit`, `approve` and `resume` (a transient `systemd-run --user` timer), so the next step no longer waits for the five-minute timer. A failed step does not wake, which keeps the timer's retry spacing. The scan records a `launched` event per step, and a suspected stall is stopped only after 300 seconds.
 - Code jobs accept an optional `public_text` list of pull request units. The check fails a unit whose commit message has a subject that is not `type(scope): summary` or `type: summary`, a subject or line over 72 characters, no blank line after the subject, or a trailer line, and fails a missing `pr/<id>/title.txt` or `pr/<id>/body.md` in the job folder.
 - One review covers a code job's diff and its public text. The reviewer reads a read-only snapshot of each unit's title, body and commit messages; a later text edit makes the PASS stale and starts a text-only round that shows the text diff. `taskwatch text <job> --out <dir>` writes the reviewed title and body with one `Review evidence:` line, and exits 2 when the text changed since the review, 3 when no review has passed.
@@ -57,6 +58,7 @@ All notable changes to hermes-taskwatch are documented here. The format is based
 
 ### Fixed
 
+- A job with `approval_required` and `predecessors` asked the owner before its predecessors finished. It now stays queued until every predecessor is `done`.
 - Verify declared output contents, including Git-ignored files, against PASS before delivery, and send stop notices without holding the global state lock.
 - Send one stop notice per wait entry and recheck accepted PASS fingerprints before result delivery.
 - Clarify safe plugin updates, default-profile timer pinning, production destinations, review executor responsibility, and user escalation; consolidate operational guidance.

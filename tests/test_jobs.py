@@ -179,7 +179,8 @@ def test_approval_records_exact_replacement_scope(tmp_path, capsys):
         == 0
     )
     current = jobs.load()[job.id]
-    assert current.approval_source == "message-2"
+    assert current.approval_source.startswith("message-1\nGate ")
+    assert current.approval_source.endswith(": message-2")
     assert current.approval_scope == "Write only the approved target"
     assert current.stage == "queued"
 

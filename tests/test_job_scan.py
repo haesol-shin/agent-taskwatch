@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -599,6 +600,75 @@ def test_blocked_predecessor_keeps_followers_waiting(board: Board, stage: str) -
     board.set(first, stage=stage, unit="")
     assert board.scan() == []
     assert board.get(second).wait_reason == f"predecessor:{first}"
+
+
+def test_gate_opens_only_after_every_predecessor_is_done(board: Board) -> None:
+    first = board.add()
+    other = board.add()
+    gated = board.add(predecessors=[first, other], approval_required=True)
+    board.scan()
+    assert (board.get(gated).stage, board.get(gated).wait_reason) == (
+        "queued",
+        f"predecessor:{first}",
+    )
+    board.kill(first)
+    board.set(first, stage="done", unit="", ended_at=board.clock)
+    board.scan()
+    assert board.get(gated).stage == "queued"  # `other` still runs
+    board.kill(other)
+    board.set(other, stage="done", unit="", ended_at=board.clock)
+    board.scan()
+    job = board.get(gated)
+    assert (job.stage, job.wait_reason, job.resume_stage, job.attempt) == (
+        "approval_wait",
+        "approval_required",
+        "work",
+        0,
+    )
+
+
+def test_gate_stays_closed_while_a_predecessor_awaits_delivery(board: Board, monkeypatch) -> None:
+    first = board.add()
+    gated = board.add(predecessors=[first], approval_required=True)
+    board.scan()
+    board.finish_step(first, "deliver_pending")
+    monkeypatch.setattr(job_scan, "deliver_job", lambda jobs, config, job, now: job)
+    board.scan()
+    assert board.get(first).stage == "deliver_pending"
+    assert (board.get(gated).stage, board.get(gated).wait_reason) == (
+        "queued",
+        f"predecessor:{first}",
+    )
+    assert board.get(gated).attempt == 0
+
+
+@pytest.mark.parametrize("stage", ["user_wait", "cancelled"])
+def test_gated_job_behind_a_blocked_predecessor_stays_queued(board: Board, stage: str) -> None:
+    first = board.add()
+    gated = board.add(predecessors=[first], approval_required=True)
+    board.scan()
+    board.set(first, stage=stage, unit="")
+    board.scan()
+    assert (board.get(gated).stage, board.get(gated).wait_reason) == (
+        "queued",
+        f"predecessor:{first}",
+    )
+
+
+def test_gated_job_without_predecessors_asks_at_once(board: Board) -> None:
+    job_id = board.add(approval_required=True)
+    board.scan()
+    assert board.get(job_id).stage == "approval_wait"
+
+
+def test_approve_appends_the_owner_words_to_the_approval_source(board: Board) -> None:
+    job_id = board.add(approval_required=True)
+    board.scan()
+    assert _run_cli(board, "approve", job_id, "--reason", "PICKS: a=A\nuse uv") == 0
+    job = board.get(job_id)
+    today = time.strftime("%Y-%m-%d")
+    assert job.approval_source == f"msg-1\nGate {today}: PICKS: a=A\nuse uv"
+    assert (job.stage, job.approval_required, job.approval_scope) == ("queued", False, "task-1")
 
 
 def test_corrupt_journal_starts_nothing(board: Board) -> None:
