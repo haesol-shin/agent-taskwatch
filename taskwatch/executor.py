@@ -6,7 +6,8 @@ A review output holds exactly one line that is a JSON object:
 
 Each finding has a heading `### F<n>` and one JSON line
 {"finding": "F<n>", "severity": "P0".."P3", "category": "<C-9 category>",
- "rule": "<rule id>", "location": "<where>"}.
+ "rule": "<rule id>", "location": "<where>", "summary": "<one sentence>"}.
+`summary` is optional here; a PASS needs one on every P2 or P3 finding (the runner checks it).
 The two sets of ids must match. Only these lines are read, never the free text.
 """
 
@@ -14,6 +15,7 @@ import json
 import re
 
 SEVERITIES = ("P0", "P1", "P2", "P3")
+MAX_SUMMARY_CHARS = 160
 CATEGORIES = ("intent", "evidence", "behavior", "clarity", "other")
 _HEADING = re.compile(r"^###\s+(F\d+)\b", re.MULTILINE)
 
@@ -60,15 +62,25 @@ def _finding_lines(body: str, verdict: str) -> list[dict]:
         for key in ("rule", "location"):
             if not isinstance(obj.get(key), str) or not obj[key].strip():
                 raise ValueError(f"finding {ident} needs a nonempty {key}")
-        findings.append(
-            {
-                "finding": ident,
-                "severity": obj["severity"],
-                "category": obj["category"],
-                "rule": obj["rule"].strip(),
-                "location": obj["location"].strip(),
-            }
-        )
+        finding = {
+            "finding": ident,
+            "severity": obj["severity"],
+            "category": obj["category"],
+            "rule": obj["rule"].strip(),
+            "location": obj["location"].strip(),
+        }
+        if "summary" in obj:
+            summary = obj["summary"]
+            if not isinstance(summary, str) or not summary.strip():
+                raise ValueError(f"finding {ident} has an empty summary")
+            summary = summary.strip()
+            if len(summary) > MAX_SUMMARY_CHARS or "\n" in summary:
+                raise ValueError(
+                    f"finding {ident} summary must be one line of at most "
+                    f"{MAX_SUMMARY_CHARS} characters"
+                )
+            finding["summary"] = summary
+        findings.append(finding)
     ids = [f["finding"] for f in findings]
     if len(set(ids)) != len(ids):
         raise ValueError("finding ids must be unique")
