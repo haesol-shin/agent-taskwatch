@@ -30,7 +30,7 @@ For a job with `public_text`, the review reads a read-only snapshot of each unit
 
 ## Scheduler checks
 
-The scanner starts ready jobs with free slots, preserves slots between steps, and holds a target until the old service is confirmed stopped. It records and recovers dead runs, two-scan stalls, and reboot interruptions.
+The scanner starts ready jobs with free slots, preserves slots between steps, and holds a target until the old service is confirmed stopped. It records and recovers dead runs, stalls (suspected, then stopped once the suspicion is 300 seconds old), and reboot interruptions. A scan runs two seconds after a step ends, besides the timer.
 
 Missing inputs, corrupt records, unknown service outcomes, exhausted recovery or fix budgets, approval waits, blocked predecessors, and cancellations prevent automatic completion.
 

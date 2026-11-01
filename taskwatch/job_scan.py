@@ -27,6 +27,10 @@ _SPAWN_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 _INPUT_ERRORS = (ValueError, OSError, KeyError)
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+# A stall must stay suspected this long before the service is stopped. Extra scans after a
+# step ends can run seconds apart, so "unchanged on the next scan" no longer means minutes.
+STALL_GRACE_SECONDS = 300
+WAKE_DELAY = "2s"
 
 
 class Systemd:
@@ -63,6 +67,23 @@ class Systemd:
             job.id,
             "--attempt",
             str(job.attempt),
+        ]
+        subprocess.run(argv, check=True, capture_output=True, timeout=30)
+
+    def wake(self) -> None:
+        """Run one extra scan shortly, so the next step does not wait for the timer."""
+        argv = [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            f"--on-active={WAKE_DELAY}",
+            sys.executable,
+            "-m",
+            "taskwatch.job_cli",
+            "--root",
+            str(self.root),
+            "scan",
         ]
         subprocess.run(argv, check=True, capture_output=True, timeout=30)
 
@@ -243,6 +264,8 @@ class _Scan:
                 self._save(replace(job, stall_suspected=False))
         elif not job.stall_suspected:
             self._save(self._event(replace(job, stall_suspected=True), "stall_suspected"))
+        elif self.now - _suspected_at(job) < STALL_GRACE_SECONDS:
+            return
         elif self.service.stop(job.unit):
             self._recover(self._event(job, "stall_stopped"))
         else:
@@ -328,6 +351,7 @@ class _Scan:
             error="",
         )
         # Reserve before the service call: a lost ack is found later by unit name.
+        job = self._event(job, "launched", stage=stage)
         self._save(job)
         self.launched.append(job.id)
         try:
@@ -358,6 +382,13 @@ class _Scan:
 
 def _rank(job: JobState) -> tuple[float, str]:
     return job.last_progress_at, job.id
+
+
+def _suspected_at(job: JobState) -> float:
+    for event in reversed(job.events):
+        if event.get("kind") == "stall_suspected":
+            return float(event.get("at", 0.0))
+    return 0.0
 
 
 def _shared_target(job: JobState) -> bool:

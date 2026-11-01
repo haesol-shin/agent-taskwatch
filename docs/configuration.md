@@ -236,7 +236,11 @@ job state are in `show <id>`.
 ### Timer entry point
 
 Install the scan timer with the units that `init` stages; see
-[Installation](#installation). Keep the five-minute timer schedule.
+[Installation](#installation). The timer is the fallback and keeps its five-minute
+schedule. A scan also runs two seconds after a step ends and after `submit`,
+`approve` and `resume`, through `systemd-run --user --on-active=2s`; a failed
+wake only prints a warning. A failed step does not wake, so the timer spaces
+its retries.
 
 `taskwatch --root <root> init --unit-dir <empty-unit-staging-directory>` writes
 `hermes-taskwatch-scan.service` and `.timer` without installing, reloading, or
@@ -361,8 +365,8 @@ the successor queued. An unrelated target can still start.
 Dead or reboot-interrupted runs resume only after the old service is known
 to have stopped. An unknown service outcome requires user judgment.
 Unchanged progress and output content first produces a stall suspicion;
-another unchanged scan stops the service and recovers. Log growth alone is
-not progress. Expected waits delay stall recovery.
+an unchanged scan at least 300 seconds later stops the service and recovers.
+Log growth alone is not progress. Expected waits delay stall recovery.
 
 Three consecutive failed recoveries stop for user judgment. Passing checks
 reset that recovery budget. The independent review has a separate per-cycle
