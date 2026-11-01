@@ -372,6 +372,36 @@ terminal(background=True, notify_on_complete=True, command="taskwatch --root <ro
 The report is a hint; re-read the state with `show` before acting. `approve` and `resume`
 move the job to `queued`, so a watcher started after them waits for the next stop.
 
+### What needs the owner
+
+`taskwatch --root <root> needs` lists what waits for the owner and prints a `cursor` (the
+byte size of `jobs.jsonl` it read). It is read only: no lock, nothing written, derived on
+every call. Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and
+their briefs and counts the decisions in their `brief.md`; otherwise it shows the reason),
+`NEEDS YOU` (a job in `user_wait`: reason, review round, open findings, rules that repeated
+in earlier reviews), `BLOCKED` (a queued job behind a cancelled or `user_wait` predecessor)
+and, only with `--from`, `FINISHED SINCE THE CURSOR` (a job that is `done` now and was not at
+the cursor, with its verdict, decision count and open findings). At most 20 jobs are shown.
+
+`needs --wait --from <cursor> [--timeout <seconds>] [--interval <seconds>]` blocks until the
+list holds an item the cursor did not, then prints the whole list and a new cursor. An item
+is `(job, stage, reason, entry)`, where `entry` counts the job's `wait`, `approve` and
+`resume` events, so a job that is answered and then stops again for the same reason wakes
+the watcher, and a re-save of the same stop does not. A cursor beyond the ledger lists
+everything again. Exit codes: `0` listed, `3` the `--timeout` (default 82800) passed, `2`
+usage error (`--wait` without `--from`), `1` other error such as a corrupt snapshot of a
+listed job. One watcher per room replaces one `watch` per job:
+
+```python
+terminal(
+    background=True,
+    notify_on_complete=True,
+    command="taskwatch --root <root> needs --wait --from <cursor>",
+)
+```
+
+The list is a hint; re-read the state with `show` before acting.
+
 ### Recovery and decisions
 
 The job retains its parallel slot through work, checks, review, and fixes.
