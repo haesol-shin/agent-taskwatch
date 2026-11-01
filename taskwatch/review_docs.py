@@ -31,7 +31,7 @@ def docs_dir(folder: str) -> Path | None:
     """The source checkout's docs folder, else the one installed with the package."""
     for base in (
         Path(__file__).resolve().parent.parent / "docs" / folder,
-        Path(sys.prefix) / "share" / "hermes-taskwatch" / folder,
+        Path(sys.prefix) / "share" / "agent-taskwatch" / folder,
     ):
         if base.is_dir():
             return base

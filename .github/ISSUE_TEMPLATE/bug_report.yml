@@ -41,7 +41,7 @@ body:
     id: versions
     attributes:
       label: Versions
-      placeholder: hermes-taskwatch 0.1.0, Python 3.12
+      placeholder: agent-taskwatch 0.1.0, Python 3.12
     validations:
       required: true
   - type: input

@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Questions and ideas
-    url: https://github.com/haesol-shin/hermes-taskwatch/discussions
+    url: https://github.com/haesol-shin/agent-taskwatch/discussions
     about: Ask questions and discuss ideas here.
   - name: Security report
-    url: https://github.com/haesol-shin/hermes-taskwatch/security/advisories/new
+    url: https://github.com/haesol-shin/agent-taskwatch/security/advisories/new
     about: Report a vulnerability privately.

@@ -269,8 +269,8 @@ def _init(root: Path, unit_dir: Path | None) -> dict:
             "[Service]\nType=oneshot\n" + f"ExecStart={command}\n"
         )
         for name, text in (
-            ("hermes-taskwatch-scan.service", service),
-            ("hermes-taskwatch-scan.timer", timer_text()),
+            ("agent-taskwatch-scan.service", service),
+            ("agent-taskwatch-scan.timer", timer_text()),
         ):
             path = unit_dir / name
             if path.exists():
