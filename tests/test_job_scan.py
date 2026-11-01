@@ -942,7 +942,7 @@ def test_review_fix_lost_start_consumes_a_round(board: Board) -> None:
     assert board.get(job_id).fix_rounds == 3
 
 
-def test_wake_schedules_one_scan_two_seconds_later(monkeypatch, tmp_path: Path) -> None:
+def test_wake_runs_one_scan_two_seconds_later_within_a_second(monkeypatch, tmp_path: Path) -> None:
     seen = []
     monkeypatch.setattr(subprocess, "run", lambda argv, **kw: seen.append(argv))
     REAL_WAKE(Systemd(tmp_path))
@@ -953,6 +953,7 @@ def test_wake_schedules_one_scan_two_seconds_later(monkeypatch, tmp_path: Path) 
             "--quiet",
             "--collect",
             "--on-active=2s",
+            "--timer-property=AccuracySec=1s",
             sys.executable,
             "-m",
             "taskwatch.job_cli",

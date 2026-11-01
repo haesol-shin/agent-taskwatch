@@ -33,6 +33,9 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 # step ends can run seconds apart, so "unchanged on the next scan" no longer means minutes.
 STALL_GRACE_SECONDS = 300
 WAKE_DELAY = "2s"
+# systemd.timer(5): AccuracySec defaults to 1min, so a 2s timer may fire up to a minute late
+# (measured AccuracyUSec=1min). 1s is the smallest value the man page recommends for precision.
+WAKE_ACCURACY = "1s"
 # A step writes logs, sessions, git objects and temporary files. Below this much free space a
 # relaunch is likely to die on ENOSPC again, so the scan stops instead of burning a recovery.
 DISK_FLOOR_BYTES = 256 * 1024 * 1024
@@ -83,6 +86,7 @@ class Systemd:
             "--quiet",
             "--collect",
             f"--on-active={WAKE_DELAY}",
+            f"--timer-property=AccuracySec={WAKE_ACCURACY}",
             sys.executable,
             "-m",
             "taskwatch.job_cli",
