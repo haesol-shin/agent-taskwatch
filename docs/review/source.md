@@ -24,6 +24,8 @@ The aim is to catch a number, a quotation, or a conclusion that the sources do n
 
 **S-8.** A one-line summary states the finding, not only the topic. A summary that names the subject and stops is not a finding.
 
+**S-9.** When the job saved its sources, the message names a table of each claim, its quote, its source and whether the deterministic check found the quote in the saved source. Judge support (whether a quote backs its claim, and what it does not claim) only for pairs the check found present. A failing check is not a review input: do not review a result whose check failed, and do not treat a missing table as a pass.
+
 ## Sources
 
 Generalized from checks used on notes that cite sources: match the passage, do not exaggerate, and look for what the note left out. Provenance is in the [folder README](README.md).
