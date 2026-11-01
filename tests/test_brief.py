@@ -187,10 +187,15 @@ def test_a_finding_line_has_its_id_and_the_reviewers_fix(tmp_path: Path) -> None
     assert "- F2 P3 K-2 (clarity): doc.md:2" in out
 
 
-def test_the_full_brief_is_cut_at_80_lines(tmp_path: Path) -> None:
-    jobs, config, job = _job(tmp_path, GOOD, [_finding(n) for n in range(1, 90)])
-    out = brief.compose(jobs, config, job)
-    assert len(out) == 80 and out[-1].startswith("... ") and "more lines" in out[-1]
+def test_the_cap_holds_the_whole_output_and_keeps_the_tail() -> None:
+    body = [f"line {n}" for n in range(100)]
+    tail = ("Worker brief: /x/brief.md", "reply: ok")
+    out = brief.cap(body, tail)
+    assert len(out) == 80
+    assert out[-2:] == list(tail)
+    assert out[-3] == "... 23 more lines omitted from this output"
+    assert out[-4] == "line 76"
+    assert brief.cap(body[:78], tail) == [*body[:78], *tail]
 
 
 def replace_job(job, review):

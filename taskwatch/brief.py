@@ -182,10 +182,18 @@ def compose(jobs: Jobs, config: JobConfig, job: JobState, *, card: bool = False)
             "Reviewer did not check: " + (review.get("not_checked") or "(not recorded)"),
         ]
     lines += _section("Where to look", worker.get("Where to look") or ["(none)"], card)
-    if not card and len(lines) > MAX_FULL_LINES:
-        hidden = len(lines) - MAX_FULL_LINES + 1
-        lines = [*lines[: MAX_FULL_LINES - 1], f"... {hidden} more lines in the worker brief"]
     return lines
+
+
+def cap(lines: list[str], tail: tuple[str, ...] = ()) -> list[str]:
+    """`lines` then `tail`, at most 80 lines in all. Lines are cut from `lines` only, so the
+    tail (the worker-brief path, the reply template) always reaches the reader."""
+    room = MAX_FULL_LINES - len(tail)
+    if len(lines) <= room:
+        return [*lines, *tail]
+    # The cut line takes one slot, so one more line is hidden than the output is over by.
+    hidden = len(lines) - room + 1
+    return [*lines[: room - 1], f"... {hidden} more lines omitted from this output", *tail]
 
 
 def _picks(job: JobState, card: bool) -> list[str]:
