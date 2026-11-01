@@ -44,6 +44,7 @@ from .jobs import (
     JobState,
     progress_fingerprint,
 )
+from .kinds import kind_label
 from .review_docs import docs_dir, profile_names
 
 STEPS = frozenset({"work", "fix", "check", "review"})
@@ -335,6 +336,37 @@ outside your session: {json.dumps(job.check_command)}. A passing claim by you is
 # --- messages ------------------------------------------------------------------------------
 
 
+def _predecessor_lines(ctx: Ctx) -> list[str]:
+    """One read-only block per predecessor. Nothing is copied: the spec says what to use."""
+    if not ctx.job.predecessors:
+        return []
+    records = ctx.jobs.load()
+    lines = ["", "Predecessor results (read only; the spec says how to use them):"]
+    for identifier in ctx.job.predecessors:
+        pred = records.get(identifier)
+        if pred is None:
+            lines.append(f"- {identifier}: not found")
+            continue
+        lines.append(f"- {pred.id} ({kind_label(pred)}), stage {pred.stage}")
+        lines += [f"  {line}" for line in _result_lines(ctx.jobs, ctx.config, pred)]
+    return lines
+
+
+def _result_lines(jobs: Jobs, config: JobConfig, pred: JobState) -> list[str]:
+    if pred.review == "code" and pred.review_target is None:
+        branch = pred.branch or f"{config.branch_prefix}{pred.id[:8]}"
+        result = [f"branch: {branch} in {pred.target}"]
+    elif pred.workspace:
+        result = [f"output: {Path(pred.workspace) / name}" for name in pred.outputs]
+    else:
+        result = ["output: (no workspace recorded)"]
+    return [
+        *result,
+        f"result fingerprint: {pred.fingerprint or '(none yet)'}",
+        f"brief: {jobs.folder(pred) / 'brief.md'}",
+    ]
+
+
 def _agent_message(ctx: Ctx, resumed: bool) -> str:
     job = ctx.job
     head = job.prompt
@@ -351,6 +383,7 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
         lines += [f"Checklist file: {ctx.folder / job.checklist}"]
     for path in job.inputs.get("work", []):
         lines.append(f"Work input: {path}")
+    lines += _predecessor_lines(ctx)
     lines += ["", _approval_text(ctx)]
     if ctx.stage == "fix":
         lines += ["", "This is a fix round. Fix exactly what follows, then finish."]
@@ -500,6 +533,7 @@ def _review_message(
     if prior:
         lines += _prior_lines(ctx, prior, review_root)
     lines += [f"Review input: {p}" for p in job.inputs.get("review", [])]
+    lines += _predecessor_lines(ctx)
     lines += ["", _layer("taskwatch.md")]
     if resumed:
         lines += ["", "You were interrupted. Review the current state again and answer in full."]

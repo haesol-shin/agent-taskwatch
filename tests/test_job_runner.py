@@ -543,3 +543,40 @@ def test_changed_review_profile_stops_job(env):
     assert env.run("check") == 1
     job = env.get()
     assert (job.stage, job.wait_reason) == ("user_wait", "inputs_invalid")
+
+
+def test_messages_list_each_predecessor_result_without_copying_it(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, review="design")
+    design = replace(env.get(), stage="done", fingerprint="fp-1", workspace=str(tmp_path / "ws"))
+    env.jobs.save(design, 1500.0)
+    code = env.jobs.submit(
+        {
+            "receipt_key": "k2",
+            "approval_source": "msg-1",
+            "approval_scope": "task-1",
+            "prompt": "next",
+            "review": "code",
+            "target": design.target,
+            "intent": design.intent,
+            "spec": design.spec,
+            "outputs": ["out.txt"],
+            "check_command": CHECK,
+            "checklist": "checklist.json",
+            "progress": "PROGRESS.md",
+            "predecessors": [design.id],
+        },
+        1600.0,
+    )
+    ctx = job_runner.Ctx(env.jobs, env.config, code, env.jobs.folder(code), tmp_path / "ws2")
+    for text in (
+        job_runner._agent_message(ctx, False),
+        job_runner._review_message(ctx, (), False, tmp_path / "rr"),
+    ):
+        assert f"- {design.id} (design), stage done" in text
+        assert f"output: {tmp_path / 'ws' / 'out.txt'}" in text
+        assert "result fingerprint: fp-1" in text
+        assert f"brief: {env.folder() / 'brief.md'}" in text
+    plain = job_runner._agent_message(
+        job_runner.Ctx(env.jobs, env.config, env.get(), env.folder(), tmp_path / "ws"), False
+    )
+    assert "Predecessor results" not in plain

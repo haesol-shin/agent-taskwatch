@@ -150,6 +150,14 @@ A repeated key returns the original job even if other arguments differ.
 The command records the caller's approval assertion; it cannot authenticate
 the conversation.
 
+A job with `predecessors` gets one block per predecessor in the work and review
+messages: its id, kind label (`research` for `review: source`, `design`,
+`implement` for `review: code`, `review` for a `review_target`), stage, result
+location (the output files in its workspace, or for a code job the branch
+`<branch_prefix><first 8 of the id>` in its target), result fingerprint and the
+path of its `brief.md`. The block is read only: nothing is copied, so input hashes
+and the review basis do not change, and the spec still says how to use the result.
+
 `approval_required` defaults to `false`. If `true`, the first scan moves the job
 to `approval_wait` before its first work run. With `predecessors`, the job stays
 `queued` (wait reason `predecessor:<id>`) until every predecessor is `done`, so the
