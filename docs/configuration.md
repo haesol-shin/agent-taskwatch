@@ -120,7 +120,7 @@ leaving it empty keeps the inherited environment. The `init` draft omits this ke
 
 ### Owner defaults
 
-Optional `<root>/taskwatch/defaults.json` holds standing owner answers for design jobs (`{"version": 1, "defaults": [{"id", "value", "scope": "global" | "<target path>", "source": "<owner words>"}]}`), validated against [`docs/kinds/defaults.schema.json`](kinds/defaults.schema.json). When the same `id` has several applicable entries, the most specific scope wins (a target path beats `global`; a longer matching path beats a shorter one), as in `git config` and Claude Code settings. Every design job's work and review messages name the file and its short SHA-256 hash (`Owner defaults: <root>/taskwatch/defaults.json (sha256 <12 hex> | absent)`), and the `choices.json` check fails a malformed file, an unknown `defaults_applied` id, or a pick whose `id` is already settled by an applicable default; see [`docs/kinds/design.md`](kinds/design.md).
+Optional `<root>/taskwatch/defaults.json` holds standing owner answers for design jobs (`{"version": 1, "defaults": [{"id", "value", "scope": "global" | "<target path>", "source": "<owner words>"}]}`), validated against [`docs/kinds/defaults.schema.json`](kinds/defaults.schema.json). Every design job's work and review messages name the file and its short SHA-256 hash (`Owner defaults: <root>/taskwatch/defaults.json (sha256 <12 hex> | absent)`); see [`docs/kinds/design.md`](kinds/design.md#choicesjson) for the scope precedence and `choices.json` check rules.
 
 ### Code job work folders
 
