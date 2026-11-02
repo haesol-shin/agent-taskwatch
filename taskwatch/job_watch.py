@@ -3,6 +3,7 @@
 Read only: no lock, no write to the state folder."""
 
 import json
+import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from . import choices
 from .brief import count_findings, decision_count
+from .job_cursor import generation
 from .jobs import JobState, _digest, _upgrade_record, _validate_record
 from .kinds import kind_label
 from .state import RECORD_VERSION, RecordError, state_dir
@@ -48,13 +50,33 @@ class _Ledger:
         self.offset = 0
         self.rows: dict[str, dict] = {}
         self.baseline: dict[str, dict] | None = {} if cursor is None else None
+        self.identity: int | None = None
+        self.cursor_identity: int | None = None
+        if cursor is not None and cursor >= 1 << 64:
+            self.cursor = cursor & ((1 << 64) - 1)
+            self.cursor_identity = cursor >> 64
+
+    def position(self) -> int:
+        if self.identity is None:
+            return 0
+        return (self.identity << 64) | self.offset
 
     def poll(self) -> None:
         try:
             with self.path.open("rb") as handle:
-                size = handle.seek(0, 2)
-                if size < self.offset:
+                info = os.fstat(handle.fileno())
+                size = info.st_size
+                identity = generation(self.path, info)
+                if identity != self.identity or size < self.offset:
                     self.offset, self.rows = 0, {}
+                self.identity = identity
+                if (self.cursor_identity is not None and self.cursor_identity != identity) or (
+                    self.cursor is not None and self.cursor_identity is None and identity & 1
+                ):
+                    # A restarted reader cannot reconstruct a discarded baseline.
+                    # Replay current needs rather than silently skipping a stop.
+                    if self.baseline is None:
+                        self.baseline = {}
                 handle.seek(self.offset)
                 data = handle.read(size - self.offset)
         except FileNotFoundError:
@@ -177,7 +199,7 @@ def _render(root: Path, ledger: _Ledger, items: list[_Item], old: set | None) ->
     )
     if old is not None:
         head += f", {counts[_SECTIONS[3]]} finished since the cursor"
-    lines = [head, f"cursor: {ledger.offset}"]
+    lines = [head, f"cursor: {ledger.position()}"]
     shown = items[:NEEDS_CAP]
     for name in _SECTIONS:
         group = [i for i in shown if i.section == name]

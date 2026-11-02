@@ -71,6 +71,11 @@ class State:
 def _append_line(path: Path, payload: Mapping[str, object], now: datetime) -> None:
     _repair_torn(path, now)
     _read_objects(path)
+    _append_validated_line(path, payload)
+
+
+def _append_validated_line(path: Path, payload: Mapping[str, object]) -> None:
+    """Append after the caller validated committed records and repaired the tail."""
     line = (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
     _make_dirs(path.parent)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
@@ -99,11 +104,26 @@ def _append_line(path: Path, payload: Mapping[str, object], now: datetime) -> No
 def _repair_torn(path: Path, now: datetime) -> Path | None:
     if not path.exists():
         return None
-    data = path.read_bytes()
-    if not data or data.endswith(b"\n"):
-        return None
-    newline = data.rfind(b"\n")
-    fragment = data[newline + 1 :]
+    with path.open("rb") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        if not size:
+            return None
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return None
+        end = size
+        chunks = []
+        while end:
+            start = max(0, end - 8192)
+            handle.seek(start)
+            chunk = handle.read(end - start)
+            newline = chunk.rfind(b"\n")
+            chunks.append(chunk[newline + 1 :] if newline >= 0 else chunk)
+            if newline >= 0:
+                break
+            end = start
+        fragment = b"".join(reversed(chunks))
+        keep = size - len(fragment)
     stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     dest = Path(f"{path}.torn-{stamp}")
     suffix = 1
@@ -113,7 +133,7 @@ def _repair_torn(path: Path, now: datetime) -> Path | None:
     # Name the fragment durably before truncating. Rewriting the prefix would
     # empty the file first, so a crash there would drop confirmed lines.
     _create_new(dest, fragment, 0o644)
-    keep = 0 if newline < 0 else newline + 1
+    # Only the uncommitted suffix is removed.
     fd = os.open(path, os.O_RDWR)
     try:
         os.ftruncate(fd, keep)

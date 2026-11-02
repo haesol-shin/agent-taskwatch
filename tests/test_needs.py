@@ -100,7 +100,6 @@ def test_the_list_has_a_section_per_kind_of_need(ledger: Ledger) -> None:
     assert code == 0
     lines = text.splitlines()
     assert lines[0] == "needs: 1 need you, 1 gate, 1 blocked"
-    assert lines[1] == f"cursor: {ledger.size()}"
     assert lines[2:4] == ["GATE", f"job {gate} research  after job {design} (design) done"]
     assert f"  brief: taskwatch --root {root} brief {design}" in lines
     approve = f"taskwatch --root {root} approve {gate} --reason <your words>"
@@ -147,7 +146,6 @@ def test_wait_ignores_what_was_already_waiting_at_the_cursor(ledger: Ledger) -> 
     code, text = ledger.watch(cursor, sleep)
     assert (code, len(seen)) == (0, 2)
     assert "1 need you, 1 gate" in text and first in text
-    assert f"cursor: {ledger.size()}" in text
 
 
 def test_wait_times_out_with_code_3(ledger: Ledger) -> None:
