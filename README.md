@@ -4,7 +4,7 @@ A job runner for approved agent work. It schedules each job, runs it through omp
 
 ## What it is not
 
-- It does not import or patch Hermes Agent. Hermes can submit jobs and watch them through the `taskwatch` command, as any caller can.
+- It does not import or patch Hermes Agent. Hermes can submit jobs and check what waits through the `taskwatch` command, as any caller can.
 - It does not approve work. Every job carries an approval record that the caller asserts; the runner cannot authenticate the conversation it came from.
 - It does not isolate what the runner's tools can read or write. Those tools have the user's permissions, and `approval_scope` is a recorded boundary, not operating-system isolation.
 - It does not merge or apply results.
@@ -58,7 +58,6 @@ taskwatch --root <root> submit <job.json>          # store an approved job
 taskwatch --root <root> scan                       # schedule job steps once
 taskwatch --root <root> run <job> --attempt <n>    # one reserved step; started by scan
 taskwatch --root <root> show [<job>]               # print job state
-taskwatch --root <root> watch <job>                # block until the job needs attention
 taskwatch --root <root> brief <job>                # print the decision brief, composed on read
 taskwatch --root <root> needs [--from <cursor> [--wait]]  # list what needs you; read only
 taskwatch --root <root> cancel <job> --reason <text>
@@ -67,7 +66,7 @@ taskwatch --root <root> approve <job> --reason <text> [--scope <text>]
 taskwatch --root <root> resume <job> --reason <text> # open a new recovery or fix cycle
 ```
 
-`--root` defaults to `HERMES_HOME`, then `~/.hermes`. `brief` exits `2` for an unknown job. `needs --wait` exits `0` when something new needs you, `3` at its `--timeout`, `2` without `--from`. `watch` exits `0` when the job needs attention, `3` when its own `--timeout` passes, `2` on a usage error or unknown job, and `1` on another error. `run` is started by `scan`; do not run it alongside the service.
+`--root` defaults to `HERMES_HOME`, then `~/.hermes`. `brief` exits `2` for an unknown job. `needs --wait` exits `0` when something new needs you, `3` at its `--timeout`, `2` without `--from`. `run` is started by `scan`; do not run it alongside the service.
 
 ## Limits
 

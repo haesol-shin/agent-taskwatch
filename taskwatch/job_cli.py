@@ -31,10 +31,6 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--attempt", type=int, required=True)
     show = commands.add_parser("show")
     show.add_argument("job", nargs="?")
-    watch = commands.add_parser("watch", help="Block until a job needs attention, then report")
-    watch.add_argument("job")
-    watch.add_argument("--timeout", type=_seconds(1), default=82800, help="Seconds (default 82800)")
-    watch.add_argument("--interval", type=_seconds(5), default=30, help="Poll seconds (min 5)")
     needs = commands.add_parser("needs", help="List what needs the owner; read only, no lock")
     needs.add_argument(
         "--from", dest="cursor", type=_seconds(0), help="Cursor from an earlier list"
@@ -79,8 +75,6 @@ def main(argv: list[str] | None = None) -> int:
     root = (
         args.root or Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
     ).resolve()
-    if args.command == "watch":
-        return _watch(args, root)
     if args.command == "text":
         return _text(args, root)
     if args.command == "brief":
@@ -109,18 +103,6 @@ def _wake(root: Path) -> None:
         Systemd(root).wake()
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"taskwatch: warning: wake failed: {exc}", file=sys.stderr)
-
-
-def _watch(args: argparse.Namespace, root: Path) -> int:
-    from .job_watch import watch
-
-    try:
-        code, report = watch(root, args.job, timeout=args.timeout, interval=args.interval)
-    except (ValueError, OSError, RecordError) as exc:
-        print(f"taskwatch: {exc}", file=sys.stderr)
-        return 1
-    print(report, file=sys.stderr if code == 2 else sys.stdout)
-    return code
 
 
 def _needs(args: argparse.Namespace, root: Path) -> int:

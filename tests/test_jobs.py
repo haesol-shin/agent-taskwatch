@@ -186,114 +186,6 @@ def test_approval_records_exact_replacement_scope(tmp_path, capsys):
     assert current.stage == "queued"
 
 
-def _stage_job(tmp_path, stage, **changes):
-    root = tmp_path / "root"
-    jobs = Jobs(root)
-    job = jobs.submit(payload(tmp_path))
-    if stage != "queued":
-        jobs.save(replace(job, stage=stage, **changes), 1.0)
-    return root, jobs, job
-
-
-@pytest.mark.parametrize(
-    "stage", ["approval_wait", "user_wait", "deliver_pending", "done", "cancelled"]
-)
-def test_watch_exits_at_once_when_already_stopped(tmp_path, capsys, stage):
-    root, _, job = _stage_job(tmp_path, stage, wait_reason="needs a decision", error="boom")
-    assert main(["--root", str(root), "watch", job.id]) == 0
-    out = capsys.readouterr().out
-    assert out.startswith(f"job {job.id}: {stage}")
-    assert len(out.splitlines()) <= 20
-    assert ("reason: needs a decision" in out) == True  # noqa: E712
-    assert "error: recorded" in out and "boom" not in out
-
-
-def test_watch_wakes_on_stage_change_and_ignores_other_snapshots(tmp_path):
-    from taskwatch.job_watch import watch
-
-    root, jobs, job = _stage_job(tmp_path, "queued")
-    other = jobs.submit(payload(tmp_path, receipt="message:2"))
-    steps = iter(["work", "other", "stop"])
-
-    def sleep(_):
-        step = next(steps)
-        if step == "work":
-            jobs.save(replace(job, stage="work", notices=({"status": "success"},)), 2.0)
-        elif step == "other":
-            jobs.save(replace(other, stage="done"), 3.0)
-        else:
-            jobs.save(replace(job, stage="user_wait", wait_reason="stuck"), 4.0)
-
-    code, report = watch(root, job.id, timeout=100, interval=5, sleep=sleep, clock=lambda: 0)
-    assert code == 0
-    assert "user_wait" in report and "reason: stuck" in report
-
-
-def test_watch_times_out_with_exit_3(tmp_path, capsys):
-    from taskwatch.job_watch import watch
-
-    root, _, job = _stage_job(tmp_path, "queued")
-    now = [0.0]
-    code, report = watch(
-        root,
-        job.id,
-        timeout=12,
-        interval=5,
-        clock=lambda: now[0],
-        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
-    )
-    assert code == 3 and "time limit" in report and now[0] == 12
-
-
-def test_watch_unknown_job_exits_2_and_usage_errors_exit_2(tmp_path, capsys):
-    root, _, _ = _stage_job(tmp_path, "queued")
-    assert main(["--root", str(root), "watch", "nope"]) == 2
-    with pytest.raises(SystemExit) as exc:
-        main(["--root", str(root), "watch", "nope", "--interval", "4"])
-    assert exc.value.code == 2
-
-
-def test_watch_never_writes_the_state_folder(tmp_path):
-    root, _, job = _stage_job(tmp_path, "done")
-
-    def snapshot():
-        return {
-            p: (p.stat().st_mtime_ns, p.stat().st_size) for p in (root / "taskwatch").rglob("*")
-        }
-
-    before = snapshot()
-    assert main(["--root", str(root), "watch", job.id]) == 0
-    assert main(["--root", str(root), "watch", "nope"]) == 2
-    assert snapshot() == before
-    empty = tmp_path / "empty"
-    assert main(["--root", str(empty), "watch", "x"]) == 2
-    assert not empty.exists()
-
-
-def test_watch_report_hides_error_text_keeps_output_paths_and_line_limit(tmp_path, capsys):
-    root, _, job = _stage_job(
-        tmp_path,
-        "user_wait",
-        error="Authorization: Bearer SYNTHETIC_SECRET",
-        workspace="/ws\n" * 30,
-        outputs=("a\n" * 30,),
-    )
-    assert main(["--root", str(root), "watch", job.id]) == 0
-    out = capsys.readouterr().out
-    assert "SYNTHETIC_SECRET" not in out
-    assert "output:" in out
-    assert len(out.splitlines()) <= 20
-
-
-def test_watch_refuses_unknown_record_version(tmp_path):
-    root, _, job = _stage_job(tmp_path, "done")
-    ledger = root / "taskwatch" / "state" / "jobs.jsonl"
-    row = json.loads(ledger.read_text().splitlines()[-1])
-    row["version"] = 2
-    ledger.write_text(json.dumps(row) + "\n")
-    assert main(["--root", str(root), "watch", job.id]) == 1
-
-
 @pytest.mark.parametrize(
     "old,new",
     [("code", "code"), ("design", "design"), ("document", "source"), ("research", "source")],
@@ -310,16 +202,10 @@ def test_record_written_with_the_old_kind_field_still_loads(tmp_path, old, new):
     assert jobs.load()[job.id].review == new
 
 
-def test_watch_reads_an_old_record_with_kind(tmp_path, capsys):
-    jobs = Jobs(tmp_path / "root")
-    job = jobs.submit(payload(tmp_path), 10)
-    data = {key: value for key, value in job.to_json().items() if key != "review"}
-    data["kind"], data["stage"] = "research", "done"
-    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    row = {"version": 1, "job": data, "sha256": hashlib.sha256(encoded).hexdigest()}
-    (jobs.state.dir / "jobs.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
-    assert main(["--root", str(tmp_path / "root"), "watch", job.id]) == 0
-    assert capsys.readouterr().out.startswith(f"job {job.id}: done")
+def test_watch_subcommand_is_rejected(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        main(["--root", str(tmp_path / "root"), "watch", "x"])
+    assert exc.value.code == 2
 
 
 def test_new_submission_with_kind_is_refused_and_names_review(tmp_path):
