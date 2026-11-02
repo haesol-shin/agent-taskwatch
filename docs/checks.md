@@ -38,6 +38,23 @@ Each finding in the output has a heading `### F<n>` and one JSON line with `find
 
 For a job with `public_text`, the review reads a read-only snapshot of each unit's title, body and commit messages, and the record keeps its hash and one text fingerprint per unit. A changed title, body or commit message makes an earlier PASS stop counting and starts a new review round; when the tree is the same the reviewer is told that only text changed and is shown the text diff. The one `Review evidence:` line is not part of the fingerprint. `taskwatch text <job> --out <dir>` writes the reviewed title and body, plus that line, and exits 2 when the text or the snapshot changed since the review, 3 when no review has passed.
 
+### Re-review scope
+
+For a code job, round 2 and later review the fix, not the whole job again. taskwatch, not the reviewer, decides whether the round is a delta round or a full review. The message of every such round holds the prior findings with the worker's record of each, the previously reviewed and current fingerprints, `git diff --stat` and the changed files of the delta (the diff from the last reviewed commit to the current one), the last check result, and the delta as a share of the first review's diff. The steps of a delta round are rules K-20 to K-22 of [the code guidelines](review/code.md).
+
+The round is a full review, judged as a first review with each prior finding still closed, when any of these holds. The thresholds are starting guesses, not measurements; tune them on the round records below after about ten jobs.
+
+| Code | Holds when | Effect |
+|---|---|---|
+| F1 | the delta touches a file that neither the first review's diff nor the diff up to the last reviewed commit contains | the reviewer reads those files in full as in a first review; the round stays a delta round |
+| F2 | the delta is over 50% of the first review's diff, or over 400 lines (added plus deleted) | full |
+| F3 | the base commit the result stands on differs from the one the last review recorded; a rebase onto newer work changes it, and a review record from before this field counts as different | full |
+| F5 | an earlier round had a P0 finding | full |
+| F6 | the delta touches a security path (`.github`, `.ssh`, `.env*`, `*.pem`, `*.key`, or a folder or file named `secret*`, `credential*`, `auth*`, `security*`) or a path the approval scope names, relative or absolute under the work folder or the target | full |
+| F7 | a rule of the last review's findings (not `other`) was already a finding of an earlier round, or the last check says a note's prevention did not hold | full |
+
+A diff that cannot be read (an unknown commit) is a full review too. Review-only jobs and design and source reviews have no commits to diff; they keep the message they had. The review record keeps the round data: `base`, `minutes` (how long the review step took), `new_findings` (findings whose rule and location no earlier round reported), `delta_ratio`, and for round 2 and later `rereview` with the mode, the conditions that held, the delta files and lines and the first review's lines. `base` is the parent of the oldest commit of the job's branch that no other branch or remote ref holds; it is the commit the job recorded when its work folder was made until the branch is rebased.
+
 ## Scheduler checks
 
 The scanner starts ready jobs with free slots, preserves slots between steps, and holds a target until the old service is confirmed stopped. It records and recovers dead runs, stalls (suspected, then stopped once the suspicion is 300 seconds old), and reboot interruptions. A scan runs two seconds after a step ends, besides the timer.

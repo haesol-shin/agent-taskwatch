@@ -139,11 +139,22 @@ class JobConfig:
     branch_prefix: str = DEFAULT_BRANCH_PREFIX
     bullet_one_line: bool = False
     language: str | None = None  # None: the card is written in the language of the intent
+    review_mode: str = "rpc"  # "print": the review command runs once per review, not over RPC
 
 
 COMMIT_RULES = ("bullet_one_line",)
 LANGUAGES = ("en", "ko")  # the keys of `brief.LABELS`
 LANGUAGE_NAMES = {"en": "English", "ko": "Korean"}
+REVIEW_MODES = ("rpc", "print")
+
+
+def _review_mode(obj: dict) -> str:
+    mode = obj.get("review_mode", "rpc")
+    if mode not in REVIEW_MODES:
+        raise ValueError(f"review_mode must be one of: {', '.join(REVIEW_MODES)}")
+    if mode == "print" and "review_command" not in obj:
+        raise ValueError("review_mode print needs review_command")
+    return mode
 
 
 def load_job_config(root: Path) -> JobConfig:
@@ -155,6 +166,7 @@ def load_job_config(root: Path) -> JobConfig:
         "branch_prefix",
         "commit_rules",
         "language",
+        "review_mode",
     } != {
         "version",
         "slots",
@@ -189,6 +201,7 @@ def load_job_config(root: Path) -> JobConfig:
     language = obj.get("language")
     if "language" in obj and language not in LANGUAGES:
         raise ValueError(f"language must be one of: {', '.join(LANGUAGES)}")
+    review_mode = _review_mode(obj)
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -206,6 +219,7 @@ def load_job_config(root: Path) -> JobConfig:
         prefix,
         rules.get("bullet_one_line", False),
         language,
+        review_mode,
     )
 
 

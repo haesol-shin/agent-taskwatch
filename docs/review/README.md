@@ -12,6 +12,7 @@ Read these files at the start of a review. They are the shared rules for a code 
    - a document that cites sources: [source.md](source.md)
 4. If the assignment names more than one review, read each named file. If it names none, read the one that matches the deliverable. A mixed deliverable needs each matching file.
 5. Read the project rules named below.
+6. On round 2 and later the message says whether the round is a delta round or a full review. taskwatch decides that with fixed conditions, listed in [Re-review scope](../checks.md#re-review-scope).
 
 Do not edit the deliverable. If a required input is missing, follow the incomplete-review rule in the common file. Do not pass.
 

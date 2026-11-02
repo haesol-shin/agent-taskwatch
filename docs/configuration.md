@@ -31,7 +31,7 @@ or seconds. `omp_command` is an argument list prefix. Checks use the submission'
 Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run
 independent reviews with a different command prefix. Like `omp_command`, it must
 be a nonempty list of nonempty strings. When omitted, reviews use `omp_command`;
-work and fix always use `omp_command`. Both commands receive `--mode rpc --no-ui`.
+work and fix always use `omp_command`. With the default `review_mode` (`"rpc"`), both commands receive `--mode rpc --no-ui`.
 The `init` draft omits this optional key.
 
 In `review_command` (and only there), an argument that is exactly `{guidelines}` becomes the
@@ -42,6 +42,47 @@ reads the agent definition and those guidelines when the review starts:
 ```json
 "review_command": ["python3", "-m", "taskwatch.reviewer_launch", "--agent", "/srv/example/reviewer.md",
                    "--guidelines", "{guidelines}", "--review", "{review}"]
+```
+
+### Reviewer other than omp
+
+Set `"review_mode": "print"` to review with a tool that is not omp (Codex, Claude Code, Gemini CLI, or any program). It needs `review_command` and adds no argument to it. The default is `"rpc"`; a host that sets nothing sees no change. Work and fix still run on `omp_command`.
+
+In print mode the command runs once per review, in the job's folder, with the review message on its standard input. Besides `{guidelines}` and `{review}`, an argument that is exactly `{schema}` becomes the path of the verdict JSON Schema file (a copy of [`docs/launch/review-verdict.schema.json`](launch/review-verdict.schema.json) in the job folder) and exactly `{output}` the path of a file where the tool may write its last message. The reply must be one JSON object that follows the schema; [`docs/launch/taskwatch-print.md`](launch/taskwatch-print.md) is the text the reviewer reads. The schema has the keys the verdict line and the finding lines have in an RPC review, so the same rules decide what is accepted.
+
+taskwatch looks for the verdict in the `{output}` file first, then in the standard output. In each it accepts the object itself (plain, or in a code fence), the object inside a wrapper (`structured_output` or `result` of `claude -p --output-format json`, `response` of `gemini -p --output-format json`), or the last line of a JSON-lines stream that holds it. It validates the object against the schema and fails the round with the schema path of the first errors (`$.findings[0].severity: 'P9' is not one of ...`) when it does not match; the raw reply is kept as the review text. There is no session, so there is no same-session repair: a malformed reply costs a round. A command that exits with a nonzero code or runs longer than `rpc_timeout` seconds fails the step with that reason.
+
+taskwatch cannot restrict the tools of the other command; see [the limits](review-launch.md#print-mode-limits). Give each tool its read-only flags, as below. These examples were written on 2026-11-02 from the tools' own help or official pages; only `codex` is installed on the host that wrote them, so the `claude` and `gemini` lines are not run here.
+
+Codex ([non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode) and `codex exec --help` of version 0.160.0): `--sandbox read-only` (read-only commands), `--output-schema` (the schema file), `-o` (the last-message file), `-` (read the prompt from stdin), `--ephemeral` (no session files), `--color never`. Add `--skip-git-repo-check` for a target that is not a Git repository.
+
+```json
+{
+  "review_mode": "print",
+  "review_command": ["codex", "exec", "--sandbox", "read-only", "--ephemeral", "--color", "never",
+                     "--output-schema", "{schema}", "-o", "{output}", "-"]
+}
+```
+
+Claude Code ([headless](https://code.claude.com/docs/en/headless) and [CLI reference](https://code.claude.com/docs/en/cli-reference)): `-p` reads the prompt from stdin; `--json-schema` takes the schema text, not a file, so a shell reads the file; `--permission-mode plan` and `--allowedTools` limit it to reading; `--output-format json` puts the validated object in `structured_output`. With `--bare` it skips hooks, plugins and `CLAUDE.md` but needs `ANTHROPIC_API_KEY`.
+
+```json
+{
+  "review_mode": "print",
+  "review_command": ["sh", "-c",
+                     "claude -p --permission-mode plan --allowedTools \"Read,Grep,Glob,Bash(git diff *),Bash(git log *),Bash(git show *)\" --output-format json --json-schema \"$(cat \"$1\")\"",
+                     "sh", "{schema}"]
+}
+```
+
+Gemini CLI ([headless](https://geminicli.com/docs/cli/headless/) and [CLI reference](https://geminicli.com/docs/cli/cli-reference/)): `-p` appends its text to the standard input and forces non-interactive mode; `--approval-mode plan` is its read-only mode; `--output-format json` returns `{"response": "...", "stats": {...}}`. It has no schema flag, so the reply follows the schema because the message names the file; a reply that does not is a failed round.
+
+```json
+{
+  "review_mode": "print",
+  "review_command": ["gemini", "-p", "Review as the instructions on standard input say, and answer with the one JSON object they describe.",
+                     "--approval-mode", "plan", "--output-format", "json"]
+}
 ```
 
 ### Commit rules
