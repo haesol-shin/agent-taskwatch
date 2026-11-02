@@ -3,6 +3,7 @@
 import json
 import subprocess
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ import pytest
 from taskwatch import job_runner, job_scan, job_workspace
 from taskwatch.job_cli import main as cli_main
 from taskwatch.job_env import job_environment
-from taskwatch.jobs import JobConfig, Jobs, JobState, _digest, _stamp, load_job_config
+from taskwatch.jobs import JobConfig, Jobs, JobState, _digest, load_job_config
 from tests.git_fixture import git, make_repo
 from tests.spec_fixture import VALID_SPEC
 from tests.test_job_scan import Board
@@ -344,11 +345,15 @@ def test_non_code_jobs_on_one_target_still_wait(board):
 
 def test_record_without_the_new_fields_loads(tmp_path, remote):
     job = code_job(tmp_path, remote.target)
-    jobs = Jobs(tmp_path / "home")
+    jobs = Jobs(tmp_path / "legacy")
     data = job.to_json()
     for key in ("base", "base_note", "branch", "workspace_state", "branch_state"):
         del data[key]
-    jobs.state.append_record("jobs.jsonl", {"job": data, "sha256": _digest(data)}, _stamp(2000.0))
+    jobs.state.append_record(
+        "jobs.jsonl",
+        {"job": data, "sha256": _digest(data)},
+        datetime.fromtimestamp(2000.0, timezone.utc),
+    )
     loaded = jobs.load()[job.id]
     assert (loaded.base, loaded.branch, loaded.workspace_state, loaded.branch_state) == ("",) * 4
 

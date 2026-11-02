@@ -11,10 +11,11 @@ from pathlib import Path
 
 from . import choices
 from .brief import count_findings, decision_count
-from .job_cursor import generation
-from .jobs import JobState, _digest, _upgrade_record, _validate_record
+from .job_cursor import decode, encode
+from .job_store import Store, projection, read_index, read_snapshot, validate_event
+from .jobs import JobState
 from .kinds import kind_label
-from .state import RECORD_VERSION, RecordError, state_dir
+from .state import RecordError, state_dir
 
 
 def _line(value: object) -> str:
@@ -25,7 +26,6 @@ def _line(value: object) -> str:
 TIMED_OUT = 3
 NEEDS_CAP = 20
 GOAL_CHARS = 100
-_ENTRY_EVENTS = frozenset({"wait", "approve", "resume"})
 _BLOCKING = frozenset({"cancelled", "user_wait"})
 _SECTIONS = ("GATE", "NEEDS YOU", "BLOCKED", "FINISHED SINCE THE CURSOR")
 
@@ -42,82 +42,165 @@ class _Item:
 
 
 class _Ledger:
-    """Follows jobs.jsonl by byte offset. Keeps the newest raw snapshot of every job, and the
-    snapshots as they stood at `cursor`. Digests are checked only for a job that is printed."""
+    """Follow committed events, retaining projections, never historical job bodies."""
 
     def __init__(self, path: Path, cursor: int | None) -> None:
-        self.path, self.cursor = path, cursor
+        self.path = path
+        self.directory = path.parent
+        self.cursor = cursor
         self.offset = 0
+        self.sequence = 0
         self.rows: dict[str, dict] = {}
-        self.baseline: dict[str, dict] | None = {} if cursor is None else None
-        self.identity: int | None = None
-        self.cursor_identity: int | None = None
-        if cursor is not None and cursor >= 1 << 64:
-            self.cursor = cursor & ((1 << 64) - 1)
-            self.cursor_identity = cursor >> 64
+        self.baseline: dict[str, dict] | None = None
+        self.index: dict | None = None
+        self.boundary: tuple | None = None
+        self.replay = False
 
     def position(self) -> int:
-        if self.identity is None:
-            return 0
-        return (self.identity << 64) | self.offset
+        return encode(self.index["generation"], self.offset) if self.index else 0
 
-    def poll(self) -> None:
+    def _signature(self) -> tuple | None:
+        try:
+            info = self.path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RecordError(f"{self.path.name}: unreadable") from exc
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+    def stable(self) -> bool:
+        return read_index(self.directory) == self.index and self._signature() == self.boundary
+
+    def _empty(self) -> None:
+        try:
+            artifacts = any(
+                (self.directory / name).exists()
+                for name in (
+                    "jobs.jsonl",
+                    "jobs.cursors.json",
+                    "job-changes.jsonl",
+                    "jobs-pending.json",
+                )
+            )
+            jobs = self.directory / "jobs"
+            artifacts = artifacts or (jobs.exists() and any(jobs.iterdir()))
+        except OSError as exc:
+            raise RecordError("jobs store: unreadable") from exc
+        if artifacts:
+            raise RecordError(
+                "jobs store: run show or normal scan once to initialize or migrate storage"
+            )
+        self.rows, self.baseline = {}, {}
+        self.offset, self.sequence = 0, 0
+        self.index, self.boundary = None, None
+
+    def poll(self) -> bool:
+        index = read_index(self.directory)
+        if index is None:
+            self._empty()
+            return read_index(self.directory) is None
+        boundary = self._signature()
+        if boundary is None:
+            if read_index(self.directory) != index:
+                return False
+            raise RecordError("job-changes.jsonl: missing indexed event stream")
+        if (
+            self.index != index
+            or self.boundary is None
+            or boundary[:2] != self.boundary[:2]
+            or boundary[2] < self.offset
+        ):
+            self.offset, self.sequence, self.rows = 0, 0, {}
+            self.baseline = None
+        self.index, self.boundary = index, boundary
         try:
             with self.path.open("rb") as handle:
                 info = os.fstat(handle.fileno())
-                size = info.st_size
-                identity = generation(self.path, info)
-                if identity != self.identity or size < self.offset:
-                    self.offset, self.rows = 0, {}
-                self.identity = identity
-                if (self.cursor_identity is not None and self.cursor_identity != identity) or (
-                    self.cursor is not None and self.cursor_identity is None and identity & 1
-                ):
-                    # A restarted reader cannot reconstruct a discarded baseline.
-                    # Replay current needs rather than silently skipping a stop.
-                    if self.baseline is None:
-                        self.baseline = {}
+                if (info.st_dev, info.st_ino) != boundary[:2]:
+                    return False
                 handle.seek(self.offset)
-                data = handle.read(size - self.offset)
+                data = handle.read(boundary[2] - self.offset)
         except FileNotFoundError:
-            return
+            return False
         except OSError as exc:
-            raise RecordError(f"{self.path.name}: unreadable") from exc
-        end = data.rfind(b"\n") + 1
-        start = self.offset
-        for line in data[:end].splitlines(keepends=True):
-            if self.baseline is None and start >= (self.cursor or 0):
-                self.baseline = dict(self.rows)
-            row = self._row(line)
-            self.rows[row["job"]["id"]] = row
-            start += len(line)
-        self.offset += end
-        if self.baseline is None and self.offset >= (self.cursor or 0):
-            self.baseline = dict(self.rows)
-
-    def _row(self, line: bytes) -> dict:
+            raise RecordError("job-changes.jsonl: unreadable") from exc
         try:
-            row = json.loads(line)
-        except ValueError as exc:
-            raise RecordError(f"{self.path.name}: not json") from exc
-        if isinstance(row, dict) and row.get("version") != RECORD_VERSION:
-            raise RecordError(f"{self.path.name}: unknown version")
-        job = row.get("job") if isinstance(row, dict) else None
-        if not isinstance(job, dict) or not isinstance(job.get("id"), str):
-            raise RecordError(f"{self.path.name}: corrupt job snapshot")
-        return row
+            self._consume(data)
+        except RecordError:
+            if not self.stable():
+                return False
+            raise
+        if not self.stable():
+            return False
+        # An index entry can precede its creation event during prepared publication.
+        if set(self.rows) != set(index["receipts"]):
+            try:
+                pending, _ = _prepared(self)
+                if set(self.rows) | {pending["job_id"]} == set(index["receipts"]):
+                    return False
+            except RecordError:
+                if not self.stable():
+                    return False
+                raise
+            raise RecordError("job-changes.jsonl: indexed membership does not match events")
+        return True
+
+    def _consume(self, data: bytes) -> None:
+        target = decode(self.cursor) if self.cursor is not None else None
+        valid = target is not None and target[0] == self.index["generation"]
+        if self.baseline is None and not valid:
+            self.baseline = {}
+            self.replay = self.cursor is not None
+        end = data.rfind(b"\n") + 1
+        for line in data[:end].splitlines(keepends=True):
+            if self.baseline is None and self.offset == target[1]:
+                self.baseline = dict(self.rows)
+            try:
+                row = json.loads(line)
+            except ValueError as exc:
+                raise RecordError("job-changes.jsonl: not json") from exc
+            row = validate_event(row, self.index["generation"], self.sequence + 1)
+            previous = self.rows.get(row["job_id"])
+            if previous is not None and row["revision"] != previous["revision"] + 1:
+                raise RecordError("job-changes.jsonl: inconsistent job revision")
+            self.rows[row["job_id"]] = row
+            self.offset += len(line)
+            self.sequence += 1
+        if self.baseline is None:
+            if self.offset == target[1]:
+                self.baseline = dict(self.rows)
+            else:
+                self.baseline = {}
+                self.replay = True
 
 
-def _entry(job: dict) -> int:
-    return sum(
-        isinstance(e, dict) and e.get("type") in _ENTRY_EVENTS for e in job.get("events", [])
-    )
+def _prepared(ledger: _Ledger) -> tuple[dict, dict]:
+    pending, event, _ = Store(ledger.directory)._pending(ledger.index)
+    ident = pending["job_id"]
+    if pending["sequence"] != ledger.sequence + 1:
+        raise RecordError("jobs-pending.json: conflicting event sequence")
+    if pending["receipt"] is not None:
+        valid = (
+            pending["revision"] == 1
+            and ident not in ledger.rows
+            and ledger.index["receipts"].get(ident) == pending["receipt"]
+        )
+    else:
+        previous = ledger.rows.get(ident)
+        valid = (
+            ident in ledger.index["receipts"]
+            and previous is not None
+            and pending["revision"] == previous["revision"] + 1
+        )
+    if not valid:
+        raise RecordError("jobs-pending.json: conflicting receipt or revision")
+    return pending, event
 
 
 def _blocker(job: dict, rows: dict[str, dict]) -> str:
     """The predecessor that keeps a queued job from ever starting without the owner."""
     for pred in job.get("predecessors", []):
-        stage = rows[pred]["job"]["stage"] if pred in rows else "missing"
+        stage = rows[pred]["projection"]["stage"] if pred in rows else "missing"
         if stage in _BLOCKING or stage == "missing":
             return f"{stage} job {pred}"
     return ""
@@ -126,8 +209,8 @@ def _blocker(job: dict, rows: dict[str, dict]) -> str:
 def _items(rows: dict[str, dict]) -> list[_Item]:
     items = []
     for ident, row in rows.items():
-        job = row["job"]
-        stage, entry = job.get("stage"), _entry(job)
+        job = row["projection"]
+        stage, entry = job["stage"], job["entry"]
         if stage == "approval_wait":
             items.append(_Item((ident, stage, job.get("wait_reason", ""), entry), "GATE", ident))
         elif stage == "user_wait":
@@ -138,12 +221,7 @@ def _items(rows: dict[str, dict]) -> list[_Item]:
             items.append(_Item((ident, stage, blocker, entry), "BLOCKED", ident, blocker))
         elif stage == "done":
             items.append(_Item((ident, stage, "", entry), _SECTIONS[3], ident))
-    return sorted(items, key=lambda i: (_last_at(rows[i.job_id]["job"]), i.job_id))
-
-
-def _last_at(job: dict) -> float:
-    stamps = [e["at"] for e in job.get("events", []) if isinstance(e, dict) and "at" in e]
-    return max(stamps, default=0.0)
+    return sorted(items, key=lambda i: (rows[i.job_id]["projection"]["last_at"], i.job_id))
 
 
 def needs(
@@ -163,16 +241,30 @@ def needs(
     not. 0 listed, 3 time limit.
     """
     root = root.resolve()
-    ledger = _Ledger(state_dir(root) / "jobs.jsonl", cursor)
+    ledger = _Ledger(state_dir(root) / "job-changes.jsonl", cursor)
     deadline = clock() + timeout
+    attempted = False
     while True:
-        ledger.poll()
-        if ledger.baseline is None:
-            ledger.baseline = {}  # a cursor beyond the ledger: list everything again
+        if attempted and clock() >= deadline:
+            return TIMED_OUT, "needs: nothing new before the watcher's time limit; start a new one"
+        attempted = True
+        stable = ledger.poll()
+        if not stable and not ledger.stable():
+            continue
         items = _items(ledger.rows)
-        old = {i.key for i in _items(ledger.baseline)}
-        if not wait or any(i.key not in old for i in items):
-            return 0, _render(root, ledger, items, old if cursor is not None else None)
+        old = {i.key for i in _items(ledger.baseline or {})}
+        if stable and (not wait or any(i.key not in old for i in items)):
+            rendered = _render(root, ledger, items, old if cursor is not None else None)
+            if rendered is not None:
+                return 0, rendered
+            stable = False
+        if not stable and not ledger.stable():
+            continue
+        if not stable and not wait:
+            return 0, (
+                "needs: publication pending; run show or normal scan to recover, then retry\n"
+                f"cursor: {cursor if cursor is not None else 0}"
+            )
         remaining = deadline - clock()
         if remaining <= 0:
             return TIMED_OUT, "needs: nothing new before the watcher's time limit; start a new one"
@@ -180,15 +272,58 @@ def needs(
 
 
 def _state(row: dict) -> JobState:
-    job = row["job"]
-    if row.get("sha256") != _digest(job):
-        raise RecordError("jobs.jsonl: corrupt job snapshot")
-    job = _upgrade_record(job)
-    _validate_record(job)
-    return JobState(**job)
+    return JobState(**row["job"])
 
 
-def _render(root: Path, ledger: _Ledger, items: list[_Item], old: set | None) -> str:
+def _snapshots(ledger: _Ledger, items: list[_Item]) -> dict[str, dict] | None:
+    selected = {item.job_id for item in items}
+    for item in items:
+        if item.section == "GATE":
+            selected.update(ledger.rows[item.job_id]["projection"]["predecessors"])
+    rows = {}
+    try:
+        for ident in selected:
+            if ident not in ledger.index["receipts"]:
+                continue
+            row = read_snapshot(ledger.directory, ident, ledger.index["receipts"][ident])
+            event = ledger.rows[ident]
+            if row["revision"] > event["revision"]:
+                pending, prepared = _prepared(ledger)
+                if (
+                    pending["job_id"] == ident
+                    and pending["revision"] == row["revision"]
+                    and pending["sha256"] == row["sha256"]
+                    and prepared["projection"] == projection(row["job"])
+                ):
+                    return None
+                raise RecordError(f"job {ident}: snapshot has no matching prepared event")
+            if (
+                row["revision"] != event["revision"]
+                or projection(row["job"]) != event["projection"]
+            ):
+                raise RecordError(f"job {ident}: snapshot and committed event disagree")
+            rows[ident] = row
+    except RecordError:
+        if not ledger.stable():
+            return None
+        raise
+    return rows if ledger.stable() else None
+
+
+def _unchanged(ledger: _Ledger, rows: dict[str, dict]) -> bool:
+    try:
+        for ident, row in rows.items():
+            current = read_snapshot(ledger.directory, ident, ledger.index["receipts"][ident])
+            if current != row:
+                return False
+    except RecordError:
+        if not ledger.stable():
+            return False
+        raise
+    return ledger.stable()
+
+
+def _render(root: Path, ledger: _Ledger, items: list[_Item], old: set | None) -> str | None:
     if old is not None:
         items = [i for i in items if i.section != _SECTIONS[3] or i.key not in old]
     else:
@@ -201,16 +336,23 @@ def _render(root: Path, ledger: _Ledger, items: list[_Item], old: set | None) ->
         head += f", {counts[_SECTIONS[3]]} finished since the cursor"
     lines = [head, f"cursor: {ledger.position()}"]
     shown = items[:NEEDS_CAP]
+    rows = _snapshots(ledger, shown) if ledger.index else {}
+    if rows is None:
+        return None
+    if ledger.replay:
+        lines.append(
+            "Cursor belongs to an unavailable position or older stream; replaying current items."
+        )
     for name in _SECTIONS:
         group = [i for i in shown if i.section == name]
         if group:
             lines.append(name)
             for item in group:
-                lines += _lines(root, ledger.rows, item)
+                lines += _lines(root, rows, item)
     if len(items) > NEEDS_CAP:
         lines.append(f"(+{len(items) - NEEDS_CAP} more; read them with show)")
     lines.append("This list is a hint; re-read the state with show before acting.")
-    return "\n".join(lines)
+    return "\n".join(lines) if _unchanged(ledger, rows) else None
 
 
 def _goal(job: JobState) -> str:

@@ -1,65 +1,23 @@
-"""Generation-qualified integer cursors without changing job snapshot records."""
+"""Opaque integer positions in the v2 projection stream."""
 
-import json
-import os
-import tempfile
-import uuid
-from pathlib import Path
-
-from .state import RecordError, _fsync
+_VERSION = 2
+_SHIFT = 256
+_OFFSET_BITS = 64
+_OFFSET_MASK = (1 << _OFFSET_BITS) - 1
+_GENERATION_MASK = (1 << 128) - 1
 
 
-def generation(path: Path, info: os.stat_result) -> int:
-    try:
-        rows = json.loads(path.with_suffix(".cursors.json").read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        rows = []
-    except (OSError, ValueError) as exc:
-        raise RecordError("jobs.jsonl: unreadable cursor generations") from exc
-    if not isinstance(rows, list) or any(
-        not isinstance(row, dict)
-        or set(row) != {"device", "inode", "generation"}
-        or any(type(value) is not int or value < 0 for value in row.values())
-        for row in rows
-    ):
-        raise RecordError("jobs.jsonl: invalid cursor generations")
-    for row in rows:
-        if (row["device"], row["inode"]) == (info.st_dev, info.st_ino):
-            return row["generation"]
-    # Even identifiers describe ledgers predating the first compaction.
-    return (info.st_dev << 65) | (info.st_ino << 1)
+def encode(generation: str, offset: int) -> int:
+    """Keep CLI cursors integers while distinguishing the replaced snapshot stream."""
+    if type(offset) is not int or not 0 <= offset <= _OFFSET_MASK:
+        raise ValueError("cursor offset is out of range")
+    return (_VERSION << _SHIFT) | (int(generation, 16) << _OFFSET_BITS) | offset
 
 
-def prepare_generation(path: Path, replacement: os.stat_result) -> None:
-    """Publish both generations before replacing the ledger, including across a crash.
-
-    An unlocked reader can open either inode during the swap. Keeping both mappings
-    prevents it from issuing an ambiguous cursor; the metadata stays bounded.
-    """
-    current = path.stat()
-    rows = [
-        {
-            "device": current.st_dev,
-            "inode": current.st_ino,
-            "generation": generation(path, current),
-        },
-        {
-            "device": replacement.st_dev,
-            "inode": replacement.st_ino,
-            "generation": (uuid.uuid4().int << 1) | 1,
-        },
-    ]
-    name = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=path.parent, prefix="jobs-cursors-", delete=False
-        ) as handle:
-            name = handle.name
-            json.dump(rows, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path.with_suffix(".cursors.json"))
-        _fsync(path.parent)
-    finally:
-        if name is not None and os.path.exists(name):
-            os.unlink(name)
+def decode(cursor: int) -> tuple[str, int] | None:
+    """Old byte/inode cursors and unknown formats cannot identify this stream."""
+    if type(cursor) is not int or cursor < 0 or cursor >> _SHIFT != _VERSION:
+        return None
+    if cursor & (((1 << _SHIFT) - 1) ^ ((1 << 192) - 1)):
+        return None
+    return f"{(cursor >> _OFFSET_BITS) & _GENERATION_MASK:032x}", cursor & _OFFSET_MASK

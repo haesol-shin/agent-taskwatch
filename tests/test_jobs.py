@@ -46,7 +46,8 @@ def test_idempotent_submit_copies_inputs_and_preserves_original(tmp_path):
     assert Path(first.intent).read_text() == "Approved synthetic intent"
     for name, digest in first.input_hashes.items():
         assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest
-    assert len(jobs.state.read_records("jobs.jsonl")) == 1
+    index = json.loads((jobs.state.dir / "jobs-store.json").read_text())
+    assert index["receipts"] == {first.id: first.receipt_key}
 
 
 def test_concurrent_receipt_has_one_durable_identity(tmp_path):
@@ -60,8 +61,8 @@ def test_concurrent_receipt_has_one_durable_identity(tmp_path):
 
 def test_corrupt_committed_record_blocks_reads_and_new_submit(tmp_path):
     jobs = Jobs(tmp_path / "root")
-    jobs.submit(payload(tmp_path), 10)
-    path = jobs.state.dir / "jobs.jsonl"
+    job = jobs.submit(payload(tmp_path), 10)
+    path = jobs.folder(job) / "state.json"
     data = json.loads(path.read_text())
     data["job"]["stage"] = "deliver_pending"
     path.write_text(json.dumps(data) + "\n")
@@ -74,13 +75,13 @@ def test_corrupt_committed_record_blocks_reads_and_new_submit(tmp_path):
 def test_torn_tail_preserves_receipt_and_is_repaired_before_append(tmp_path):
     jobs = Jobs(tmp_path / "root")
     first = jobs.submit(payload(tmp_path), 10)
-    path = jobs.state.dir / "jobs.jsonl"
+    path = jobs.state.dir / "job-changes.jsonl"
     with path.open("ab") as handle:
-        handle.write(b'{"version":1,"job":')
+        handle.write(b'{"version":2,"generation":')
     assert jobs.load()[first.id] == first
     jobs.submit(payload(tmp_path, "message:2"), 20)
     assert len(jobs.load()) == 2
-    assert len(list(path.parent.glob("jobs.jsonl.torn-*"))) == 1
+    assert len(list(path.parent.glob("job-changes.jsonl.torn-*"))) == 1
 
 
 def test_changed_copied_input_is_not_accepted(tmp_path):
@@ -134,11 +135,11 @@ def test_valid_checksum_does_not_allow_invalid_job_schema(tmp_path, change):
     jobs = Jobs(tmp_path / "root")
     job = jobs.submit(payload(tmp_path), 10)
     data = {**job.to_json(), **change}
-    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    row = {"version": 1, "job": data, "sha256": hashlib.sha256(encoded).hexdigest()}
-    path = jobs.state.dir / "jobs.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row) + "\n")
+    content = {"revision": 1, "job": data}
+    encoded = json.dumps(content, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    row = {"version": 2, **content, "sha256": hashlib.sha256(encoded).hexdigest()}
+    path = jobs.folder(job) / "state.json"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     with pytest.raises(RecordError):
         jobs.load()
 
@@ -192,12 +193,13 @@ def test_approval_records_exact_replacement_scope(tmp_path, capsys):
 )
 def test_record_written_with_the_old_kind_field_still_loads(tmp_path, old, new):
     jobs = Jobs(tmp_path / "root")
-    job = jobs.submit(payload(tmp_path), 10)
+    job = Jobs(tmp_path / "donor").submit(payload(tmp_path), 10)
     data = {key: value for key, value in job.to_json().items() if key != "review"}
     data["kind"] = old
     encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     row = {"version": 1, "job": data, "sha256": hashlib.sha256(encoded).hexdigest()}
     path = jobs.state.dir / "jobs.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     assert jobs.load()[job.id].review == new
 

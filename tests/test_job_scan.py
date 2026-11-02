@@ -734,7 +734,7 @@ def test_approve_appends_the_owner_words_to_the_approval_source(board: Board) ->
 def test_corrupt_journal_starts_nothing(board: Board) -> None:
     board.add()
     board.add()
-    path = board.jobs.state.dir / "jobs.jsonl"
+    path = board.jobs.state.dir / "job-changes.jsonl"
     lines = path.read_text(encoding="utf-8").splitlines()
     path.write_text("\n".join(["{garbage", *lines[1:]]) + "\n", encoding="utf-8")
     with pytest.raises(ValueError):
@@ -743,8 +743,8 @@ def test_corrupt_journal_starts_nothing(board: Board) -> None:
 
 
 def test_tampered_snapshot_starts_nothing(board: Board) -> None:
-    board.add()
-    path = board.jobs.state.dir / "jobs.jsonl"
+    ident = board.add()
+    path = board.jobs.folder(board.get(ident)) / "state.json"
     path.write_text(path.read_text(encoding="utf-8").replace("do it", "do bad"), encoding="utf-8")
     with pytest.raises(ValueError):
         board.scan()
