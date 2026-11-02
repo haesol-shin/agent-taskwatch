@@ -70,6 +70,18 @@ Use these rules when the assignment names public text: the commit messages, titl
 
 **K-14.** Once the prior blockers are resolved, the verdict must not get worse unless a new blocker has that reason. An unresolved prior blocker stays blocking. Do not broaden the scope, add a new requirement, or raise the severity of an item already reported beyond what resolves it.
 
+**K-20.** A round the message calls a delta round reviews the fix, not the whole job again. Do these, in this order:
+
+1. Close each prior finding. Run the condition that first showed it, and say in `checked` what you ran.
+2. Read every changed line of the delta. The message names the two fingerprints, the files and the `git diff --stat`.
+3. For each function, configuration key, option or phrase the delta changed, grep for its users and for the documents that quote it, and read those places.
+4. Read nothing else of a file the delta did not touch. The one exception is a file the message says no earlier round saw: read it in full, as in a first review.
+5. The message gives the last check result. Do not run again what it ran.
+
+**K-21.** List in `checked` what you read outside the delta, and in `not_checked` what you skipped. If the delta changed a function, key or phrase and you read none of its users, say why in `not_checked`.
+
+**K-22.** A round the message calls a full review is judged as a first review, and each prior finding is still closed. taskwatch computes the mode from the conditions in [Re-review scope](../checks.md#re-review-scope); do not choose it, and do not shorten a full round because the delta looks small.
+
 ## A job with a unit table
 
 When the spec or a work input has a table of units, judge the split with the rules and checks of [Splitting a plan](design.md#splitting-a-plan). Do not copy its numbers here.

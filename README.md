@@ -8,7 +8,7 @@ A job runner for approved agent work. It schedules each job, runs it through omp
 - It does not approve work. Every job carries an approval record that the caller asserts; the runner cannot authenticate the conversation it came from.
 - It does not isolate what the runner's tools can read or write. Those tools have the user's permissions, and `approval_scope` is a recorded boundary, not operating-system isolation.
 - It does not merge or apply results.
-- Every check is plain code and never calls a model. Work, fixes, and independent reviews use omp.
+- Every check is plain code and never calls a model. Work and fixes use omp; an independent review uses omp, or with `review_mode: "print"` Codex, Claude Code, Gemini CLI or any command that prints a JSON verdict.
 
 ## How a job runs
 

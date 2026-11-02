@@ -20,7 +20,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import brief, choices, job_findings, job_text, job_workspace, source_check
+from . import (
+    brief,
+    choices,
+    job_findings,
+    job_text,
+    job_workspace,
+    review_delta,
+    review_print,
+    source_check,
+)
 from .checks import checklist_problems, message_problems
 from .evidence import basis_of
 from .executor import _design_check, _finding_lines, _scope, _verdict_line
@@ -552,7 +561,9 @@ def _finding_notes(ctx: Ctx, last: Mapping) -> list[str]:
     return lines
 
 
-def _prior_lines(ctx: Ctx, prior: list[Mapping], review_root: Path) -> list[str]:
+def _prior_lines(
+    ctx: Ctx, prior: list[Mapping], review_root: Path, scope: review_delta.Scope | None = None
+) -> list[str]:
     job = ctx.job
     last = prior[-1]
     if job.review_target is not None:
@@ -563,22 +574,33 @@ def _prior_lines(ctx: Ctx, prior: list[Mapping], review_root: Path) -> list[str]
             f"This is round {len(prior) + 1}. The last answer was not accepted: {problems}.",
             "Review the whole target again and answer in full.",
         ]
-    lines = [
-        "",
-        f"This is re-review round {len(prior) + 1}. Review the changes since the last review",
-        "and whether each finding below is resolved. Do not reopen settled ground.",
+    if scope is not None:
+        lines = ["", *review_delta.message_lines(scope, len(prior) + 1, job.checks)]
+    else:
+        lines = [
+            "",
+            f"This is re-review round {len(prior) + 1}. Review the changes since the last review",
+            "and whether each finding below is resolved. Do not reopen settled ground.",
+        ]
+    lines += [
         f"Previously reviewed fingerprint: {last['fingerprint']}",
         f"Current fingerprint: {job.fingerprint}",
     ]
     text = _text_since(ctx, last, review_root)
     if job.review == "code" and not any(line.startswith("The tree is identical") for line in text):
         lines.append(f"See: git diff {last['fingerprint']} {job.fingerprint}")
+        if scope is not None and scope.stat:
+            lines += ["git diff --stat of the delta:", scope.stat]
     lines += text
     return [*lines, *_finding_notes(ctx, last), "Findings of the last review:", last["body"]]
 
 
 def _review_message(
-    ctx: Ctx, guidelines: tuple[Path, ...], resumed: bool, review_root: Path
+    ctx: Ctx,
+    guidelines: tuple[Path, ...],
+    resumed: bool,
+    review_root: Path,
+    scope: review_delta.Scope | None = None,
 ) -> str:
     job = ctx.job
     prior = [r for r in job.reviews if isinstance(r, Mapping)]
@@ -599,10 +621,13 @@ def _review_message(
         job.prompt,
     ]
     if prior:
-        lines += _prior_lines(ctx, prior, review_root)
+        lines += _prior_lines(ctx, prior, review_root, scope)
     lines += [f"Review input: {p}" for p in job.inputs.get("review", [])]
     lines += _predecessor_lines(ctx)
-    lines += ["", _layer("taskwatch.md")]
+    if ctx.config.review_mode == "print":
+        lines += [f"Verdict schema: {_schema_path(ctx)}", "", _layer("taskwatch-print.md")]
+    else:
+        lines += ["", _layer("taskwatch.md")]
     if resumed:
         lines += ["", "You were interrupted. Review the current state again and answer in full."]
     return "\n".join(lines)
@@ -645,6 +670,10 @@ class Recorder:
             return
         self._last = now
 
+    def beat(self) -> None:
+        """Refresh the evidence of a run that gives no frames."""
+        self._write(None)
+
     def _write(self, event: dict | None) -> None:
         ctx = self.ctx
 
@@ -659,13 +688,74 @@ class Recorder:
             self.abort.set()
 
 
-def _command(ctx: Ctx) -> tuple[str, ...]:
-    """The review step may use its own command; {guidelines} and {review} name the job copy."""
+def _schema_path(ctx: Ctx) -> Path:
+    return ctx.folder / review_print.SCHEMA_NAME
+
+
+def _command(ctx: Ctx, review_root: Path | None = None) -> tuple[str, ...]:
+    """The review step may use its own command. {guidelines} and {review} name the job copy and
+    the review kind, {schema} the verdict schema file, {output} the file of the last message
+    (print mode)."""
     config = ctx.config
     if ctx.stage != "review" or config.review_command is None:
         return config.omp_command
-    fields = {"{guidelines}": str(ctx.folder / "review-docs"), "{review}": ctx.job.review}
+    fields = {
+        "{guidelines}": str(ctx.folder / "review-docs"),
+        "{review}": ctx.job.review,
+        "{schema}": str(_schema_path(ctx)),
+    }
+    if review_root is not None:
+        fields["{output}"] = str(review_root / "reply.txt")
     return tuple(fields.get(part, part) for part in config.review_command)
+
+
+def _write_schema(ctx: Ctx) -> dict:
+    """Copy the verdict schema into the job folder, where the review command reads it."""
+    try:
+        text = (_docs_source("launch") / review_print.SCHEMA_NAME).read_text(encoding="utf-8")
+        schema = json.loads(text)
+        _write_durable(_schema_path(ctx), text)
+    except (OSError, ValueError) as exc:
+        raise StepError(f"the verdict schema is unusable: {exc}") from exc
+    return schema
+
+
+def _print_reply(ctx: Ctx, message: str, review_root: Path) -> tuple[str, str]:
+    """Run the print-mode review command once. Returns the review text and, when the reply holds
+    no acceptable verdict, the reason (the text is then the raw reply, for the fix session)."""
+    schema = _write_schema(ctx)
+    output = review_root / "reply.txt"
+    output.unlink(missing_ok=True)
+    recorder = Recorder(ctx)
+    watcher = threading.Thread(target=recorder.watch, daemon=True)
+    watcher.start()
+    try:
+        stdout = review_print.run(
+            _command(ctx, review_root),
+            ctx.workspace,
+            ctx.env,
+            message,
+            timeout=float(ctx.config.rpc_timeout),
+            every=EVIDENCE_EVERY,
+            tick=recorder.beat,
+            abort=recorder.abort,
+            stderr_path=ctx.folder / "logs" / f"review-a{ctx.job.attempt}.stderr",
+        )
+    except review_print.RunError as exc:
+        raise StepError(str(exc)) from exc
+    finally:
+        recorder.done.set()
+    if recorder.abort.is_set():
+        raise StaleAttempt
+    replies = []
+    if output.is_file():
+        replies.append(("last-message file", output.read_text(encoding="utf-8", errors="replace")))
+    replies.append(("standard output", stdout))
+    try:
+        return review_print.verdict_body(replies, schema), ""
+    except review_print.ReplyError as exc:
+        raw = next((text for _, text in replies if text.strip()), "")
+        return raw[: review_print.KEEP_CHARS], str(exc)
 
 
 def _converse(
@@ -1084,25 +1174,62 @@ def _snapshot(ctx: Ctx, review_root: Path) -> dict:
     }
 
 
+def _review_base(ctx: Ctx) -> str:
+    """The commit the reviewed result stands on. For a code job that builds commits it follows
+    a rebase of the branch; otherwise it is what the job recorded."""
+    job = ctx.job
+    if job.review != "code" or job.review_target is not None or not job.fingerprint:
+        return job.base
+    return review_delta.effective_base(
+        ctx.workspace, ctx.env, job.fingerprint, job.branch, job.base
+    )
+
+
+def _rereview_scope(ctx: Ctx, base: str) -> review_delta.Scope | None:
+    """Round 2 and later of a code review that builds commits: delta or full, by code."""
+    job = ctx.job
+    prior = [r for r in job.reviews if isinstance(r, Mapping)]
+    if not prior or job.review != "code" or job.review_target is not None:
+        return None
+    return review_delta.decide(
+        ctx.workspace,
+        ctx.env,
+        base=base,
+        fingerprint=job.fingerprint,
+        approval_scope=job.approval_scope,
+        prior=prior,
+        checks=job.checks,
+        roots=(str(ctx.workspace), job.target),
+    )
+
+
 def _review_step(ctx: Ctx) -> int:
+    started = time.monotonic()
     if ctx.job.review_target is not None:
         ctx = _pin_subject(ctx)
     elif _result_stale(ctx):
         _apply(ctx, lambda j: _requeue(j))
         return 0
     job = ctx.job
+    base = _review_base(ctx)
+    scope = _rereview_scope(ctx, base)
     guidelines = _guidelines(job, ctx.folder)
     name = f"review-{len(job.reviews)}-{len(job.checks)}"
     review_root = ctx.folder / "reviews" / name
     review_root.mkdir(parents=True, exist_ok=True)
     snapshot = _snapshot(ctx, review_root)
-    text = _converse(
-        ctx,
-        ctx.folder / "sessions" / name,
-        lambda r: _review_message(ctx, guidelines, r, review_root),
-        True,
-        lambda body: _repair_prompt(ctx, body),
-    )
+    if ctx.config.review_mode == "print":
+        message = _review_message(ctx, guidelines, False, review_root, scope)
+        text, reply_problem = _print_reply(ctx, message, review_root)
+    else:
+        reply_problem = ""
+        text = _converse(
+            ctx,
+            ctx.folder / "sessions" / name,
+            lambda r: _review_message(ctx, guidelines, r, review_root, scope),
+            True,
+            lambda body: _repair_prompt(ctx, body),
+        )
     try:
         ctx.jobs.verify_inputs(job)
     except (ValueError, OSError) as exc:
@@ -1112,7 +1239,8 @@ def _review_step(ctx: Ctx) -> int:
         # The reviewer saw evidence that no longer holds, so its verdict is not accepted.
         _apply(ctx, lambda j: {**_requeue(j), "error": "; ".join(problems)})
         return 0
-    record = _judge(ctx, text, snapshot)
+    minutes = round((time.monotonic() - started) / 60, 1)
+    record = _judge(ctx, text, snapshot, reply_problem, scope, minutes, base)
     _apply(ctx, lambda j: _review_route(j, record))
     job_findings.sync_index(ctx.jobs.state, ctx.jobs.load()[job.id], ctx.folder, _now())
     return 0
@@ -1211,7 +1339,15 @@ def _repair_prompt(ctx: Ctx, body: str) -> str | None:
     )
 
 
-def _judge(ctx: Ctx, body: str, snapshot: Mapping) -> dict:
+def _judge(
+    ctx: Ctx,
+    body: str,
+    snapshot: Mapping,
+    reply_problem: str = "",
+    scope: review_delta.Scope | None = None,
+    minutes: float = 0.0,
+    base: str = "",
+) -> dict:
     job = ctx.job
     seq = len(job.checks) + len(job.reviews) + 1
     record = {
@@ -1224,18 +1360,28 @@ def _judge(ctx: Ctx, body: str, snapshot: Mapping) -> dict:
         "fingerprint": job.fingerprint,
         "outputs_fingerprint": "",
         "basis": job.basis,
+        "base": base,
         "body": body,
         "session_path": ctx.jobs.load()[job.id].session_path,
         "problems": [],
         "findings": [],
         "checked": "",
         "not_checked": "",
+        "minutes": minutes,
+        "new_findings": 0,
+        "delta_ratio": scope.ratio if scope else None,
+        **({"rereview": scope.record()} if scope else {}),
         **snapshot,
     }
     try:
-        _read_reply(job, body, record)
+        if reply_problem:
+            record["problems"].append(reply_problem)
+        else:
+            _read_reply(job, body, record)
     except ValueError as exc:
         record["problems"].append(str(exc))
+    prior = [r for r in job.reviews if isinstance(r, Mapping)]
+    record["new_findings"] = review_delta.new_findings(prior, record["findings"])
     try:
         if _fingerprint(job, ctx.workspace, ctx.env) != job.fingerprint:
             record["problems"].append("the result changed during the review")

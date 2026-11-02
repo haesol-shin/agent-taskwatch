@@ -28,11 +28,11 @@ Use this file with the common guidelines when the deliverable is a design: a pla
 
 ## Splitting a plan
 
-Use this section when the design carries a table that splits work into units and jobs. Cite a rule by its id and a check by its code (`S1` to `S8`) in the finding. The numbers in the first two rules and the S1 row (400 lines, 10 files, 700 lines, 3 units) are provisional. They are a judgment from Google's "Small CLs" (about 100 lines is usual, 1000 too large), SmartBear's review study (200 to 400 lines at a time) and ten measured jobs of this project (sanitized owner record, 2026-11-01), which do not separate 400 from 700 lines. Change a number here only with a new measurement.
+Use this section when the design carries a table that splits work into units and jobs. Cite a rule by its id and a check by its code (`S1` to `S8`) in the finding. Split by logical change, not by size. The numbers in the first two rules and the S1 row (400 lines, 10 files, 700 lines, 3 units) are provisional and only signals: they tell the reviewer to confirm that the unit or job is still one logical change. They are a judgment from Google's "Small CLs" (about 100 lines is usual, 1000 too large), SmartBear's review study (200 to 400 lines at a time) and ten measured jobs of this project (sanitized owner record, 2026-11-01), which do not separate 400 from 700 lines. Two later cases show why size alone is the wrong test. One job of this project (sanitized owner record, 2026-11-02) built one unit of 454 lines that changed one thing, the result card; splitting off its `language` key would still have left the unit over 400 lines. And the [gajae-code ultragoal skill](https://github.com/Yeachan-Heo/gajae-code/blob/main/packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md) says "File count or line count alone does not force delegation". The first measured plan (9 units, 3110 lines, several changes) is still caught, because it holds more than one logical change. Change a number here only with a new measurement.
 
-**D-10.** A unit is one logical change and its tests. Aim at no more than 400 added plus deleted lines and 10 files.
+**D-10.** A unit is one logical change and its tests. When a unit is over 400 added plus deleted lines or 10 files, confirm that it is still one logical change; when it is, its size alone is no finding and no decision for the owner.
 
-**D-11.** A job is what one review can judge: one unit, or at most 3 units that share a check, and at most about 700 lines in total.
+**D-11.** A job is what one review can judge: one unit, or at most 3 units that share a check. When a job is over 3 units or about 700 lines in total, confirm that it is still one logical change, or units that one review can judge together; when it is, its size alone is no finding and no decision for the owner.
 
 **D-12.** Bundle units when one cannot be verified without another, when they edit the same file in turn, or when a unit is a one-line change.
 
@@ -50,7 +50,7 @@ Use this section when the design carries a table that splits work into units and
 
 | Check | Fails when |
 |---|---|
-| S1 size | the estimate times 2 is over 400 lines or 10 files for a unit, or a job totals over 700 lines or 3 units, with no written reason |
+| S1 size | a unit over 400 lines or 10 files (the estimate times 2), or a job over 700 lines or 3 units, holds more than one logical change, or has no written sentence that says why it is one |
 | S2 files | two units that are not predecessors of each other share a file outside the merged-by-hand list |
 | S3 predecessor reason | a predecessor has no reason, or units share files and no predecessor |
 | S4 bundle reason | units in one job lack a sentence (not verifiable alone, same files in turn, same acceptance) |

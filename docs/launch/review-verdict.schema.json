@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "taskwatch review verdict",
+  "description": "The answer of an independent review in print mode. taskwatch turns it into the verdict line and finding lines of docs/launch/taskwatch.md and reads those with the same parser as an RPC review.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "blocking",
+    "checked",
+    "not_checked",
+    "design_check",
+    "findings"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "FAIL"
+      ]
+    },
+    "blocking": {
+      "type": "boolean"
+    },
+    "checked": {
+      "type": "string"
+    },
+    "not_checked": {
+      "type": "string"
+    },
+    "design_check": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "root_cause",
+        "alternatives",
+        "one_home",
+        "overlaps",
+        "needed_now",
+        "repeated_judgment",
+        "portability",
+        "choices"
+      ],
+      "properties": {
+        "root_cause": {
+          "$ref": "#/$defs/design_answer"
+        },
+        "alternatives": {
+          "$ref": "#/$defs/design_answer"
+        },
+        "one_home": {
+          "$ref": "#/$defs/design_answer"
+        },
+        "overlaps": {
+          "$ref": "#/$defs/design_answer"
+        },
+        "needed_now": {
+          "$ref": "#/$defs/design_answer"
+        },
+        "repeated_judgment": {
+          "$ref": "#/$defs/design_answer"
+        },
+        "portability": {
+          "$ref": "#/$defs/design_answer"
+        },
+        "choices": {
+          "$ref": "#/$defs/design_answer"
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    }
+  },
+  "$defs": {
+    "design_answer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "answer",
+        "evidence"
+      ],
+      "properties": {
+        "answer": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "finding",
+            "na"
+          ]
+        },
+        "evidence": {
+          "type": "string"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding",
+        "severity",
+        "category",
+        "rule",
+        "location",
+        "summary",
+        "detail"
+      ],
+      "properties": {
+        "finding": {
+          "type": "string",
+          "pattern": "^F[0-9]+$"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "intent",
+            "evidence",
+            "behavior",
+            "clarity",
+            "other"
+          ]
+        },
+        "rule": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
