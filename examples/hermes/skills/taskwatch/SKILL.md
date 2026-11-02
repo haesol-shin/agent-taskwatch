@@ -10,12 +10,12 @@ Use `taskwatch` for approved background jobs (`review`: `source`, `design`, or `
 
 ## 1. Split and prepare
 
-- Split a multi-unit or multi-job request and write the `## Units` table by [`docs/review/design.md`](../../../../docs/review/design.md#splitting-a-plan) and [`docs/spec-template.md`](../../../../docs/spec-template.md).
-- Check `<root>/taskwatch/defaults.json` for standing owner choices ([`docs/configuration.md#owner-defaults`](../../../../docs/configuration.md#owner-defaults)).
+- Split a multi-unit or multi-job request and write the `## Units` table by [`docs/review/design.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/review/design.md#splitting-a-plan) and [`docs/spec-template.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/spec-template.md).
+- Check `<root>/taskwatch/defaults.json` for standing owner choices ([`docs/configuration.md#owner-defaults`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#owner-defaults) and [`docs/kinds/design.md#choicesjson`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/kinds/design.md#choicesjson)).
 
 ## 2. Submit
 
-Follow [`docs/configuration.md#chains-and-gates`](../../../../docs/configuration.md#chains-and-gates):
+Follow [`docs/configuration.md#chains-and-gates`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#chains-and-gates):
 
 1. Read the current `cursor` with `taskwatch --root <root> needs` before or right after submitting.
 2. Submit ordered units in one pass with `taskwatch --root <root> submit <job.json>`, giving each unit `receipt_key: "<approval-source>:<n>"`, `predecessors` with the earlier unit's receipt key (or id), and `base: "@<predecessor-receipt-key>"` for stacked `code` units.
@@ -34,6 +34,6 @@ taskwatch --root <root> needs --wait --from <cursor>
 Always re-read state with `taskwatch --root <root> show <id>` before acting (`activity` shows the stage elapsed time, last progress age, and last progress line while a job runs).
 
 - **Gate (`approval_wait`)**: show the owner `taskwatch --root <root> brief <predecessor>`, then pass the owner's reply to `taskwatch --root <root> approve <id> --reason "<reply>"` (prepend `PICKS: ok` or `PICKS: <id>=<key|text> ...` when answering design picks).
-- **Needs you (`user_wait`)**: inspect `taskwatch --root <root> brief <id>`, ask the owner for a decision when required, then run `resume`, `approve`, or `cancel`.
+- **Needs you (`user_wait`)**: inspect `taskwatch --root <root> brief <id>`, ask the owner for a decision when required, then run `taskwatch --root <root> resume <id> --reason "<reply>"` or `taskwatch --root <root> cancel <id> --reason "<reply>"`.
 - **Finished (`done`, `deliver_pending`)**: relay the delivery card (`delivery.txt`) unchanged. Give full details, paths, or findings only when the owner asks, via `taskwatch --root <root> brief <id>`. Export reviewed pull request text with `taskwatch --root <root> text <id> --out <dir>`.
 - If jobs are still running after handling the event (or after exit code `3`), arm a new `needs --wait --from <new-cursor>`.
