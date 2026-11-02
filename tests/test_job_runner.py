@@ -1,6 +1,7 @@
 """The runner against a fake omp RPC process: real subprocess, real files, no model."""
 
 import base64
+import hashlib
 import json
 import subprocess
 import sys
@@ -693,3 +694,22 @@ def test_messages_list_each_predecessor_result_without_copying_it(tmp_path, monk
         job_runner.Ctx(env.jobs, env.config, env.get(), env.folder(), tmp_path / "ws"), False
     )
     assert "Predecessor results" not in plain
+
+
+def test_design_messages_name_defaults_file_and_short_hash(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, review="design")
+    ctx = job_runner.Ctx(env.jobs, env.config, env.get(), env.folder(), tmp_path / "ws")
+    expected_path = env.jobs.state.root / "taskwatch" / "defaults.json"
+    for text in (
+        job_runner._agent_message(ctx, False),
+        job_runner._review_message(ctx, (), False, tmp_path / "rr"),
+    ):
+        assert f"Owner defaults: {expected_path} (absent)" in text
+    payload = b'{"version":1,"defaults":[]}\n'
+    expected_path.write_bytes(payload)
+    short = hashlib.sha256(payload).hexdigest()[:12]
+    for text in (
+        job_runner._agent_message(ctx, False),
+        job_runner._review_message(ctx, (), False, tmp_path / "rr"),
+    ):
+        assert f"Owner defaults: {expected_path} (sha256 {short})" in text

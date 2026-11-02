@@ -9,6 +9,7 @@ import pytest
 from taskwatch.job_cli import main
 from taskwatch.jobs import Jobs, load_job_config
 from taskwatch.state import RecordError
+from tests.spec_fixture import VALID_SPEC
 
 
 def payload(tmp_path: Path, receipt="message:1") -> dict:
@@ -336,3 +337,69 @@ def test_submission_refuses_the_retired_review_values(tmp_path):
     data["review"] = "research"
     with pytest.raises(ValueError, match="code, design, or source"):
         jobs.submit(data)
+
+
+def _code_payload(tmp_path: Path, receipt: str, **extra: object) -> dict:
+    data = payload(tmp_path, receipt)
+    Path(data["spec"]).write_text(VALID_SPEC, encoding="utf-8")
+    return {**data, "review": "code", **extra}
+
+
+def test_submit_resolves_receipt_keys_in_predecessors_and_base(tmp_path):
+    root = tmp_path / "root"
+    jobs = Jobs(root)
+    first = jobs.submit(_code_payload(tmp_path, "msg-1:1"), 10)
+    second = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "msg-1:2",
+            predecessors=["msg-1:1"],
+            base="@msg-1:1",
+        ),
+        20,
+    )
+    third = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "msg-1:3",
+            predecessors=[first.id, "msg-1:2"],
+            base="@msg-1:2",
+        ),
+        30,
+    )
+    assert second.predecessors == (first.id,)
+    assert second.base == f"taskwatch/{first.id[:8]}"
+    assert third.predecessors == (first.id, second.id)
+    assert third.base == f"taskwatch/{second.id[:8]}"
+    reloaded = jobs.load()
+    assert reloaded[second.id].predecessors == (first.id,)
+    assert reloaded[second.id].base == f"taskwatch/{first.id[:8]}"
+
+
+def test_submit_receipt_base_uses_configured_branch_prefix_and_rejects_unknown_tokens(tmp_path):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    cfg_path = root / "taskwatch" / "jobs-config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["branch_prefix"] = "work/"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    jobs = Jobs(root)
+    source_job = jobs.submit(payload(tmp_path, "msg-1:src"), 10)
+    code_job = jobs.submit(_code_payload(tmp_path, "msg-1:code"), 20)
+    stacked = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "msg-1:next",
+            predecessors=["msg-1:src", "msg-1:code"],
+            base="@msg-1:code",
+        ),
+        30,
+    )
+    assert stacked.predecessors == (source_job.id, code_job.id)
+    assert stacked.base == f"work/{code_job.id[:8]}"
+    with pytest.raises(ValueError, match="unknown predecessors: msg-1:missing"):
+        jobs.submit(_code_payload(tmp_path, "msg-1:bad1", predecessors=["msg-1:missing"]), 40)
+    with pytest.raises(ValueError, match="unknown receipt key in base: @msg-1:missing"):
+        jobs.submit(_code_payload(tmp_path, "msg-1:bad2", base="@msg-1:missing"), 40)
+    with pytest.raises(ValueError, match="not a code job"):
+        jobs.submit(_code_payload(tmp_path, "msg-1:bad3", base="@msg-1:src"), 40)

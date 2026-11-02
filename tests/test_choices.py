@@ -202,3 +202,139 @@ def test_a_design_brief_shows_the_picks_and_the_card_does_not(tmp_path: Path) ->
     assert brief.reply_template(design) == "reply: ok | <id>=<key|text> ... | free text"
     plain = replace(design, review="source")
     assert brief.reply_template(plain) is None
+
+
+def _write_defaults(root: Path, entries: list[dict] | dict | str) -> Path:
+    path = root / "taskwatch" / "defaults.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(entries, str):
+        path.write_text(entries, encoding="utf-8")
+    elif isinstance(entries, dict):
+        path.write_text(json.dumps(entries), encoding="utf-8")
+    else:
+        path.write_text(json.dumps({"version": 1, "defaults": entries}), encoding="utf-8")
+    return path
+
+
+def test_default_pick_fails_and_target_path_beats_global(work: Path, tmp_path: Path) -> None:
+    repo = tmp_path / "org" / "repo"
+    sub = repo / "sub"
+    sub.mkdir(parents=True)
+    defaults = _write_defaults(
+        tmp_path,
+        [
+            {
+                "id": "python.dep_manager",
+                "value": "pip",
+                "scope": "global",
+                "source": "owner: always use pip unless a repo overrides",
+            },
+            {
+                "id": "python.dep_manager",
+                "value": "poetry",
+                "scope": str(repo),
+                "source": "owner: from now on use poetry in org/repo",
+            },
+            {
+                "id": "python.dep_manager",
+                "value": "uv",
+                "scope": str(sub),
+                "source": "owner: always use uv in org/repo/sub",
+            },
+            {
+                "id": "other.only",
+                "value": "x",
+                "scope": str(tmp_path / "unrelated"),
+                "source": "owner: always x in unrelated",
+            },
+        ],
+    )
+    entries, issues = choices.load_defaults(defaults)
+    assert issues == [] and entries is not None
+    assert (
+        choices.resolve_defaults(entries, tmp_path / "elsewhere")["python.dep_manager"]["value"]
+        == "pip"
+    )
+    assert choices.resolve_defaults(entries, repo)["python.dep_manager"]["value"] == "poetry"
+    assert choices.resolve_defaults(entries, sub)["python.dep_manager"]["value"] == "uv"
+    assert "other.only" not in choices.resolve_defaults(entries, sub)
+
+    (work / "choices.json").write_text(json.dumps(VALID), encoding="utf-8")
+    probs = choices.problems(
+        work, (work, sub), ("design.md", "choices.json"), defaults_path=defaults
+    )
+    assert len(probs) == 1
+    assert "pick python.dep_manager is already settled by defaults.json" in probs[0]
+    assert f"{sub}: 'uv'" in probs[0]
+
+    settled = mutated(
+        lambda d: (
+            d.update(picks=[], defaults_applied=["python.dep_manager"]),
+            d["decided"].append(
+                {
+                    "id": "python.dep_manager",
+                    "chosen": "uv",
+                    "why": "standing owner default",
+                    "source": "owner: always use uv in org/repo/sub",
+                }
+            ),
+        )
+    )
+    (work / "design.md").write_text(
+        DESIGN.replace("## Other", "2. python.dep_manager: uv.\n\n## Other"), encoding="utf-8"
+    )
+    (work / "choices.json").write_text(json.dumps(settled), encoding="utf-8")
+    assert (
+        choices.problems(work, (work, sub), ("design.md", "choices.json"), defaults_path=defaults)
+        == []
+    )
+
+    unknown_applied = mutated(lambda d: d.update(picks=[], defaults_applied=["missing.id"]))
+    (work / "choices.json").write_text(json.dumps(unknown_applied), encoding="utf-8")
+    probs = choices.problems(
+        work, (work, sub), ("design.md", "choices.json"), defaults_path=defaults
+    )
+    assert probs == ["choices.json: defaults_applied missing.id is not in defaults.json"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("{bad", "defaults.json is not valid JSON"),
+        ({"version": 2, "defaults": []}, "defaults.json does not match defaults.schema.json"),
+        (
+            {
+                "version": 1,
+                "defaults": [{"id": "x", "value": "v", "scope": "rel/path", "source": "s"}],
+            },
+            "$.defaults[0].scope",
+        ),
+        (
+            {
+                "version": 1,
+                "defaults": [{"id": "x", "value": "v", "scope": "global", "source": " "}],
+            },
+            "$.defaults[0].source",
+        ),
+        (
+            {
+                "version": 1,
+                "defaults": [
+                    {"id": "x", "value": "a", "scope": "global", "source": "always a"},
+                    {"id": "x", "value": "b", "scope": "global", "source": "always b"},
+                ],
+            },
+            "duplicate entry for x in global",
+        ),
+    ],
+)
+def test_malformed_defaults_file_fails_with_schema_error(
+    work: Path, tmp_path: Path, raw, expected: str
+) -> None:
+    defaults = _write_defaults(tmp_path, raw)
+    data = mutated(lambda d: d.update(picks=[]))
+    (work / "choices.json").write_text(json.dumps(data), encoding="utf-8")
+    probs = choices.problems(
+        work, (work, work), ("design.md", "choices.json"), defaults_path=defaults
+    )
+    assert any(expected in p for p in probs), probs

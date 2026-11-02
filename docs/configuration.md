@@ -118,6 +118,10 @@ leaving it empty keeps the inherited environment. The `init` draft omits this ke
 "env": {"PATH": "~/.local/bin:~/.bun/bin:$PATH"}
 ```
 
+### Owner defaults
+
+Optional `<root>/taskwatch/defaults.json` holds standing owner answers for design jobs (`{"version": 1, "defaults": [{"id", "value", "scope": "global" | "<target path>", "source": "<owner words>"}]}`), validated against [`docs/kinds/defaults.schema.json`](kinds/defaults.schema.json). When the same `id` has several applicable entries, the most specific scope wins (a target path beats `global`; a longer matching path beats a shorter one), as in `git config` and Claude Code settings. Every design job's work and review messages name the file and its short SHA-256 hash (`Owner defaults: <root>/taskwatch/defaults.json (sha256 <12 hex> | absent)`), and the `choices.json` check fails a malformed file, an unknown `defaults_applied` id, or a pick whose `id` is already settled by an applicable default; see [`docs/kinds/design.md`](kinds/design.md).
+
 ### Code job work folders
 
 A `code` job that builds a result works in `state/jobs/<id>/worktree`, on its own branch.
@@ -126,9 +130,11 @@ A `code` job that builds a result works in `state/jobs/<id>/worktree`, on its ow
   without prompting and with a 5 second cap. The default branch is the one `origin/HEAD`
   names, or `main`. The worktree starts at `origin/<default branch>`. If the fetch fails or the
   target has no `origin`, the local ref is used and the job records `base_note: "base may be
-  stale: <reason>"`. The optional submission field `base` (a commit or branch of the target)
-  replaces the base, for work stacked on another job's branch; it is used as written, with no
-  fetch. Afterwards `base` in the record is the commit used.
+  stale: <reason>"`. The optional submission field `base` (a commit or branch of the target, or
+  `@<receipt key>` for the branch `<branch_prefix><first 8 characters of the id>` of an existing
+  code job) replaces the base, for work stacked on another job's branch; it is used as written,
+  with no fetch, and `@<receipt key>` is stored as the resolved branch name. Afterwards `base`
+  in the record is the commit used.
 - Branch. `<branch_prefix><first 8 characters of the job id>`. Optionally add
   `"branch_prefix"` to `jobs-config.json` (default `"taskwatch/"`): letters, digits, `_` and
   `-`, with parts joined by `/`. A resumed job reuses its worktree and branch.
@@ -204,9 +210,11 @@ The work must create that check script if it is not already in its workspace.
 The checklist follows the existing nonempty `items` list of boolean `passes`.
 
 `inputs`, `predecessors`, `expected_wait_seconds`, and `approval_required` are
-optional. Every other example field is required. Predecessors must already
-exist. Derive the receipt key from the approval message and its job number.
-A repeated key returns the original job even if other arguments differ.
+optional. Every other example field is required. Each entry of `predecessors` is
+an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored
+record keeps the resolved job ids. Derive the receipt key from the approval
+message and its job number. A repeated key returns the original job even if other
+arguments differ.
 The command records the caller's approval assertion; it cannot authenticate
 the conversation.
 
@@ -466,7 +474,7 @@ Publishing is a gate, not a kind. The common chain is research, a gate, design, 
 
 The submit rule for a caller that sends ordered units under one approval:
 
-1. Submit the first unit and read its id. Submit each next unit with `predecessors` naming the unit before it and the receipt key `<approval message>:<n>`. The message of the successor lists each predecessor's result, so the prompt needs no pasted path; for a stacked code unit set `base` to the predecessor's branch `<branch_prefix><first 8 characters of its id>`. Units with no order between them are submitted together without `predecessors`.
+1. Submit the units in order, each with the receipt key `<approval message>:<n>` and `predecessors` naming the unit before it by its receipt key (or its id). Because receipt keys are known before submit, the whole chain can be submitted in one pass; the stored record keeps the resolved ids. The message of the successor lists each predecessor's result, so the prompt needs no pasted path; for a stacked code unit set `base` to `@<predecessor receipt key>` (or `<branch_prefix><first 8 characters of its id>`). Units with no order between them are submitted together without `predecessors`.
 2. A unit that needs the owner's decision on an earlier result (a design before its implementation) carries `approval_required: true`. It stays queued until every predecessor is `done`, then waits in `approval_wait` with the brief of the predecessor ready. Show the owner the output of `taskwatch brief <predecessor>`, then pass the owner's reply to `approve --reason`, preceded for picks by one line `PICKS: ok` or `PICKS: <id>=<key|text> ...`. The reply is appended to the approval source, so the worker and the reviewer see it as the owner's decision.
 3. A unit whose `spec`, `intent` or `inputs` must be a predecessor's output cannot be submitted early: those files are copied and hashed at submit. Submit it after the output exists.
 4. A cancelled or stopped predecessor leaves its successors queued; `needs` lists them as blocked. Cancel or resubmit them.

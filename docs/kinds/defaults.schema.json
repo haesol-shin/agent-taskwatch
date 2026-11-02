@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "taskwatch owner defaults",
+  "description": "Standing owner choices in <root>/taskwatch/defaults.json. The most specific matching scope wins (a target path beats global; a longer matching path beats a shorter one).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "defaults"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "defaults": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/default_entry"
+      }
+    }
+  },
+  "$defs": {
+    "default_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "value",
+        "scope",
+        "source"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "value": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "scope": {
+          "type": "string",
+          "pattern": "^(global|/.*\\S.*)$"
+        },
+        "source": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      }
+    }
+  }
+}

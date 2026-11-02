@@ -5,6 +5,7 @@ here is plain code. It cannot tell whether a choice that is listed as decided sh
 a pick; the reviewer's `choices` key and rule D-9 judge that.
 """
 
+import hashlib
 import json
 import re
 import shlex
@@ -14,8 +15,12 @@ from pathlib import Path
 from .jobs import Jobs, JobState
 from .kinds import kind_label
 from .pointers import pointer_problem, pointers
+from .review_docs import docs_dir
+from .review_print import MAX_ERRORS, validate
 
 FILE = "choices.json"
+DEFAULTS_FILE = "defaults.json"
+DEFAULTS_SCHEMA = "defaults.schema.json"
 MAX_PICKS = 5
 MIN_SEARCHES = 3
 REPLY = "reply: ok | <id>=<key|text> ... | free text"
@@ -47,7 +52,13 @@ def _text(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def problems(workspace: Path, roots: tuple[Path, ...], outputs: tuple[str, ...]) -> list[str]:
+def problems(
+    workspace: Path,
+    roots: tuple[Path, ...],
+    outputs: tuple[str, ...],
+    *,
+    defaults_path: Path | None = None,
+) -> list[str]:
     """Why `choices.json` in the workspace fails the schema; empty when it passes."""
     data, issues = load(workspace / FILE)
     if data is None:
@@ -61,8 +72,12 @@ def problems(workspace: Path, roots: tuple[Path, ...], outputs: tuple[str, ...])
     issues += _picks(data["picks"], roots, seen)
     issues += _decided(data["decided"], roots, seen)
     issues += _tools(data["existing_tools"])
-    if not isinstance(data.get("defaults_applied", []), list):
-        issues.append(f"{FILE}: `defaults_applied` must be a list")
+    applied = data.get("defaults_applied", [])
+    if not isinstance(applied, list) or not all(_text(item) for item in applied):
+        issues.append(f"{FILE}: `defaults_applied` must be a list of nonempty strings")
+    elif defaults_path is not None:
+        target = roots[-1] if roots else workspace
+        issues += _default_problems(defaults_path, target, data["picks"], applied)
     issues += _writer_choices(workspace, outputs, data["decided"])
     return issues
 
@@ -203,6 +218,108 @@ def _writer_choices(workspace: Path, outputs: tuple[str, ...], decided: list) ->
         for i in ids
         if i not in section
     ]
+
+
+# --- owner defaults ------------------------------------------------------------------------
+
+
+def defaults_path(root: Path) -> Path:
+    return root / "taskwatch" / DEFAULTS_FILE
+
+
+def defaults_lines(root: Path, job: JobState) -> list[str]:
+    """The line in a design job's messages that names `<root>/taskwatch/defaults.json` and its
+    short hash."""
+    if not is_design(job):
+        return []
+    path = defaults_path(root)
+    try:
+        short = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        state = f"sha256 {short}"
+    except FileNotFoundError:
+        state = "absent"
+    except OSError:
+        state = "unreadable"
+    return [f"Owner defaults: {path} ({state})"]
+
+
+def _defaults_schema() -> Mapping:
+    source = docs_dir("kinds")
+    if source is None:
+        raise ValueError("kinds documents were not found")
+    return json.loads((source / DEFAULTS_SCHEMA).read_text(encoding="utf-8"))
+
+
+def load_defaults(path: Path) -> tuple[list[dict] | None, list[str]]:
+    """The validated entries of `defaults.json`, or `([], [])` when the file is absent."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [], []
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, [f"{DEFAULTS_FILE} cannot be read: {exc}"]
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return None, [f"{DEFAULTS_FILE} is not valid JSON: {exc}"]
+    errors = validate(data, _defaults_schema())
+    if errors:
+        shown = "; ".join(errors[:MAX_ERRORS])
+        more = f" (+{len(errors) - MAX_ERRORS} more)" if len(errors) > MAX_ERRORS else ""
+        return None, [f"{DEFAULTS_FILE} does not match {DEFAULTS_SCHEMA}: {shown}{more}"]
+    seen: set[tuple[str, str]] = set()
+    duplicates = []
+    for entry in data["defaults"]:
+        scope = "global" if entry["scope"] == "global" else str(Path(entry["scope"]).resolve())
+        pair = (entry["id"], scope)
+        if pair in seen:
+            duplicates.append(f"{DEFAULTS_FILE}: duplicate entry for {entry['id']} in {scope}")
+        seen.add(pair)
+    if duplicates:
+        return None, duplicates
+    return list(data["defaults"]), []
+
+
+def resolve_defaults(entries: list[dict], target: Path) -> dict[str, dict]:
+    """Applicable entries for `target`, the most specific scope winning per `id`."""
+    resolved_target = target.resolve()
+    best: dict[str, tuple[tuple[int, int], dict]] = {}
+    for entry in entries:
+        rank = _scope_rank(entry["scope"], resolved_target)
+        if rank is None:
+            continue
+        ident = entry["id"]
+        if ident not in best or rank > best[ident][0]:
+            best[ident] = (rank, entry)
+    return {ident: pair[1] for ident, pair in best.items()}
+
+
+def _scope_rank(scope: str, target: Path) -> tuple[int, int] | None:
+    if scope == "global":
+        return (0, 0)
+    path = Path(scope).resolve()
+    if target == path or target.is_relative_to(path):
+        return (1, len(path.parts))
+    return None
+
+
+def _default_problems(path: Path, target: Path, picks: list, applied: list[str]) -> list[str]:
+    entries, issues = load_defaults(path)
+    if entries is None:
+        return issues
+    known = {entry["id"] for entry in entries}
+    applicable = resolve_defaults(entries, target)
+    for ident in applied:
+        if ident not in known:
+            issues.append(f"{FILE}: defaults_applied {ident} is not in {DEFAULTS_FILE}")
+    for pick in picks:
+        if isinstance(pick, dict) and _text(pick.get("id")) and pick["id"] in applicable:
+            win = applicable[pick["id"]]
+            issues.append(
+                f"{FILE}: pick {pick['id']} is already settled by {DEFAULTS_FILE} "
+                f"({win['scope']}: {win['value']!r})"
+            )
+    return issues
 
 
 # --- the owner's answer --------------------------------------------------------------------

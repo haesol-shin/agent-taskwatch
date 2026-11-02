@@ -436,6 +436,7 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
         lines += [f"Brief file: {ctx.folder / 'brief.md'}"]
     for path in job.inputs.get("work", []):
         lines.append(f"Work input: {path}")
+    lines += choices.defaults_lines(ctx.jobs.state.root, job)
     lines += _predecessor_lines(ctx)
     lines += ["", _approval_text(ctx)]
     if ctx.stage == "fix":
@@ -623,6 +624,7 @@ def _review_message(
     if prior:
         lines += _prior_lines(ctx, prior, review_root, scope)
     lines += [f"Review input: {p}" for p in job.inputs.get("review", [])]
+    lines += choices.defaults_lines(ctx.jobs.state.root, job)
     lines += _predecessor_lines(ctx)
     if ctx.config.review_mode == "print":
         lines += [f"Verdict schema: {_schema_path(ctx)}", "", _layer("taskwatch-print.md")]
@@ -921,7 +923,12 @@ def _brief_problems(jobs: Jobs, job: JobState, workspace: Path, folder: Path) ->
     if choices.is_design(job):
         if choices.FILE not in job.outputs:
             problems.append(f"{choices.FILE} must be listed in outputs so the review covers it")
-        problems += choices.problems(workspace, roots, job.outputs)
+        problems += choices.problems(
+            workspace,
+            roots,
+            job.outputs,
+            defaults_path=choices.defaults_path(jobs.state.root),
+        )
     awaiting, listed, unanswered = choices.brief_expectations(jobs, job, workspace)
     return (
         problems

@@ -278,9 +278,7 @@ class Jobs:
                 if job.receipt_key == payload["receipt_key"]:
                     return job
             data = _submission(payload)
-            missing = set(data["predecessors"]) - existing.keys()
-            if missing:
-                raise ValueError(f"unknown predecessors: {', '.join(sorted(missing))}")
+            _resolve_receipt_tokens(data, existing, _branch_prefix(self.state.root))
             data.update(id=uuid.uuid4().hex, last_progress_at=now)
             self._copy_inputs(data)
             job = JobState(**data)
@@ -456,6 +454,40 @@ def _base_field(data: dict, review_only: bool) -> None:
         raise ValueError("base must be a commit or branch name")
     if data["review"] != "code" or review_only:
         raise ValueError("base applies only to code jobs that build a result")
+
+
+def _branch_prefix(root: Path) -> str:
+    try:
+        return load_job_config(root).branch_prefix
+    except FileNotFoundError:
+        return DEFAULT_BRANCH_PREFIX
+
+
+def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix: str) -> None:
+    """Resolve receipt keys in `predecessors` to job ids and `@<receipt key>` in `base` to a
+    branch name, so a chain can be submitted before its jobs have ids."""
+    by_receipt = {job.receipt_key: job for job in existing.values()}
+    predecessors = []
+    missing = []
+    for token in data["predecessors"]:
+        if token in existing:
+            predecessors.append(token)
+        elif token in by_receipt:
+            predecessors.append(by_receipt[token].id)
+        else:
+            missing.append(token)
+    if missing:
+        raise ValueError(f"unknown predecessors: {', '.join(sorted(set(missing)))}")
+    data["predecessors"] = predecessors
+    base = data.get("base", "")
+    if base.startswith("@"):
+        key = base[1:]
+        pred = by_receipt.get(key)
+        if not key or pred is None:
+            raise ValueError(f"unknown receipt key in base: {base}")
+        if pred.review != "code" or pred.review_target is not None:
+            raise ValueError(f"base {base} is not a code job that builds a branch")
+        data["base"] = pred.branch or f"{prefix}{pred.id[:8]}"
 
 
 def _ref(value: object, label: str) -> str:
