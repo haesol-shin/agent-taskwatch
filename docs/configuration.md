@@ -272,11 +272,15 @@ No blocking findings.
 A FAIL, malformed verdict, missing input, or blocking finding prevents
 `deliver_pending`. See [review records](checks.md#review-records) for the shared contract.
 
-Submission copies and hashes intent, spec, and role-specific inputs. The
-original prompt is kept intact. `jobs.jsonl` stores append-only, checksummed
-snapshots. The existing torn-tail repair preserves a partial last line before
-the next append. Corrupt committed records block scheduling rather than
-letting a job start or pass. Inspect the scan service journal for diagnostics.
+#### Job records
+
+Submission copies and hashes intent, spec, and role-specific inputs. The original prompt is kept intact. `jobs.jsonl` stores checksummed full snapshots in the existing JSONL format. A job's receipt key is immutable; two job identities cannot share a receipt key. Corrupt committed records block scheduling rather than letting a job start or pass. Inspect the scan service journal for diagnostics.
+
+Each `Jobs` instance caches validated snapshots and reads only committed bytes appended since its last read. A replaced or shortened file invalidates the cache; a changed boundary at the cached offset also causes a fresh read. The first load in a process still validates the whole current file. Writers share the state lock. Saving validates unseen records once, preserves any torn tail beside the ledger, and appends and fsyncs one snapshot without rereading the committed history.
+
+After a save, when the number of lines exceeds eight times the number of jobs, the writer compacts under the same lock to the newest snapshot of each job. It fsyncs a temporary file, atomically replaces the ledger and fsyncs its directory. This fixed ratio amortizes rewriting the current snapshots across several saves without letting old snapshots accumulate indefinitely; it is not a configuration option. Current snapshots still contain their full event history, so this bounds obsolete snapshots, not the size of an individual job.
+
+`jobs.cursors.json` holds the current and next ledger generations, published durably before the ledger replacement. It keeps integer cursors unambiguous across compaction, inode reuse and file regrowth without adding fields to job records. Include this small metadata file with the ledger when backing up state. Readers that already have a baseline retain it across replacement; a restarted reader whose generation was discarded conservatively lists current needs and finished jobs again.
 
 Each job has `state/jobs/<id>/`, a separate workspace, copied inputs, a
 `WORKFLOW.md`, and execution evidence. Code jobs use a git worktree on their own
@@ -462,8 +466,7 @@ The submit rule for a caller that sends ordered units under one approval:
 
 ### What needs the owner
 
-`taskwatch --root <root> needs` lists what waits for the owner and prints a `cursor` (the
-byte size of `jobs.jsonl` it read). It is read only: no lock, nothing written, derived on
+`taskwatch --root <root> needs` lists what waits for the owner and prints an opaque integer `cursor` identifying the ledger generation and committed byte offset. Pass it unchanged to `--from`; do not calculate it from file size. Existing byte-only cursors remain accepted and conservatively replay current items after compaction. It is read only: no lock, nothing written, derived on
 every call. Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and
 their briefs and counts the decisions in their `brief.md`, or the picks of a design predecessor with the reply template `ok | <id>=<key> | text`; otherwise it shows the reason),
 `NEEDS YOU` (a job in `user_wait`: reason, review round, open findings, rules that repeated

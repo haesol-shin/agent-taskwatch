@@ -85,6 +85,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 
 ### Fixed
 
+- Job saves and repeated loads read only new ledger records, and automatic compaction bounds obsolete snapshots while preserving checksums, torn-tail recovery and generation-qualified `needs` cursors; see [Job records](docs/configuration.md#job-records).
 - The delivery card is written in the configured `language`: `WORKFLOW.md` tells the worker to write the `Card` lines in it and the review prompt tells the reviewer to write finding `summary` and `not_checked` items in it. Without the key, the language of the intent stays (`docs/configuration.md`, "Language"; `docs/kinds/brief.md`).
 - The wake that starts the next stage sets the timer accuracy to 1 s (`--timer-property=AccuracySec=1s`); systemd's default of 1 minute let the next stage start 20 to 52 s late.
 - A dead step on a full disk no longer burns three relaunches. If the job folder's or `TMPDIR`'s filesystem has under 256 MiB free, the scan parks the job as `user_wait` with reason `disk_full`, the path and the free bytes in `error`, and uses no recovery. Test runs also leave no read-only snapshot folders in the pytest base temp.

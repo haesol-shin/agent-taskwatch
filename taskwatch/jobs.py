@@ -3,8 +3,10 @@
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Mapping
@@ -13,8 +15,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 
+from .job_cursor import prepare_generation
 from .job_env import validate_env
-from .state import RecordError, State, _create_new, _make_dirs
+from .state import (
+    RECORD_VERSION,
+    RecordError,
+    State,
+    _append_validated_line,
+    _create_new,
+    _fsync,
+    _make_dirs,
+    _repair_torn,
+)
 
 STAGES = frozenset(
     {
@@ -35,6 +47,8 @@ REVIEWS = frozenset({"code", "design", "source"})
 _OLD_KINDS = {"code": "code", "design": "design", "document": "source", "research": "source"}
 MAX_FIX_ROUNDS = 3
 MAX_RECOVERIES = 3
+# Ledger policy lives in docs/configuration.md#job-records.
+COMPACT_RATIO = 8
 
 DEFAULT_BRANCH_PREFIX = "taskwatch/"
 _PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*(/[A-Za-z0-9][A-Za-z0-9_-]*)*[/-]?")
@@ -235,38 +249,125 @@ def _stamp(now: float) -> datetime:
 class Jobs:
     def __init__(self, root: Path) -> None:
         self.state = State(root.resolve())
+        self._signature = None
+        self._offset = 0
+        self._lines = 0
+        self._latest: dict[str, JobState] = {}
+        self._rows: dict[str, dict] = {}
+        self._receipts: dict[str, str] = {}
+        self._anchor = b""
 
     def folder(self, job: JobState) -> Path:
         return self.state.dir / "jobs" / job.id
 
     def load(self) -> dict[str, JobState]:
         with self.state.lock():
-            latest = {}
-            receipts = {}
-            for row in self.state.read_records("jobs.jsonl"):
-                job = row.get("job")
-                if not isinstance(job, dict) or row.get("sha256") != _digest(job):
-                    raise RecordError("jobs.jsonl: corrupt job snapshot")
-                job = _upgrade_record(job)
-                _validate_record(job)
-                key, identifier = job["receipt_key"], job["id"]
-                if key in receipts and receipts[key] != identifier:
-                    raise RecordError("jobs.jsonl: conflicting receipt key")
-                receipts[key] = identifier
-                try:
-                    latest[identifier] = JobState(**job)
-                except TypeError as exc:
-                    raise RecordError(f"jobs.jsonl: invalid job fields: {exc}") from exc
-            return latest
+            self._refresh()
+            return dict(self._latest)
+
+    def _refresh(self) -> None:
+        path = self.state.dir / "jobs.jsonl"
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            self._reset()
+            return
+        signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if signature == self._signature:
+            return
+        if (
+            self._signature is None
+            or signature[:2] != self._signature[:2]
+            or info.st_size <= self._signature[2]
+        ):
+            self._reset()
+        try:
+            with path.open("rb") as handle:
+                if self._offset:
+                    handle.seek(self._offset - len(self._anchor))
+                    if handle.read(len(self._anchor)) != self._anchor:
+                        self._reset()
+                handle.seek(self._offset)
+                while line := handle.readline():
+                    if not line.endswith(b"\n"):
+                        break
+                    self._accept(json.loads(line))
+                    self._offset += len(line)
+                    self._lines += 1
+                handle.seek(max(0, self._offset - 128))
+                self._anchor = handle.read(min(self._offset, 128))
+        except (ValueError, TypeError, OSError) as exc:
+            self._reset()
+            raise RecordError(f"jobs.jsonl: invalid committed record: {exc}") from exc
+        self._signature = signature
+
+    def _reset(self) -> None:
+        self._signature = None
+        self._offset = self._lines = 0
+        self._latest = {}
+        self._rows = {}
+        self._receipts = {}
+        self._anchor = b""
+
+    def _accept(self, row: dict) -> None:
+        if not isinstance(row, dict) or isinstance(row.get("version"), bool):
+            raise RecordError("jobs.jsonl: invalid record")
+        if row.get("version") != RECORD_VERSION:
+            raise RecordError("jobs.jsonl: unknown version")
+        data = row.get("job")
+        if not isinstance(data, dict) or row.get("sha256") != _digest(data):
+            raise RecordError("jobs.jsonl: corrupt job snapshot")
+        data = _upgrade_record(data)
+        _validate_record(data)
+        job = JobState(**data)
+        self._check_receipt(job)
+        self._receipts[job.receipt_key] = job.id
+        self._latest[job.id] = job
+        self._rows[job.id] = row
+
+    def _check_receipt(self, job: JobState) -> None:
+        if self._receipts.get(job.receipt_key, job.id) != job.id:
+            raise RecordError("jobs.jsonl: conflicting receipt key")
+        previous = self._latest.get(job.id)
+        if previous is not None and previous.receipt_key != job.receipt_key:
+            raise RecordError("jobs.jsonl: receipt key changed")
+
+    def _compact(self) -> None:
+        if self._lines <= COMPACT_RATIO * len(self._latest):
+            return
+        path = self.state.dir / "jobs.jsonl"
+        name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=path.parent, prefix="jobs-compact-", delete=False
+            ) as handle:
+                name = handle.name
+                os.fchmod(handle.fileno(), path.stat().st_mode & 0o777)
+                for row in self._rows.values():
+                    handle.write((json.dumps(row, separators=(",", ":")) + "\n").encode())
+                handle.flush()
+                os.fsync(handle.fileno())
+                prepare_generation(path, os.fstat(handle.fileno()))
+            os.replace(name, path)
+            _fsync(path.parent)
+        finally:
+            if name is not None and os.path.exists(name):
+                os.unlink(name)
+            self._signature = None
 
     def save(self, job: JobState, now: float) -> None:
         data = job.to_json()
         _validate_record(data)
         with self.state.lock():
-            self.load()
-            self.state.append_record(
-                "jobs.jsonl", {"job": data, "sha256": _digest(data)}, _stamp(now)
+            self._refresh()
+            self._check_receipt(job)
+            path = self.state.dir / "jobs.jsonl"
+            _repair_torn(path, _stamp(now))
+            _append_validated_line(
+                path, {"version": RECORD_VERSION, "job": data, "sha256": _digest(data)}
             )
+            self._refresh()
+            self._compact()
 
     def submit(self, payload: dict, now: float | None = None) -> JobState:
         now = time.time() if now is None else now
