@@ -508,7 +508,7 @@ terminal(
 )
 ```
 
-The list is a hint; re-read the state with `show` before acting.
+The list is a hint; re-read the state with `show` before acting. `taskwatch --root <root> show [<id>]` prints the job record (or the list of records) as JSON with one derived key, `"activity"` (not stored in `jobs.jsonl` and not in `needs`): for a job in `work`, `fix`, `check` or `review`, `"<stage> <m>m; last progress <m>m ago: <last non-empty progress line>"` (from `started_at`, `last_progress_at` and the progress file in the job folder, collapsed to one line of at most 120 characters, or `"<stage> <m>m; last progress <m>m ago"` when the progress file has no non-empty line yet); `null` for any other stage. An example Hermes skill for this loop is in [`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
 
 ### Recovery and decisions
 

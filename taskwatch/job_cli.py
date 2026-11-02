@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from .activity import activity
 from .jobs import JobConfig, Jobs, load_job_config
 from .state import RecordError, _create_new, _make_dirs
 
@@ -210,8 +211,15 @@ def _dispatch(args: argparse.Namespace, root: Path):
     if args.command == "submit":
         return jobs.submit(json.loads(args.file.read_text(encoding="utf-8"))).to_json()
     if args.command == "show":
+        now = time.time()
         records = jobs.load()
-        return records[args.job].to_json() if args.job else [j.to_json() for j in records.values()]
+        if args.job:
+            job = records[args.job]
+            return {**job.to_json(), "activity": activity(job, jobs.folder(job), now)}
+        return [
+            {**job.to_json(), "activity": activity(job, jobs.folder(job), now)}
+            for job in records.values()
+        ]
     if args.command == "scan":
         from .job_scan import scan_jobs
 
