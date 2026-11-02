@@ -93,5 +93,6 @@ def test_show_cli_includes_derived_activity_without_storing_it(
     assert shown_all[active.id]["activity"] == "work 12m; last progress 3m ago: - running tests"
     assert shown_all[finished.id]["activity"] is None
 
-    for row in jobs.state.read_records("jobs.jsonl"):
+    for job in jobs.load().values():
+        row = json.loads((jobs.folder(job) / "state.json").read_text())
         assert "activity" not in row["job"]

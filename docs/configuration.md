@@ -274,13 +274,89 @@ A FAIL, malformed verdict, missing input, or blocking finding prevents
 
 #### Job records
 
-Submission copies and hashes intent, spec, and role-specific inputs. The original prompt is kept intact. `jobs.jsonl` stores checksummed full snapshots in the existing JSONL format. A job's receipt key is immutable; two job identities cannot share a receipt key. Corrupt committed records block scheduling rather than letting a job start or pass. Inspect the scan service journal for diagnostics.
+The paths here are relative to `<root>/taskwatch/state/`. Use
+`taskwatch --root <root> show [<id>]` for an authoritative read or
+`taskwatch --root <root> scan` for normal scheduling and recovery. Read
+[What needs the owner](#what-needs-the-owner) for the list identities and wake
+conditions; do not edit storage files to acknowledge an item.
 
-Each `Jobs` instance caches validated snapshots and reads only committed bytes appended since its last read. A replaced or shortened file invalidates the cache; a changed boundary at the cached offset also causes a fresh read. The first load in a process still validates the whole current file. Writers share the state lock. Saving validates unseen records once, preserves any torn tail beside the ledger, and appends and fsyncs one snapshot without rereading the committed history.
+Submission copies and hashes intent, spec, and role-specific inputs. The original
+prompt is kept intact. `jobs/<id>/state.json` is the sole current
+full snapshot, in a version-2 envelope with a positive revision and a SHA-256
+checksum covering both the revision and all job fields. `jobs-store.json` records
+the format, stream generation and job-id-to-receipt membership. Receipt keys are
+immutable and globally unique. An indexed missing or corrupt snapshot is an
+error, not an absent job; unindexed folders left by input copying are not jobs.
+Corruption blocks scheduling rather than allowing a job to start or pass.
 
-After a save, when the number of lines exceeds eight times the number of jobs, the writer compacts under the same lock to the newest snapshot of each job. It fsyncs a temporary file, atomically replaces the ledger and fsyncs its directory. This fixed ratio amortizes rewriting the current snapshots across several saves without letting old snapshots accumulate indefinitely; it is not a configuration option. Current snapshots still contain their full event history, so this bounds obsolete snapshots, not the size of an individual job.
+Writers share the existing reentrant state lock. Each save validates its affected
+snapshot, membership and unseen committed event tail, rather than rereading
+obsolete full snapshots or unrelated jobs. A cold load validates the indexed
+current snapshots. `job-changes.jsonl` holds checksummed version-2 events with
+generation, sequence, job id, revision and only the needs projection: stage,
+wait reason, wait/approve/resume entry count, predecessors and last event time.
+Every successful save emits an event, including an unchanged projection; needs
+identities, not save count, determine a wake. Full event/review histories remain
+in current snapshots and may grow. The small log grows linearly with saves; there
+is no automatic rotation or bound on total disk use.
 
-`jobs.cursors.json` holds the current and next ledger generations, published durably before the ledger replacement. It keeps integer cursors unambiguous across compaction, inode reuse and file regrowth without adding fields to job records. Include this small metadata file with the ledger when backing up state. Readers that already have a baseline retain it across replacement; a restarted reader whose generation was discarded conservatively lists current needs and finished jobs again.
+A save writes and fsyncs a restrictive same-directory temporary snapshot, then
+atomically publishes and syncs `jobs-pending.json`, a small prepared transaction
+containing the temporary basename, revision/digest, exact event bytes and any new
+receipt membership, never another full snapshot. It replaces and syncs the
+snapshot, publishes new membership if needed, appends and fsyncs the event, then
+removes the pending marker and syncs its directory before returning success.
+These files are **not** independently updated atomically. Failure before the
+pending marker leaves the old state authoritative and may leave an unreferenced
+temporary file. Failure after publication is uncertain to the caller: the next
+locked authoritative read or mutation rolls the transaction forward, validating
+its revision, digest and sequence. An already matching event is synced again,
+not duplicated; receipt retries retain the original identity. Torn final events
+are preserved beside the log before repair. No external operation runs in
+storage recovery.
+
+On first authoritative `show`, normal `scan` or mutation without a format marker,
+the writer validates every committed legacy snapshot once, including checksums,
+versions, typed fields, ids and receipt invariants. It preserves a torn suffix,
+stages latest states and one initial projection per job, syncs them, and publishes
+the index last. Interrupted pre-marker migration accepts only artifacts matching
+the exact validated legacy latest states; conflicts or orphaned v2 files without
+a legacy source fail closed. Empty roots initialize the same format.
+
+After cutover, `jobs.jsonl` and `jobs.cursors.json` remain untouched historical
+backups: no dual writes, automatic deletion or movement. Stop old workers and
+watchers before replacing binaries; an old binary is not a supported v2 writer.
+Back up the index, current states, change log and pending/temporary files together
+with writers stopped or under the same lock. Rollback means restoring a consistent
+pre-migration backup with every process stopped, not running an old writer against
+v2 files.
+
+If validation refuses a stable file or migration conflict, inspect the command
+error and scan service journal; do not remove the marker or adopt orphan files.
+Restore a consistent backup with all processes stopped rather than bypassing
+checksums or receipt checks. Keep copied inputs and execution evidence when
+backing up the job folders, as well as the other state ledgers.
+
+`needs` remains unlocked and read-only: it follows committed projection bytes and
+loads validated current snapshots only for rendered jobs and required gate
+predecessors. It rechecks the event boundary, generation and selected snapshots
+before rendering. A selected newer snapshot without its committed event defers
+the result only when a matching pending marker exists, preserving the incoming
+cursor; a non-wait call explains how to recover with `show` or normal `scan`,
+while a wait keeps polling. A watcher never repairs a crashed writer. Until the
+next normal locked read/scan recovers it, an unpublished transition need not be
+visible. A stable snapshot/event mismatch without a matching pending marker is
+corruption.
+
+Cursors remain opaque nonnegative integers, now identifying the v2 generation
+and committed byte offset. Retained v2 cursors resume precisely. Legacy byte-only
+and stopgap-generation cursors, future offsets and offsets splitting a committed
+line conservatively replay current actionable and finished jobs with an
+explanation and a new cursor. This is a one-time cutover replay, not a new wake
+policy. First-use `needs` never migrates: legacy or staged files without a marker
+produce error code 1 and an instruction to run `show` or normal `scan` once. A
+genuinely empty root returns no items and cursor 0 without writing; a waiting
+watcher observes the first published generation normally.
 
 Each job has `state/jobs/<id>/`, a separate workspace, copied inputs, a
 `WORKFLOW.md`, and execution evidence. Code jobs use a git worktree on their own
@@ -466,8 +542,11 @@ The submit rule for a caller that sends ordered units under one approval:
 
 ### What needs the owner
 
-`taskwatch --root <root> needs` lists what waits for the owner and prints an opaque integer `cursor` identifying the ledger generation and committed byte offset. Pass it unchanged to `--from`; do not calculate it from file size. Existing byte-only cursors remain accepted and conservatively replay current items after compaction. It is read only: no lock, nothing written, derived on
-every call. Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and
+`taskwatch --root <root> needs` lists what waits for the owner and prints an
+opaque integer `cursor`. Pass it unchanged to `--from`; do not calculate it from
+file size. It is read only: no lock, nothing written, derived on every call.
+See [Job records](#job-records) for generation and cutover replay semantics.
+Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and
 their briefs and counts the decisions in their `brief.md`, or the picks of a design predecessor with the reply template `ok | <id>=<key> | text`; otherwise it shows the reason),
 `NEEDS YOU` (a job in `user_wait`: reason, review round, open findings, rules that repeated
 in earlier reviews), `BLOCKED` (a queued job behind a cancelled or `user_wait` predecessor)
@@ -491,7 +570,16 @@ terminal(
 )
 ```
 
-The list is a hint; re-read the state with `show` before acting. `taskwatch --root <root> show [<id>]` prints the job record (or the list of records) as JSON with one derived key, `"activity"` (not stored in `jobs.jsonl` and not in `needs`): for a job in `work`, `fix`, `check` or `review`, `"<stage> <m>m; last progress <m>m ago: <last non-empty progress line>"` (from `started_at`, `last_progress_at` and the progress file in the job folder, collapsed to one line of at most 120 characters, or `"<stage> <m>m; last progress <m>m ago"` when the progress file has no non-empty line yet); `null` for any other stage. An example Hermes skill for this loop is in [`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
+The list is a hint; re-read the state with `show` before acting. See
+[Job records](#job-records) for storage, recovery and cursor cutover.
+`taskwatch --root <root> show [<id>]` prints the job record (or list of records)
+with one derived key, `"activity"` (not persisted and not in `needs`): for a job
+in `work`, `fix`, `check` or `review`, `"<stage> <m>m; last progress <m>m ago:
+<last non-empty progress line>"` (from `started_at`, `last_progress_at` and the
+progress file in the job folder, collapsed to at most 120 characters, or without
+the trailing progress text when empty); for all other stages, `null`.
+An example skill for this loop is in
+[`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
 
 ### Recovery and decisions
 

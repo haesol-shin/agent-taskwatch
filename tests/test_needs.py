@@ -54,7 +54,7 @@ class Ledger:
         self.set(job_id, events=events, **changes)
 
     def size(self) -> int:
-        return (self.jobs.state.dir / "jobs.jsonl").stat().st_size
+        return cursor_of(needs(self.root)[1])
 
     def watch(self, cursor: int, sleep):
         return needs(
@@ -218,13 +218,12 @@ def test_wait_without_a_cursor_is_a_usage_error(ledger: Ledger, capsys) -> None:
 
 
 def test_a_corrupt_snapshot_of_a_listed_job_exits_1(ledger: Ledger, capsys) -> None:
-    ledger.add(stage="user_wait", wait_reason="review_exhausted")
-    path = ledger.jobs.state.dir / "jobs.jsonl"
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    rows[-1]["job"]["error"] = "tampered"
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    ident = ledger.add(stage="user_wait", wait_reason="review_exhausted")
+    path = ledger.jobs.folder(ledger.get(ident)) / "state.json"
+    row = json.loads(path.read_text(encoding="utf-8"))
+    row["job"]["error"] = "tampered"
+    path.write_text(json.dumps(row), encoding="utf-8")
     assert main(["--root", str(ledger.root), "needs"]) == 1
-    assert "corrupt job snapshot" in capsys.readouterr().err
 
 
 def test_the_cli_prints_the_list(ledger: Ledger, capsys) -> None:

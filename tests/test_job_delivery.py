@@ -32,9 +32,9 @@ with open(args[args.index("--file") + 1], encoding="utf-8") as handle:
 seen = ""
 root = os.environ.get("FAKE_JOBS_FILE", "")
 if root:
-    with open(root, encoding="utf-8") as handle:
-        rows = [json.loads(line) for line in handle if line.strip()]
-    attempts = rows[-1]["job"]["deliveries"]
+    from pathlib import Path
+    states = Path(root).glob("*/state.json")
+    attempts = [a for p in states for a in json.loads(p.read_text())["job"]["deliveries"]]
     seen = attempts[-1]["status"] if attempts else ""
 calls = os.path.join(here, "calls.jsonl")
 with open(calls, "a", encoding="utf-8") as handle:
@@ -147,7 +147,7 @@ def _short_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 def sender(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Sender:
     fake = Sender(tmp_path / "sender")
     fake.modes("success")
-    jobs_file = tmp_path / "home" / "taskwatch" / "state" / "jobs.jsonl"
+    jobs_file = tmp_path / "home" / "taskwatch" / "state" / "jobs"
     monkeypatch.setenv("FAKE_JOBS_FILE", str(jobs_file))
     return fake
 
