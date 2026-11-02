@@ -439,26 +439,6 @@ response with only `skipped` is unknown, not done.
 
 `WORKFLOW.md` tells the worker to run only the tests that cover the files it changed while working, and `check <job> --run-command` once just before it ends.
 
-### Watching a job
-
-`taskwatch --root <root> watch <job-id> [--timeout <seconds>] [--interval <seconds>]` blocks
-until the job stage is `approval_wait`, `user_wait`, `deliver_pending`, `done`, or
-`cancelled`, prints a report of at most 20 lines (id, stage, `wait_reason`, whether an `error` is recorded (its text is not printed), last
-review verdict, output and detail paths, next commands), and exits. It exits at once when the
-job already stopped. Exit codes: `0` needs attention, `3` the `--timeout` (default 82800)
-passed with nothing to report, `2` usage error or unknown job, `1` other error. `--interval`
-defaults to 30 and is at least 5. The command is read only: it takes no lock and writes
-nothing. It reads `jobs.jsonl` once, then only the lines appended since the last poll, because
-a full load of a large ledger takes about a second. Hermes starts it from the room that
-submitted the job:
-
-```python
-terminal(background=True, notify_on_complete=True, command="taskwatch --root <root> watch <id>")
-```
-
-The report is a hint; re-read the state with `show` before acting. `approve` and `resume`
-move the job to `queued`, so a watcher started after them waits for the next stop.
-
 ### Chains and gates
 
 A kind is a label derived from `review` and `review_target`; it names the contract in `docs/kinds/` that `WORKFLOW.md` carries.

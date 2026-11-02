@@ -41,7 +41,6 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 - Code jobs start from a freshly fetched `origin/<default branch>` on a named branch (`<branch_prefix><id8>`, default `taskwatch/`), record `base`, `base_note`, `branch`, `workspace_state` and `branch_state`, and accept an optional `base` field for stacked work. The scan removes a clean worktree at `done` and `cancelled`, keeps a dirty one with the reason, and deletes the branch only once it is merged or squash merged into `origin/<default branch>`.
 - Optional `env` object in `jobs-config.json` sets the environment of every process a job starts (omp worker, reviewer, check command, runner git commands); `PATH` entries expand `~`, `$HOME` and `$PATH`, so jobs find tools in `~/.local/bin` without per-job approval.
 - A job keeps its checklist and progress files in its job folder instead of the worktree, and the worker prompt gives their absolute paths, so records are never committed into a result and the clean-tree check needs no exception. Records that name `.taskwatch/...` still load.
-- `taskwatch watch <job>` blocks until a job reaches `approval_wait`, `user_wait`, `deliver_pending`, `done`, or `cancelled`, prints a short report, and exits (0 attention, 3 time limit, 2 unknown job). It reads `jobs.jsonl` without a lock or write and parses only new lines per poll, so a Hermes background process can wake the room that started the work.
 - Optional `review_command` selects a separate executor command for independent job reviews, falling back to `omp_command` when omitted.
 - Review-only jobs: submit a `review_target` (files or a commit) to review it without a work stage; the parsed verdict is recorded and delivered.
 - `python -m taskwatch.reviewer_launch` builds the omp reviewer command at run time from an omp agent definition and the `docs/review` guidelines, so a review started by taskwatch or by omp alone reads the same guideline text; `review_command` accepts `{guidelines}` and `{review}`.
@@ -81,6 +80,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 
 ### Removed
 
+- `taskwatch watch <job>`: use `taskwatch needs --wait --from <cursor>` instead (`docs/configuration.md`, "What needs the owner").
 - The Hermes Kanban plugin: the plugin entry, cards, completion gate, Hermes tools, the `hermes taskwatch` command, their examples, and the shared-module code only they used. The `taskwatch` job runner is unchanged.
 
 ### Fixed
