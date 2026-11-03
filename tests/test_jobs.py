@@ -430,6 +430,10 @@ def test_init_writes_the_default_and_the_loader_reads_it(tmp_path):
     path = host_config(root)
     assert json.loads(path.read_text(encoding="utf-8"))["max_reviews"] == 3
     assert load_job_config(root).max_reviews == 3
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "worker_mode" not in data and "worker_command" not in data
+    assert load_job_config(root).worker_mode == "rpc"
+    assert load_job_config(root).worker_command is None
 
 
 def test_max_reviews_is_per_job_over_host_over_built_in_and_frozen_at_submit(tmp_path):
@@ -614,3 +618,65 @@ def test_host_install_command_is_optional_argv(tmp_path, command):
     config["install_command"] = command
     path.write_text(json.dumps(config), encoding="utf-8")
     assert load_job_config(root).install_command == (tuple(command) if command else None)
+
+
+@pytest.mark.parametrize(
+    "extra,mode,command",
+    [
+        ({}, "rpc", None),
+        ({"worker_mode": "rpc"}, "rpc", None),
+        ({"worker_mode": "rpc", "worker_command": ["unused"]}, "rpc", ("unused",)),
+        (
+            {"worker_mode": "print", "worker_command": ["worker", "{literal}", "--flag"]},
+            "print",
+            ("worker", "{literal}", "--flag"),
+        ),
+    ],
+)
+def test_worker_configuration_preserves_literal_argv_and_review_defaults(
+    tmp_path, extra, mode, command
+):
+    root = tmp_path / "root"
+    host_config(root, omp_command=["unavailable-omp.invalid"], **extra)
+    config = load_job_config(root)
+    assert (config.worker_mode, config.worker_command) == (mode, command)
+    assert config.omp_command == ("unavailable-omp.invalid",)
+    assert config.review_mode == "rpc"
+    assert config.review_command is None
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"worker_mode": "unknown"},
+        {"worker_mode": None},
+        {"worker_mode": 1},
+        {"worker_mode": []},
+        {"worker_mode": {}},
+        {"worker_mode": "print"},
+        {"worker_command": None},
+        {"worker_command": []},
+        {"worker_command": "worker"},
+        {"worker_command": [""]},
+        {"worker_command": [" "]},
+        {"worker_command": ["worker", ""]},
+        {"worker_command": ["worker", 1]},
+    ],
+)
+def test_worker_configuration_rejects_invalid_modes_and_commands(tmp_path, extra):
+    root = tmp_path / "root"
+    path = host_config(root)
+    data = {**json.loads(path.read_text(encoding="utf-8")), **extra}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="worker_(mode|command)"):
+        load_job_config(root)
+
+
+@pytest.mark.parametrize("command", [None, [], "", ["worker", ""], [1]])
+def test_print_still_validates_unused_omp_argv(tmp_path, command):
+    root = tmp_path / "root"
+    path = host_config(root, worker_mode="print", worker_command=["worker"])
+    data = {**json.loads(path.read_text(encoding="utf-8")), "omp_command": command}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="omp_command"):
+        load_job_config(root)

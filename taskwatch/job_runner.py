@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import (
+    agent_process,
     brief,
     choices,
     job_findings,
@@ -54,7 +55,7 @@ from .jobs import (
     progress_fingerprint,
 )
 from .kinds import declares_choices, kind_label
-from .rate_limit import RateLimit
+from .rate_limit import RateLimit, print_rate_limit, scrub
 from .review_docs import docs_dir, profile_names
 
 STEPS = frozenset({"work", "fix", "check", "review", "land"})
@@ -865,36 +866,50 @@ def _print_reply(ctx: Ctx, message: str, review_root: Path) -> tuple[str, str]:
     schema = _write_schema(ctx)
     output = review_root / "reply.txt"
     output.unlink(missing_ok=True)
+    stdout = ctx.folder / "logs" / f"review-a{ctx.job.attempt}.stdout"
+    stderr = ctx.folder / "logs" / f"review-a{ctx.job.attempt}.stderr"
+    _print_process(ctx, _command(ctx, review_root), message, stdout, stderr, review=True)
+    replies = []
+    if output.is_file():
+        replies.append(("last-message file", output))
+    replies.append(("standard output", stdout))
+    try:
+        return review_print.verdict_files(replies, schema), ""
+    except review_print.ReplyError as exc:
+        raw = next((review_print.excerpt(path) for _, path in replies if path.stat().st_size), "")
+        return raw, str(exc)[: review_print.KEEP_CHARS]
+
+
+def _print_process(
+    ctx: Ctx, argv, message: str, stdout: Path, stderr: Path, *, review: bool = False
+) -> None:
     recorder = Recorder(ctx)
     watcher = threading.Thread(target=recorder.watch, daemon=True)
     watcher.start()
     try:
-        stdout = review_print.run(
-            _command(ctx, review_root),
+        agent_process.run(
+            argv,
             ctx.workspace,
             ctx.env,
             message,
-            timeout=float(ctx.config.rpc_timeout),
+            deadline=time.monotonic() + ctx.config.rpc_timeout,
             every=EVIDENCE_EVERY,
             tick=recorder.beat,
             abort=recorder.abort,
-            stderr_path=ctx.folder / "logs" / f"review-a{ctx.job.attempt}.stderr",
+            stdout_path=stdout,
+            stderr_path=stderr,
         )
-    except review_print.RunError as exc:
-        raise StepError(str(exc), exc.rate_limit) from exc
+    except agent_process.RunError as exc:
+        if recorder.abort.is_set():
+            raise StaleAttempt from exc
+        detail = agent_process.tail(stderr, 4000)
+        limit = print_rate_limit(detail) if review and exc.returncode is not None else None
+        raise StepError(scrub(str(exc)) if limit else str(exc), limit) from exc
     finally:
         recorder.done.set()
+        watcher.join()
     if recorder.abort.is_set():
         raise StaleAttempt
-    replies = []
-    if output.is_file():
-        replies.append(("last-message file", output.read_text(encoding="utf-8", errors="replace")))
-    replies.append(("standard output", stdout))
-    try:
-        return review_print.verdict_body(replies, schema), ""
-    except review_print.ReplyError as exc:
-        raw = next((text for _, text in replies if text.strip()), "")
-        return raw[: review_print.KEEP_CHARS], str(exc)
 
 
 def _converse(
@@ -934,7 +949,7 @@ def _converse(
                 lambda j: {
                     "session_path": path if isinstance(path, str) else "",
                     "session_dir": str(session_dir),
-                    "events": _event(j, type="session_open", resumed=resumed),
+                    "events": _event(j, type="session_open", attempt=j.attempt, resumed=resumed),
                 },
             )
             client.prompt_and_wait(message(resumed), timeout)
@@ -951,8 +966,60 @@ def _converse(
     return reply
 
 
+def _worker_identity(ctx: Ctx) -> tuple[str, tuple[str, ...]]:
+    for event in reversed(ctx.job.events):
+        if event.get("type") == "worker_launch" and event.get("attempt") == ctx.job.attempt:
+            return event.get("mode", "rpc"), tuple(event["argv"])
+    mode = "rpc" if ctx.job.attempt <= ctx.job.legacy_worker_attempt else ctx.config.worker_mode
+    command = ctx.config.omp_command if mode == "rpc" else ctx.config.worker_command
+    if not command:
+        raise StepError("worker_mode print needs worker_command")
+    program = command[0]
+    if "/" in program:
+        executable = str((ctx.workspace / program).absolute())
+    else:
+        search = os.pathsep.join(str(ctx.workspace / entry) for entry in os.get_exec_path(ctx.env))
+        executable = shutil.which(program, path=search) or program
+    argv = (executable, *command[1:])
+    _apply(
+        ctx,
+        lambda j: {
+            "events": _event(
+                j,
+                type="worker_launch",
+                attempt=j.attempt,
+                stage=ctx.stage,
+                mode=mode,
+                command=list(command),
+                argv=list(argv),
+                executable=executable,
+            ),
+            **({"session_path": "", "session_dir": ""} if mode == "print" else {}),
+        },
+    )
+    return mode, argv
+
+
 def _agent_step(ctx: Ctx) -> int:
-    _converse(ctx, ctx.folder / "sessions" / "work", lambda r: _agent_message(ctx, r), False)
+    mode, argv = _worker_identity(ctx)
+    if mode == "rpc":
+        pinned = replace(ctx, config=replace(ctx.config, omp_command=tuple(argv)))
+        _converse(pinned, ctx.folder / "sessions" / "work", lambda r: _agent_message(ctx, r), False)
+    else:
+        resumed = (
+            any(
+                event.get("type") == "worker_launch" and event.get("stage") == ctx.stage
+                for event in ctx.job.events
+            )
+            or ctx.job.recoveries > 0
+        )
+        _print_process(
+            ctx,
+            argv,
+            _agent_message(ctx, resumed),
+            ctx.folder / "logs" / f"{ctx.stage}-a{ctx.job.attempt}.stdout",
+            ctx.folder / "logs" / f"{ctx.stage}-a{ctx.job.attempt}.stderr",
+        )
     stage = ctx.stage
 
     def build(job: JobState) -> dict:
@@ -1537,7 +1604,9 @@ def _judge(
         "basis": job.basis,
         "base": base,
         "body": body,
-        "session_path": ctx.jobs.load()[job.id].session_path,
+        "session_path": (
+            "" if ctx.config.review_mode == "print" else ctx.jobs.load()[job.id].session_path
+        ),
         "problems": [],
         "findings": [],
         "checked": "",

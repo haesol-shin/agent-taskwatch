@@ -29,11 +29,7 @@ All keys shown above except `max_reviews` are required. The three numeric settin
 
 `install_command` is optional and defaults to `null`; [Automatic landing](#automatic-landing) owns its host-only argv contract, frozen identity and explicit retry rules.
 
-Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run
-independent reviews with a different command prefix. Like `omp_command`, it must
-be a nonempty list of nonempty strings. When omitted, reviews use `omp_command`;
-work and fix always use `omp_command`. With the default `review_mode` (`"rpc"`), both commands receive `--mode rpc --no-ui`.
-The `init` draft omits this optional key.
+Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run independent reviews with a different command prefix. Like `omp_command`, it must be a nonempty list of nonempty strings. When omitted, RPC reviews use `omp_command`. With the default `review_mode` (`"rpc"`), review commands receive `--mode rpc --no-ui`. The `init` draft omits this optional key. Work and fix select their command through [Worker execution](#worker-execution).
 
 In `review_command` (and only there), an argument that is exactly `{guidelines}` becomes the
 job's own copy of the review guidelines, and exactly `{review}` becomes the job's `review`
@@ -44,6 +40,76 @@ reads the agent definition and those guidelines when the review starts:
 "review_command": ["python3", "-m", "taskwatch.reviewer_launch", "--agent", "/srv/example/reviewer.md",
                    "--guidelines", "{guidelines}", "--review", "{review}"]
 ```
+
+### Worker execution
+
+`worker_mode` is optional, accepts exactly `"rpc"` or `"print"` and defaults to `"rpc"` when omitted. Explicit `"worker_mode": "rpc"` preserves the existing omp worker behavior. Optional `worker_command` must be a nonempty argv list of nonempty strings; print mode requires it. RPC work and fix use `omp_command`, never `worker_command`. `omp_command` remains a required nonempty argv list even when unused, but taskwatch does not resolve or launch it in a fully print configuration. No worker placeholder substitution, shell parsing, vendor flags or model/role reinterpretation occurs.
+
+Print work and fix each launch the configured argv once in the existing job workspace with the [job environment](#job-environment). The exact worker message arrives as UTF-8 stdin followed by EOF: `WORKFLOW.md`, copied inputs, predecessor evidence, approval scope, progress/checklist/brief paths, fix findings and any unfinished-work reminder retain their existing meaning. Exit zero permits deterministic checking only. Stdout, including `PASS` text or reviewer-shaped JSON, is execution evidence, never a verdict. Checks, independent review and existing fingerprint/basis guards still decide acceptance.
+
+The workspace is the per-job Git worktree for code jobs and the per-job `work` directory for source/design jobs; see [work folders](#code-job-work-folders) and [records](#job-records). For a first run, follow [submission](#submit-an-approved-job); reviewer placeholders and file/stdout reply priority are defined in [print review](#reviewer-other-than-omp).
+
+Work/fix attempts durably record the selected mode, argv and executable resolution before launch under the existing attempt/stage guards. Historical attempts without print identity retain RPC meaning. Configuration changes cannot reinterpret a running attempt or attach print to an old RPC conversation; a genuinely new attempt may select and record a different command. Print recovery launches a fresh CLI in the retained workspace with progress and the unfinished-work reminder, without a taskwatch session path, implicit resume flags or cross-job session reuse.
+
+Print workers and print reviewers share one subprocess supervisor. Each invocation has a new process group, concurrent stdin feeding, and distinct attempt-owned stdout/stderr files streamed directly to disk, not accumulated in memory: `logs/work-a<attempt>.stdout`, `logs/fix-a<attempt>.stdout` and matching `.stderr` files for workers. Raw logs remain evidence; error summaries are bounded excerpts. Missing executables, nonzero exits, signals, failed stdin delivery and timeout use existing [step-failure/recovery handling](#recovery-and-decisions), without backend fallback. A process that prints completion but stays alive is not complete.
+
+`rpc_timeout` is also the absolute print execution limit, measured from process start across stdin feeding and waiting. Every 15 seconds the existing evidence/progress machinery ticks: evidence heartbeats and log bytes cannot extend the deadline, and log output alone is not progress. Changes to the progress/checklist or declared output files update their progress fingerprint, not stdout bytes. Abort, cancellation, stale attempts/stages, timeout and supervisor failures terminate the process group and reap the leader, including same-group descendants left after leader exit. Existing guarded state updates fence late completion; user-systemd still owns reservation/service cleanup. This is not containment of deliberately detached processes or arbitrary filesystem writes.
+
+Host operators own authentication, network access, loaded rules, model/tool selection and noninteractive permissions. Approval text is not a sandbox. In particular, the job-folder progress, checklist, brief, findings, root-cause and declared public-text paths named by `WORKFLOW.md` can be outside the Git worktree. Prepare narrowly scoped write permissions for the actual authorized files before launch; do not grant the entire job folder or publication permission. Reviewers remain independently read-only except for their required reply destination. Print model controls are vendor/host settings, not omp `@task` or `@slow` role mappings.
+
+The runner prepares `WORKFLOW.md` before invoking the worker. A host-owned launch wrapper can read its exact authorized paths before starting a sandboxed CLI; provision permission for creating the named files as well as updating them. Do not infer permission for sibling files or directories from the approval text.
+
+### Standalone print configurations
+
+These complete `jobs-config.json` examples require neither Hermes nor omp. The synthetic `omp-unused.invalid` argv validates but need not exist. The host must supply the selected vendor CLI on `PATH`, Python/shell utilities where used, and `/srv/example/notify-command`: a real sender implementing [Delivery](#delivery), taking `--to`, `--file` and the generated message path, waiting for channel acceptance and returning the specified JSON. `person.invalid` is a synthetic destination to replace, not an operational account. Configure submission checks separately. These are configuration examples, not evidence of an authenticated model run.
+
+Codex worker and independent schema-constrained reviewer:
+
+```json
+{
+  "version": 1,
+  "slots": 2,
+  "stall_seconds": 1800,
+  "omp_command": ["omp-unused.invalid"],
+  "rpc_timeout": 3600,
+  "worker_mode": "print",
+  "worker_command": ["codex", "exec", "--sandbox", "workspace-write", "--ephemeral", "--color", "never", "-"],
+  "review_mode": "print",
+  "review_command": ["codex", "exec", "--sandbox", "read-only", "--ephemeral", "--color", "never", "--output-schema", "{schema}", "-o", "{output}", "-"],
+  "deliver_command": ["/srv/example/notify-command", "--to", "person.invalid", "--file", "{message}"],
+  "max_reviews": 3
+}
+```
+
+`workspace-write` alone does not authorize every workflow path outside the worktree. The host must prepare the narrowly authorized workflow writes and reviewer reply destination using its supported policy, rather than assuming the sandbox flag grants them. Check `codex exec --help` for stdin `-`, sandbox modes, `--ephemeral`, `--color`, `--output-schema`, `-o` and host-controlled `--add-dir`; this example does not automatically add directories or approval bypasses. See the official [noninteractive documentation](https://learn.chatgpt.com/docs/non-interactive-mode).
+
+Claude worker and independent structured-output reviewer:
+
+```json
+{
+  "version": 1,
+  "slots": 2,
+  "stall_seconds": 1800,
+  "omp_command": ["omp-unused.invalid"],
+  "rpc_timeout": 3600,
+  "worker_mode": "print",
+  "worker_command": ["claude", "-p", "--output-format", "text"],
+  "review_mode": "print",
+  "review_command": ["sh", "-c", "claude -p --permission-mode plan --allowedTools \"Read,Grep,Glob,Bash(git diff *),Bash(git log *),Bash(git show *)\" --output-format json --json-schema \"$(cat \"$1\")\"", "sh", "{schema}"],
+  "deliver_command": ["/srv/example/notify-command", "--to", "person.invalid", "--file", "{message}"],
+  "max_reviews": 3
+}
+```
+
+The worker receives its prompt on stdin. The host must configure its model, tools, writable workflow paths and noninteractive permissions without depending on an interactive approval prompt. No `--bare`, permission bypass or auto-approval flag is added: normal host rule/authentication discovery remains intact. The official [headless guide](https://code.claude.com/docs/en/headless.md) and [CLI reference](https://code.claude.com/docs/en/cli-reference) describe bare mode separately: it skips hooks, plugins and `CLAUDE.md` and requires explicit authentication setup. Verify current bare-mode behavior and permissions against `claude --help` on the target host.
+
+### OpenCode stdin adapter
+
+After copying [`examples/worker/opencode.py`](../examples/worker/opencode.py) to the host as `/srv/example/opencode-worker.py`, replace either complete configuration's worker argv with exactly `["python3", "/srv/example/opencode-worker.py"]`, retaining its explicit print reviewer and sender. The host supplies Python 3 and `opencode` on `PATH`, plus its model, authentication, tools and narrowly scoped permissions.
+
+The adapter validates UTF-8 stdin and passes the entire prompt as one positional argument to the documented `opencode run [message..]` interface, using `--` to end option parsing even for a prompt starting with `--help`. It replaces itself with the CLI, preserving cwd, environment, stdout/stderr, process-group ownership and the CLI's exit/signal semantics. It adds no shell, server attachment, implicit resume or permission grant. It does not assume native prompt stdin support or free inference. See the official [OpenCode CLI reference](https://opencode.ai/docs/cli/) and verify compatibility against `opencode run --help` on the target host.
+
+This argv transport is deliberately limited on Linux: every encoded argument/environment entry including its terminating NUL must fit `min(32 * page_size, 128 KiB)`, and all encoded argv/environment strings, terminating NULs and pointer slots plus a 2048-byte reserve must fit `min(ARG_MAX, 128 KiB)`. This conservative check can reject prompts the kernel might accept; the environment reduces available prompt space. Embedded NULs, invalid UTF-8 and size violations fail before execution. A missing CLI or kernel `E2BIG` produces an explicit diagnostic, never truncation, another transport or retry. Synthetic tests establish protocol fidelity only, not vendor compatibility or authentication.
 
 ### Model selection
 
@@ -56,17 +122,17 @@ taskwatch does not read omp's configuration or route between providers. A comman
 "review_command": ["omp", "--model", "@slow"]
 ```
 
-`review_command` may instead be the [reviewer launcher](review-launch.md) whose agent definition selects `@slow`. An explicit model (`--model <provider>/<id>`) or a launcher-owned model option keeps its meaning, and a bare `omp` keeps omp's ordinary startup default. A role lists candidates in order and omp takes the first available one, so a first candidate whose quota is used up is still chosen: edit the role order, and the next launch uses it. Print-mode reviewers get no RPC behavior from this.
+`review_command` may instead be the [reviewer launcher](review-launch.md) whose agent definition selects `@slow`. An explicit model (`--model <provider>/<id>`) or a launcher-owned model option keeps its meaning, and a bare `omp` keeps omp's ordinary startup default. A role lists candidates in order and omp takes the first available one, so a first candidate whose quota is used up is still chosen: edit the role order, and the next launch uses it. Print workers and reviewers get no RPC behavior from this.
 
 The step fails before any prompt, with the transcript untouched, when `get_state` reports no model, when `open_session` is rejected (for example `Model not found`), cancelled or times out, or when the model read back differs from the requested one. It never falls back to the saved model or to a new empty conversation. The omp command must support the public RPC `open_session` model override (`provider` and `modelId` together); it is a documented runtime prerequisite, not a transport version, so protocol v2 alone does not prove it. An older omp has to be upgraded by its operator. The upstream references are [RPC](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md) (Model, `get_state`, `open_session`), [models](https://github.com/can1357/oh-my-pi/blob/main/docs/models.md) (role aliases) and the [CLI reference](https://github.com/can1357/oh-my-pi/blob/main/docs/cli-reference.md) (model selection).
 
 ### Reviewer other than omp
 
-Set `"review_mode": "print"` to review with a tool that is not omp (Codex, Claude Code, Gemini CLI, or any program). It needs `review_command` and adds no argument to it. The default is `"rpc"`; a host that sets nothing sees no change. Work and fix still run on `omp_command`.
+Set `"review_mode": "print"` to review with a tool that is not omp (Codex, Claude Code, Gemini CLI, or any program). It needs `review_command` and adds no argument to it. The default is `"rpc"`; a host that sets nothing sees no change. Work and fix independently use [Worker execution](#worker-execution); a standalone setup needs both modes set to print.
 
 In print mode the command runs once per review, in the job's folder, with the review message on its standard input. Besides `{guidelines}` and `{review}`, an argument that is exactly `{schema}` becomes the path of the verdict JSON Schema file (a copy of [`docs/launch/review-verdict.schema.json`](launch/review-verdict.schema.json) in the job folder) and exactly `{output}` the path of a file where the tool may write its last message. The reply must be one JSON object that follows the schema; [`docs/launch/taskwatch-print.md`](launch/taskwatch-print.md) is the text the reviewer reads. The schema has the keys the verdict line and the finding lines have in an RPC review, so the same rules decide what is accepted.
 
-taskwatch looks for the verdict in the `{output}` file first, then in the standard output. In each it accepts the object itself (plain, or in a code fence), the object inside a wrapper (`structured_output` or `result` of `claude -p --output-format json`, `response` of `gemini -p --output-format json`), or the last line of a JSON-lines stream that holds it. It validates the object against the schema and fails the round with the schema path of the first errors (`$.findings[0].severity: 'P9' is not one of ...`) when it does not match; the raw reply is kept as the review text. There is no session, so there is no same-session repair: a malformed reply uses its review attempt and the review runs again. A command that exits with a nonzero code or runs longer than `rpc_timeout` seconds fails the step with that reason, unless its standard error holds an explicit HTTP 429 diagnostic, which is a [rate limit](#rate-limits).
+taskwatch looks for the verdict in the `{output}` file first, then in the standard output. In each it accepts the object itself (plain, or in a code fence), the object inside a wrapper (`structured_output` or `result` of `claude -p --output-format json`, `response` of `gemini -p --output-format json`), or the last line of a JSON-lines stream that holds it. Whole reply documents and individual JSONL candidates have a 4 MiB parsing bound; oversized single candidates explicitly fail rather than being truncated into a verdict. Raw files are retained, while malformed-reply excerpts in review records are limited to 20,000 characters. It validates the object against the schema and fails the round with the schema path of the first errors (`$.findings[0].severity: 'P9' is not one of ...`) when it does not match. There is no session, so there is no same-session repair: a malformed reply uses its review attempt and the review runs again. A nonzero reviewer exit fails the step unless its stderr holds an explicit terminal HTTP 429 diagnostic, which is a [rate limit](#rate-limits). Deadline, stdin-delivery and supervisor failures remain execution failures even if stderr mentions 429. Both raw streams remain in `logs/review-a<attempt>.stdout` and `.stderr`; both callers use the lifecycle in [Worker execution](#worker-execution).
 
 taskwatch cannot restrict the tools of the other command; see [the limits](review-launch.md#print-mode-limits). Give each tool its read-only flags, as below. These examples were written on 2026-11-02 from the tools' own help or official pages; only `codex` is installed on the host that wrote them, so the `claude` and `gemini` lines are not run here.
 
@@ -131,7 +197,7 @@ A review is counted when it is reserved, before it starts, and never after it re
 
 ### Job environment
 
-Optionally add `"env"`, an object of string keys and string values, to set the environment of every process the runner starts for a job: the omp worker (work, fix, review, including the reviewer command), check command, runner git/forge commands and enabled install hook. A systemd job starts with a minimal `PATH`, so tools such as `gitleaks` in `~/.local/bin` or omp plugins in `~/.bun/bin` can need entries here. Values are used as written, except in `PATH`, where `~` and `$HOME` expand and `$PATH` stands for the inherited value. No shell runs implicitly. Anything other than an object of strings is a config error; omitting `env` or leaving it empty keeps the inherited environment. The `init` draft omits this key.
+Optionally add `"env"`, an object of string keys and string values, to set the environment of every process the runner starts for a job: RPC and print workers/reviewers, check command, runner git/forge commands and enabled install hook. A systemd job starts with a minimal `PATH`, so tools such as `gitleaks` in `~/.local/bin` or omp plugins in `~/.bun/bin` can need entries here. Values are used as written, except in `PATH`, where `~` and `$HOME` expand and `$PATH` stands for the inherited value. No shell runs implicitly. Anything other than an object of strings is a config error; omitting `env` or leaving it empty keeps the inherited environment. The `init` draft omits this key.
 
 ```json
 "env": {"PATH": "~/.local/bin:~/.bun/bin:$PATH"}

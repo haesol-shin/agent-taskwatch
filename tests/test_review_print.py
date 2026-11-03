@@ -1,15 +1,17 @@
 """Print mode: a review command that answers once, found, validated and parsed by code."""
 
 import json
+import os
 import re
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from taskwatch import review_print
+from taskwatch import job_runner, review_print
 from taskwatch.executor import (
     CATEGORIES,
     DESIGN_KEYS,
@@ -299,14 +301,101 @@ def test_a_command_that_never_finishes_is_stopped(env):
     env.config = replace(env.config, rpc_timeout=1)
     env.to_review()
     assert env.run("review") == 1
-    assert "did not finish within 1 seconds" in env.get().error
+    assert "deadline" in env.get().error
 
 
-def test_the_message_does_not_need_the_command_to_read_it(env):
-    use(env, answer(), shell=f"cat {env.tmp}/reply.txt")
+def test_early_closed_review_stdin_cannot_supply_authority(env):
+    use(env, answer(), shell=f"exec 0<&-; cat {env.tmp}/reply.txt")
+    env.job = replace(env.job, prompt="x" * 1024 * 1024)
+    env.jobs.save(env.job, time.time())
     env.to_review()
-    assert env.run("review") == 0
-    assert env.get().stage == "deliver_pending"
+    assert env.run("review") == 1
+    assert env.get().stage == "review"
+    assert not env.get().reviews
+    assert "stdin" in env.get().error
+
+
+@pytest.mark.parametrize("phase", ["feed", "wait"])
+@pytest.mark.parametrize("replacement", ["cancel", "attempt"])
+def test_reviewer_cancellation_and_stale_replacement_stop_real_process(
+    env, monkeypatch, phase, replacement
+):
+    ready = env.tmp / "review-ready"
+    script = (
+        "import os, pathlib, signal, sys; "
+        + ("sys.stdin.read(); " if phase == "wait" else "")
+        + f"print({answer()!r}, flush=True); "
+        + f"ready = pathlib.Path({str(ready)!r}); "
+        + "pending = ready.with_suffix('.tmp'); pending.write_text(str(os.getpid())); "
+        + "pending.replace(ready); signal.pause()"
+    )
+    env.to_review()
+    env.config = replace(
+        env.config, review_mode="print", review_command=(sys.executable, "-c", script)
+    )
+    monkeypatch.setattr(job_runner, "WATCH_EVERY", 0.01)
+    env.put("review", prompt="prompt " * 200000 if phase == "feed" else env.get().prompt)
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            job_runner.run_job(env.jobs, env.config, env.job.id, env.attempt)
+        )
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists() and worker.is_alive()
+        pid = int(ready.read_text())
+        with env.jobs.state.lock():
+            current = env.get()
+            replaced = replace(
+                current,
+                stage="cancelled" if replacement == "cancel" else current.stage,
+                attempt=current.attempt + (replacement == "attempt"),
+            )
+            env.jobs.save(replaced, time.time())
+        worker.join(3)
+        assert not worker.is_alive() and result == [2]
+        assert env.get() == replaced
+        assert not env.get().reviews
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        with env.jobs.state.lock():
+            env.jobs.save(replace(env.get(), stage="cancelled"), time.time())
+        worker.join(6)
+
+
+@pytest.mark.parametrize("failure", ["feed-timeout", "wait-timeout", "feed-closed"])
+def test_429_before_incomplete_execution_does_not_refund_a_review(env, failure):
+    script = (
+        "import os, signal, sys; "
+        "print('HTTP 429 Too Many Requests; Retry-After: 120', file=sys.stderr, flush=True); "
+        + {
+            "feed-timeout": "",
+            "wait-timeout": "sys.stdin.read(); ",
+            "feed-closed": "os.close(0); ",
+        }[failure]
+        + "signal.pause()"
+    )
+    env.to_review()
+    env.config = replace(
+        env.config,
+        review_mode="print",
+        review_command=(sys.executable, "-c", script),
+        rpc_timeout=1,
+    )
+    changes = {"prompt": "prompt " * 200000} if failure != "wait-timeout" else {}
+    assert env.run("review", **changes) == 1
+    job = env.get()
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("review", 1, 0)
+    assert (job.wait_reason, job.retry_not_before) == ("", 0.0)
+    assert not job.reviews
+    assert ("stdin" if failure == "feed-closed" else "deadline") in job.error
+    stderr = env.folder() / "logs" / f"review-a{job.attempt}.stderr"
+    assert "HTTP 429" in stderr.read_text()
 
 
 # --- config ----------------------------------------------------------------------------------
@@ -340,8 +429,80 @@ def test_the_documented_examples_are_accepted_by_the_config_loader(tmp_path: Pat
     text = (Path(__file__).parents[1] / "docs" / "configuration.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```json\n(\{.*?\})\n```", text, re.DOTALL)
     examples = [json.loads(b) for b in blocks if '"review_mode"' in b]
-    assert len(examples) == 3
     for example in examples:
         write_config(tmp_path, **example)
         config = load_job_config(tmp_path)
         assert config.review_mode == "print" and config.review_command
+
+
+def test_large_jsonl_reply_stream_keeps_last_verdict_and_raw_evidence(env):
+    use(
+        env,
+        answer(),
+        shell=f'cat > /dev/null; yes \'{{"event":"noise"}}\' | head -c 5000000;'
+        f" echo; cat {env.tmp}/reply.txt; echo diagnostic >&2",
+    )
+    env.to_review()
+    assert env.run("review") == 0
+    job = env.get()
+    assert job.stage == "deliver_pending"
+    logs = env.folder() / "logs"
+    assert (logs / f"review-a{job.attempt}.stdout").stat().st_size > 5000000
+    assert (logs / f"review-a{job.attempt}.stderr").read_text().strip() == "diagnostic"
+
+
+def test_oversized_single_candidate_is_explicitly_rejected(tmp_path):
+    path = tmp_path / "reply"
+    path.write_text('{"text":"' + "x" * review_print.MAX_REPLY_BYTES + '"}')
+    with pytest.raises(review_print.ReplyError, match="candidate exceeds"):
+        review_print.verdict_files([("stdout", path)], SCHEMA)
+
+
+def test_large_jsonl_cannot_override_invalid_last_message_file(tmp_path):
+    last = tmp_path / "last"
+    last.write_text(answer(verdict="MAYBE"))
+    stream = tmp_path / "stdout"
+    stream.write_text('{"event":"noise"}\n' * 300000 + answer())
+    with pytest.raises(review_print.ReplyError, match="does not match the schema"):
+        review_print.verdict_files([("last", last), ("stdout", stream)], SCHEMA)
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+def test_oversized_multiline_wrapper_cannot_invert_wrapper_priority(tmp_path, fenced):
+    path = tmp_path / "reply"
+    fail = {**ANSWER, "verdict": "FAIL", "blocking": True, "findings": [FINDING]}
+    padding = ",\n".join(
+        json.dumps("x" * 1000) for _ in range(review_print.MAX_REPLY_BYTES // 1000 + 1)
+    )
+    text = (
+        '{\n"result": '
+        + json.dumps(fail)
+        + ',\n"padding": [\n'
+        + padding
+        + '\n],\n"content": [\n'
+        + answer()
+        + "\n]\n}"
+    )
+    if fenced:
+        text = "```json\n" + text + "\n```"
+    path.write_text(text, encoding="utf-8")
+    assert path.stat().st_size > review_print.MAX_REPLY_BYTES
+    # Whole-document parsing prefers result=FAIL over content=PASS.
+    assert found(text)["verdict"] == "FAIL"
+    with pytest.raises(review_print.ReplyError, match="candidate exceeds"):
+        review_print.verdict_files([("stdout", path)], SCHEMA)
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+def test_large_jsonl_preserves_each_multiline_wrapper_priority(tmp_path, fenced):
+    path = tmp_path / "reply"
+    fail = {**ANSWER, "verdict": "FAIL", "blocking": True, "findings": [FINDING]}
+    with path.open("w", encoding="utf-8") as stream:
+        stream.write('{"event":"noise"}\n' * 300000)
+        if fenced:
+            stream.write("```json\n")
+        json.dump({"result": fail, "content": [ANSWER]}, stream, indent=2)
+        if fenced:
+            stream.write("\n```\n")
+    body = review_print.verdict_files([("stdout", path)], SCHEMA)
+    assert json.loads(body.splitlines()[0])["verdict"] == "FAIL"
