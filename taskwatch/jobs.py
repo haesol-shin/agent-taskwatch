@@ -526,8 +526,7 @@ def _host_config(root: Path) -> JobConfig:
 
 
 def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix: str) -> None:
-    """Resolve receipt keys in `predecessors` to job ids and `@<receipt key>` in `base` to a
-    branch name, so a chain can be submitted before its jobs have ids."""
+    """Resolve receipt references, preferring a verified landed base over its retained branch."""
     by_receipt = {job.receipt_key: job for job in existing.values()}
     predecessors = []
     missing = []
@@ -551,6 +550,18 @@ def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix
             raise ValueError(f"base {base} is not a code job that builds a branch")
         data["base"] = pred.branch or f"{prefix}{pred.id[:8]}"
         data["base_predecessor"] = pred.id
+        if pred.land:
+            from .job_env import job_environment
+            from .job_workspace import WorkspaceError, verified_predecessor_base
+
+            try:
+                landed = verified_predecessor_base(data["target"], pred, job_environment({}))
+            except WorkspaceError:
+                # Unready predecessors remain deferred until workspace creation.
+                pass
+            else:
+                if landed:
+                    data["base"] = landed
 
 
 def _ref(value: object, label: str) -> str:

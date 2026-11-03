@@ -654,7 +654,7 @@ taskwatch --root <root> resume <id> --reason "Approved a new fix cycle"
 taskwatch --root <root> cancel <id> --reason "User cancelled"
 ```
 
-Wait and cancel fence late output immediately. The scanner confirms service termination before reusing the slot, target or landing repository reservation. Approval resumes the saved step; an explicit user resume opens a new review cycle and a new recovery budget. Commands do not send messages themselves; scans send results and stop notices. Landing reconciles only its persisted exact external identities as described in [Automatic landing](#automatic-landing); arbitrary worker actions and unknown result deliveries are not reconciled.
+Wait and cancel fence late output immediately. The scanner confirms service termination before reusing the slot, target or landing repository reservation. Approval resumes the saved step; an explicit user resume outside landing opens a new review cycle and a new recovery budget. Resuming a landing stop preserves the accepted review and its review budget; a distinct resume entry authorizes only the specific persisted create, CI observation or install retry described in [Automatic landing](#automatic-landing), not new content or another review cycle. Commands do not send messages themselves; scans send results and stop notices. Landing reconciles only its persisted exact external identities; arbitrary worker actions and unknown result deliveries are not reconciled.
 
 `approve --reason` appends `Gate <date>: <reason>` to the approval source; the
 original approval stays and the worker and reviewer see both. `approve --scope`

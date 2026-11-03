@@ -199,8 +199,9 @@ class Transaction:
         self.repo = repo
 
     def fetch_main(self):
-        self.git("fetch", "--no-tags", "origin", self.repo.default_branch)
-        return self.git("rev-parse", f"refs/remotes/origin/{self.repo.default_branch}^{{commit}}")
+        ref = f"refs/remotes/origin/{self.repo.default_branch}"
+        self.git("fetch", "--no-tags", "origin", f"+refs/heads/{self.repo.default_branch}:{ref}")
+        return self.git("rev-parse", f"{ref}^{{commit}}")
 
     def base_guard(self):
         main = self.fetch_main()
@@ -228,6 +229,31 @@ class Transaction:
                 return True
         return False
 
+    def push_target(self):
+        urls = self.git("remote", "get-url", "--push", "--all", "origin").splitlines()
+        fetch_urls = self.git("remote", "get-url", "--all", "origin").splitlines()
+        identity = (self.repo.host.lower(), self.repo.owner.lower(), self.repo.name.lower())
+        try:
+            valid = (
+                urls
+                and fetch_urls
+                and all(
+                    tuple(part.lower() for part in forge.parse_origin(url, (self.repo.host,)))
+                    == identity
+                    for url in [*urls, *fetch_urls]
+                )
+            )
+        except forge.ForgeError:
+            valid = False
+        if not valid:
+            raise LandStop("land_head_changed", "push URLs differ from approved repository")
+        endpoints = {"push": urls, "fetch": fetch_urls}
+        if self.state.get("publication_endpoints", endpoints) != endpoints:
+            raise LandStop("land_head_changed", "frozen publication endpoints changed")
+        self.save(publication_endpoints=endpoints)
+        # Resolved URLs would undergo insteadOf expansion a second time as argv.
+        return "origin"
+
     def head(self):
         if not self.state.get("H"):
             message = self.title + "\n\n" + self.commit
@@ -239,13 +265,14 @@ class Transaction:
             "rev-list", "--parents", "-n", "1", head
         ).split() != [head, self.state["M"]]:
             raise LandStop("land_head_changed", "publication object parent or tree differs")
-        remote = self.git("ls-remote", "--heads", "origin", f"refs/heads/{self.state['branch']}")
+        target = self.push_target()
+        remote = self.git("ls-remote", "--heads", target, f"refs/heads/{self.state['branch']}")
         if remote and remote.split()[0] != head:
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
         if not remote:
             self.freshness()
             self.save(push_intent=True, phase="push")
-            self.git("push", "origin", f"{head}:refs/heads/{self.state['branch']}")
+            self.git("push", target, f"{head}:refs/heads/{self.state['branch']}")
         self.save(pushed=True)
 
     def validate_pr(self, pr):
@@ -260,7 +287,7 @@ class Transaction:
             raise LandStop("land_pr_mismatch", "PR identity, state or reviewed publication differs")
         return pr
 
-    def pull_request(self):
+    def pull_request(self, *, create=True):
         matches = self.api.find_pull_requests(
             self.repo, self.state["branch"], self.repo.default_branch, self.state["H"]
         )
@@ -275,6 +302,8 @@ class Transaction:
             entry = resume_entry(self.current())
             if self.state.get("pr"):
                 raise LandStop("land_pr_mismatch", "saved PR disappeared")
+            if not create:
+                return None
             if self.state.get("create_intent") and entry <= self.state.get("create_entry", entry):
                 raise LandStop(
                     "land_interrupted", "create outcome unknown; explicit resume required"
@@ -463,6 +492,12 @@ class Transaction:
 
     def run(self):
         self.initialize()
+        if (
+            not self.state.get("S")
+            and self.state.get("H")
+            and (self.state.get("pr") or self.state.get("create_intent"))
+        ):
+            self.pull_request(create=False)
         if not self.state.get("S") and not self.state.get("merge_intent"):
             self.base_guard()
             self.head()

@@ -518,6 +518,48 @@ def test_landed_predecessor_requires_readiness_and_same_repository(tmp_path, rem
         job_workspace.create(foreign, tmp_path / "successor-worktree", JobConfig(), ENV, jobs)
 
 
+@pytest.mark.parametrize("created", [False, True])
+def test_interrupted_predecessor_worktree_setup_preserves_base_on_retry(
+    tmp_path, remote, monkeypatch, created
+):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote)
+    sha = predecessor.land_state["S"]
+    git(remote.target, "branch", predecessor.branch, "HEAD")
+    jobs.save(replace(predecessor, stage="work"), 2001)
+    successor = code_job(tmp_path, remote.target, receipt_key="successor", base="@predecessor")
+    assert successor.base == predecessor.branch
+    successor = replace(successor, stage="work", attempt=1)
+    jobs.save(successor, 2002)
+    jobs.save(predecessor, 2003)
+    folder = jobs.folder(successor)
+    original = job_workspace.create
+
+    def interrupted(job, path, config, env, jobs=None):
+        saved = jobs.load()[job.id]
+        assert saved.base == sha and saved.workspace_state == "prepared"
+        if created:
+            original(job, path, config, env, jobs)
+        raise RuntimeError("interrupted setup")
+
+    monkeypatch.setattr(job_workspace, "create", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted setup"):
+        job_runner._workspace(successor, folder, JobConfig(), ENV, jobs)
+    saved = jobs.load()[successor.id]
+    assert saved.base == sha
+    # Neither a moving branch nor later predecessor metadata may change the saved base.
+    later = remote.publish("later.txt", "later unrelated result\n")
+    git(remote.target, "fetch", "origin", "main")
+    git(remote.target, "branch", "-f", predecessor.branch, later)
+    jobs.save(replace(predecessor, stage="user_wait"), 2004)
+    monkeypatch.setattr(job_workspace, "create", original)
+    path, changes = job_runner._workspace(saved, folder, JobConfig(), ENV, jobs)
+    assert git(path, "rev-parse", "HEAD") == sha
+    assert jobs.load()[successor.id].base == sha
+    assert changes["workspace_state"] == "active"
+    assert (path / "landed.txt").read_text() == "approved tree\n"
+    assert not (path / "later.txt").exists()
+
+
 def test_nonlanding_receipt_base_keeps_existing_branch_behavior(tmp_path, remote):
     jobs = Jobs(tmp_path / "home")
     predecessor = code_job(tmp_path, remote.target, receipt_key="predecessor")

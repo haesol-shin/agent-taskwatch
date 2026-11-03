@@ -249,7 +249,7 @@ def _stop(jobs: Jobs, job: JobState, reason: str, message: str) -> int:
 def _context(jobs: Jobs, config: JobConfig, job: JobState) -> Ctx:
     folder = jobs.folder(job)
     workspace, described = _workspace(job, folder, config, job_environment(config.env), jobs)
-    ctx = Ctx(jobs, config, replace(job, workspace=str(workspace)), folder, workspace)
+    ctx = Ctx(jobs, config, replace(job, workspace=str(workspace), **described), folder, workspace)
     hashes = _prepare(ctx)
     recorded = job.guideline_hashes
     if recorded is not None and recorded != hashes:
@@ -276,6 +276,11 @@ def _workspace(
     if path.exists() and any(path.iterdir()):
         raise StepError("the job worktree folder exists but is not a worktree")
     try:
+        if jobs is not None:
+            prepared = job_workspace.prepare(job, env, jobs)
+            if not _cas(jobs, job, {job.stage}, lambda current: prepared):
+                raise StaleAttempt
+            job = replace(job, **prepared)
         return path, job_workspace.create(job, path, config, env, jobs=jobs)
     except (job_workspace.WorkspaceError, subprocess.TimeoutExpired) as exc:
         raise StepError(str(exc) or type(exc).__name__) from exc

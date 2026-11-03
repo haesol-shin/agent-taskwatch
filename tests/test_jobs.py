@@ -322,6 +322,69 @@ def test_submit_resolves_receipt_keys_in_predecessors_and_base(tmp_path):
     assert reloaded[second.id].base_predecessor == first.id
 
 
+@pytest.mark.parametrize("stage", ["deliver_pending", "done"])
+def test_receipt_submission_compares_public_text_with_landed_commit_not_retained_branch(
+    tmp_path, stage
+):
+    repo = make_repo(tmp_path)
+    jobs = Jobs(tmp_path / "root")
+    predecessor = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "predecessor",
+            target=str(repo),
+            land=True,
+            public_text=[{"id": "result", "base": "HEAD"}],
+        )
+    )
+    parent = git(repo, "rev-parse", "HEAD")
+    (repo / "out.txt").write_text("approved result\n", encoding="utf-8")
+    git(repo, "commit", "-am", "approved result")
+    reviewed = git(repo, "rev-parse", "HEAD")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    landed = git(repo, "commit-tree", tree, "-p", parent, "-m", "landed result")
+    branch = "taskwatch/predecessor"
+    git(repo, "branch", branch, reviewed)
+    jobs.save(
+        replace(
+            predecessor,
+            stage=stage,
+            branch=branch,
+            land_state={
+                "S": landed,
+                "T": tree,
+                "tree_verified": True,
+                "install": {"status": "disabled"},
+            },
+        ),
+        2000,
+    )
+    successor = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "successor",
+            target=str(repo),
+            base="@predecessor",
+            public_text=[{"id": "result", "base": landed}],
+        )
+    )
+    assert reviewed != landed
+    assert git(repo, "rev-parse", branch) == reviewed
+    assert successor.base == landed
+    assert successor.base_predecessor == predecessor.id
+    assert successor.public_text[0]["base"] == landed
+    with pytest.raises(ValueError, match="effective job base"):
+        jobs.submit(
+            _code_payload(
+                tmp_path,
+                "partial-successor",
+                target=str(repo),
+                base="@predecessor",
+                public_text=[{"id": "result", "base": reviewed}],
+            )
+        )
+
+
 def test_submit_receipt_base_uses_configured_branch_prefix_and_rejects_unknown_tokens(tmp_path):
     root = tmp_path / "root"
     assert main(["--root", str(root), "init"]) == 0

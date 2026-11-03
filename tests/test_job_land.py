@@ -303,6 +303,7 @@ command = args[index] if index < len(args) else ""
 prefix = []
 if command in {"fetch", "push", "ls-remote"}:
     prefix = ["-c", f"url.{bare}.insteadOf=https://github.com/sample/project.git"]
+    prefix += ["-c", f"url.{bare}.insteadOf=review-publish:sample/project.git"]
 trap = Path(__file__).with_name("kill-once")
 when = trap.read_text(encoding="utf-8").strip() if trap.exists() else ""
 if when in (f"before:{command}", f"after:{command}"):
@@ -1462,3 +1463,94 @@ def test_ci_query_finishing_after_deadline_cannot_accept_green_or_spend_a_rerun(
     assert stopped.value.reason == "land_ci_failed"
     assert saved == [] and reruns == []
     assert transaction.state["ci_deadline"] == 110.0
+
+
+@pytest.mark.parametrize("multiple", [False, True])
+def test_foreign_push_urls_stop_before_any_remote_write(make, tmp_path, multiple):
+    lab = make()
+    lab.accept()
+    foreign = tmp_path / "foreign.git"
+    subprocess.run([os.environ["REAL_GIT"], "init", "--bare", str(foreign)], check=True)
+    if multiple:
+        git(lab.repo, "config", "--add", "remote.origin.pushurl", ORIGIN)
+    git(lab.repo, "config", "--add", "remote.origin.pushurl", str(foreign))
+    lab.park("land_head_changed")
+    cleaned_forge(lab)
+    assert git(foreign, "for-each-ref", "--format=%(refname)") == ""
+    assert lab.hook_calls() == []
+
+
+def test_main_fetch_ignores_restricted_remote_tracking_mapping(make):
+    lab = make()
+    lab.accept()
+    base = lab.get().base
+    git(
+        lab.repo,
+        "config",
+        "--replace-all",
+        "remote.origin.fetch",
+        "+refs/heads/other:refs/remotes/origin/other",
+    )
+    moved = lab.advance_remote()
+    assert git(lab.repo, "rev-parse", "origin/main") == base
+    lab.park("land_base_moved")
+    assert git(lab.repo, "rev-parse", "origin/main") == moved
+    cleaned_forge(lab)
+    assert lab.hook_calls() == []
+
+
+def test_saved_pr_merged_during_ci_resumes_verification_without_remerge(make):
+    lab = make()
+    lab.accept()
+    lab.edit(ci=PENDING)
+    lab.park("land_ci_failed")
+    state = lab.land()
+    assert "merge_intent" not in state and state["pr"]["number"] == 17
+    merged = git(
+        lab.bare,
+        "commit-tree",
+        state["T"],
+        "-p",
+        state["M"],
+        "-m",
+        "feat(x): add (#17)\n\nWhy it is needed.",
+    )
+    git(lab.bare, "update-ref", "refs/heads/main", merged, state["M"])
+    pulls = lab.forge()["pulls"]
+    pulls["17"].update(state="closed", merged=True, merge_sha=merged)
+    lab.edit(pulls=pulls)
+    lab.resume()
+    lab.finish()
+    assert lab.land()["S"] == merged and lab.land()["tree_verified"]
+    assert lab.writes() == ["pr create"]
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
+
+
+def test_resolved_push_alias_is_not_rewritten_a_second_time(make, tmp_path):
+    lab = make()
+    lab.accept()
+    foreign = tmp_path / "foreign.git"
+    subprocess.run([os.environ["REAL_GIT"], "init", "--bare", str(foreign)], check=True)
+    git(lab.repo, "config", "remote.origin.pushurl", "review-publish:sample/project.git")
+    git(lab.repo, "config", "url.ssh://git@github.com/.insteadOf", "review-publish:")
+    git(lab.repo, "config", f"url.{foreign}.insteadOf", "ssh://git@github.com/sample/project.git")
+    resolved = git(lab.repo, "remote", "get-url", "--push", "origin")
+    assert resolved == "ssh://git@github.com/sample/project.git"
+    assert git(lab.repo, "ls-remote", "--get-url", resolved) == str(foreign)
+    lab.finish()
+    assert lab.remote_land_branch() == lab.land()["H"]
+    assert git(foreign, "for-each-ref", "--format=%(refname)") == ""
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
+
+
+def test_missing_pr_reconciliation_never_creates_before_rechecking_moved_base(make):
+    lab = make()
+    lab.accept()
+    lab.edit(create_refused=1)
+    lab.park("land_interrupted")
+    assert len(lab.forge()["created"]) == 1 and not lab.forge()["pulls"]
+    lab.advance_remote()
+    lab.resume()
+    lab.park("land_base_moved")
+    assert len(lab.forge()["created"]) == 1 and not lab.forge()["pulls"]
+    assert lab.writes() == ["pr create"] and lab.hook_calls() == []

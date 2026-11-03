@@ -105,14 +105,10 @@ def _base(job: JobState, env: Mapping[str, str]) -> tuple[str, str]:
     return sha, f"base may be stale: {problem}" if problem else ""
 
 
-def _predecessor_base(job: JobState, env: Mapping[str, str], jobs: Jobs | None) -> str | None:
-    if not job.base_predecessor:
-        return None
-    if jobs is None:
-        raise WorkspaceError("predecessor base requires the job store")
-    predecessor = jobs.load().get(job.base_predecessor)
-    if predecessor is None:
-        raise WorkspaceError("base predecessor no longer exists")
+def verified_predecessor_base(
+    target: str, predecessor: JobState, env: Mapping[str, str]
+) -> str | None:
+    """Resolve a landed predecessor only after readiness, tree and install verification."""
     if not predecessor.land:
         return None
     state = predecessor.land_state
@@ -127,12 +123,28 @@ def _predecessor_base(job: JobState, env: Mapping[str, str], jobs: Jobs | None) 
         or re.fullmatch(r"[0-9a-f]{40}", tree) is None
     ):
         raise WorkspaceError("base predecessor has not completed verified landing and install")
-    if repository_key(job.target, env) != repository_key(predecessor.target, env):
+    if repository_key(target, env) != repository_key(predecessor.target, env):
         raise WorkspaceError("base predecessor belongs to a different repository")
-    observed = _git(job.target, env, "rev-parse", "--verify", f"{sha}^{{tree}}")
-    if _resolve(job.target, env, sha) != sha or observed.returncode or observed.stdout != tree:
+    observed = _git(target, env, "rev-parse", "--verify", f"{sha}^{{tree}}")
+    if _resolve(target, env, sha) != sha or observed.returncode or observed.stdout != tree:
         raise WorkspaceError("base predecessor landed commit or tree is unavailable")
     return sha
+
+
+def prepare(job: JobState, env: Mapping[str, str], jobs: Jobs | None = None) -> dict:
+    """Resolve the immutable base before the runner records its worktree creation intent."""
+    if job.workspace_state == "prepared":
+        return {"base": job.base, "base_note": job.base_note, "workspace_state": "prepared"}
+    predecessor = None
+    if job.base_predecessor:
+        if jobs is None:
+            raise WorkspaceError("predecessor base requires the job store")
+        record = jobs.load().get(job.base_predecessor)
+        if record is None:
+            raise WorkspaceError("base predecessor no longer exists")
+        predecessor = verified_predecessor_base(job.target, record, env)
+    sha, note = (predecessor, "") if predecessor else _base(job, env)
+    return {"base": sha, "base_note": note, "workspace_state": "prepared"}
 
 
 def create(
@@ -143,8 +155,8 @@ def create(
     jobs: Jobs | None = None,
 ) -> dict:
     """Add the worktree on a new branch; return the record fields that describe it."""
-    predecessor = _predecessor_base(job, env, jobs)
-    sha, note = (predecessor, "") if predecessor else _base(job, env)
+    prepared = prepare(job, env, jobs)
+    sha, note = prepared["base"], prepared["base_note"]
     branch = f"{config.branch_prefix}{job.id[:8]}"
     proc = _git(job.target, env, "worktree", "add", "-b", branch, os.fspath(path), sha)
     if proc.returncode != 0:
@@ -163,7 +175,7 @@ def adopt(job: JobState, path: Path, env: Mapping[str, str]) -> dict:
 
     A detached worktree is from a record that predates this lifecycle and stays unmanaged.
     """
-    if job.workspace_state:
+    if job.workspace_state and job.workspace_state != "prepared":
         return {}
     proc = _git(path, env, "branch", "--show-current")
     if proc.returncode != 0 or not proc.stdout:
