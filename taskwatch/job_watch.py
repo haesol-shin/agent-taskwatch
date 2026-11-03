@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import choices
+from . import brief, choices, job_findings
 from .brief import count_findings, decision_count
 from .job_cursor import decode, encode
 from .job_store import Store, projection, read_index, read_snapshot, validate_event
@@ -230,6 +230,7 @@ def needs(
     *,
     cursor: int | None = None,
     wait: bool = False,
+    include_done: bool = False,
     timeout: float = 82800,
     interval: float = 30,
     clock: Callable[[], float] = time.monotonic,
@@ -237,14 +238,15 @@ def needs(
 ) -> tuple[int, str]:
     """Return (exit code, list). Read only, no lock: nothing is written.
 
-    Without `cursor` the list is what needs the owner now. With `cursor` it also lists the jobs
-    that finished since it, and with `wait` it blocks until the list holds an item the cursor did
-    not. 0 listed, 3 time limit.
+    Without `cursor` the list is what needs the owner now. With `cursor` it also lists jobs
+    that finished since it. `wait` wakes only for new owner attention, unless `include_done`
+    requests every completion. 0 listed, 3 time limit.
     """
     root = root.resolve()
     ledger = _Ledger(state_dir(root) / "job-changes.jsonl", cursor)
     deadline = clock() + timeout
     attempted = False
+    classified: dict[tuple, tuple[dict, bool]] = {}
     while True:
         if attempted and clock() >= deadline:
             return TIMED_OUT, "needs: nothing new before the watcher's time limit; start a new one"
@@ -254,9 +256,21 @@ def needs(
             continue
         items = _items(ledger.rows)
         old = {i.key for i in _items(ledger.baseline or {})}
-        if stable and (not wait or any(i.key not in old for i in items)):
-            rendered = _render(root, ledger, items, old if cursor is not None else None)
-            if rendered is not None:
+        triggers, evidence = (
+            _wake_items(root, ledger, items, old, classified, include_done)
+            if stable and wait
+            else (set(), {})
+        )
+        if evidence is None:
+            stable = False
+        if stable and (not wait or triggers):
+            ordered = (
+                sorted(items, key=lambda i: (i.key not in triggers, i.section == _SECTIONS[3]))
+                if wait
+                else items
+            )
+            rendered = _render(root, ledger, ordered, old if cursor is not None else None)
+            if rendered is not None and _unchanged(ledger, evidence):
                 return 0, rendered
             stable = False
         if not stable and not ledger.stable():
@@ -270,6 +284,80 @@ def needs(
         if remaining <= 0:
             return TIMED_OUT, "needs: nothing new before the watcher's time limit; start a new one"
         sleep(min(interval, remaining))
+
+
+def _attention(root: Path, row: dict) -> bool:
+    """Only recognized, accepted clean evidence can silence a completion."""
+    job = _state(row)
+    review = job.reviews[-1] if job.reviews else {}
+    try:
+        if (
+            not isinstance(review, Mapping)
+            or not job_findings.accepted(review)
+            or review.get("verdict") != "PASS"
+            or review.get("problems")
+            or review.get("stale")
+            or review.get("blocking")
+            or not (review.get("ok") is True or review.get("final") is True)
+            or not isinstance(review.get("findings"), tuple)
+            or count_findings(review) != "none"
+        ):
+            return True
+        folder = state_dir(root) / "jobs" / job.id
+        workspace = Path(job.workspace)
+        path = folder / "brief.md"
+        commit = None
+        roots = (workspace, folder, Path(job.target))
+        if job.review == "code" and job.review_target is None:
+            commit = (Path(job.target), job.fingerprint)
+            roots = (folder,)
+        if brief.problems(path, roots, commit=commit):
+            return True
+        if decision_count(path.read_text(encoding="utf-8")):
+            return True
+        if choices.is_design(job):
+            return bool(
+                choices.problems(workspace, (workspace, folder, Path(job.target)), job.outputs)
+                or choices.pick_count(workspace)
+            )
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, KeyError):
+        return True
+    return False
+
+
+def _wake_items(
+    root: Path,
+    ledger: _Ledger,
+    items: list[_Item],
+    old: set,
+    cache: dict[tuple, tuple[dict, bool]],
+    include_done: bool,
+) -> tuple[set, dict[str, dict] | None]:
+    candidates = [i for i in items if i.key not in old]
+    triggers = {i.key for i in candidates if include_done or i.section != _SECTIONS[3]}
+    done = [i for i in candidates if not include_done and i.section == _SECTIONS[3]]
+
+    def key(item: _Item) -> tuple:
+        return ledger.index["generation"], item.job_id, ledger.rows[item.job_id]["revision"]
+
+    fresh = [i for i in done if key(i) not in cache]
+    # Cache judgment, not storage validity: even a quiet candidate can become corrupt.
+    rows = _snapshots(ledger, done) if done else {}
+    if rows is None:
+        return set(), None
+    results = {key(i): (rows[i.job_id], _attention(root, rows[i.job_id])) for i in fresh}
+    if not _unchanged(ledger, rows):
+        return set(), None
+    cache.update(results)
+    evidence = {}
+    for item in done:
+        row, attention = cache[key(item)]
+        if rows[item.job_id] != row:
+            raise RecordError(f"job {item.job_id}: snapshot changed without a new revision")
+        evidence[item.job_id] = row
+        if attention:
+            triggers.add(item.key)
+    return triggers, evidence
 
 
 def _state(row: dict) -> JobState:
@@ -387,8 +475,15 @@ def _lines(root: Path, rows: dict[str, dict], item: _Item) -> list[str]:
     verdict = review.get("verdict") or "none"
     return [
         f"job {job.id} {kind} done {verdict}; decisions: {decisions}; "
-        f"open {count_findings(review)}   brief: {cmd} brief {job.id}"
+        f"open {_finding_count(review)}   brief: {cmd} brief {job.id}"
     ]
+
+
+def _finding_count(review: Mapping) -> str:
+    try:
+        return count_findings(review)
+    except (KeyError, TypeError):
+        return "unknown"
 
 
 def _gate_lines(root: Path, rows: dict[str, dict], job: JobState, kind: str, cmd: str) -> list[str]:

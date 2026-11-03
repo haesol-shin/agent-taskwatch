@@ -37,6 +37,9 @@ def parser() -> argparse.ArgumentParser:
         "--from", dest="cursor", type=_seconds(0), help="Cursor from an earlier list"
     )
     needs.add_argument("--wait", action="store_true", help="Block until something new needs you")
+    needs.add_argument(
+        "--include-done", action="store_true", help="With --wait, wake on every new completion"
+    )
     needs.add_argument("--timeout", type=_seconds(1), default=82800, help="Seconds (default 82800)")
     needs.add_argument("--interval", type=_seconds(5), default=30, help="Poll seconds (min 5)")
     brief = commands.add_parser("brief", help="Print the decision brief of a job, composed on read")
@@ -115,11 +118,15 @@ def _needs(args: argparse.Namespace, root: Path) -> int:
     if args.wait and args.cursor is None:
         print("taskwatch: needs --wait needs --from <cursor>", file=sys.stderr)
         return 2
+    if args.include_done and not args.wait:
+        print("taskwatch: needs --include-done needs --wait", file=sys.stderr)
+        return 2
     try:
         code, report = needs(
             root,
             cursor=args.cursor,
             wait=args.wait,
+            include_done=args.include_done,
             timeout=args.timeout,
             interval=args.interval,
         )

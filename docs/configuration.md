@@ -383,26 +383,9 @@ Restore a consistent backup with all processes stopped rather than bypassing
 checksums or receipt checks. Keep copied inputs and execution evidence when
 backing up the job folders, as well as the other state ledgers.
 
-`needs` remains unlocked and read-only: it follows committed projection bytes and
-loads validated current snapshots only for rendered jobs and required gate
-predecessors. It rechecks the event boundary, generation and selected snapshots
-before rendering. A selected newer snapshot without its committed event defers
-the result only when a matching pending marker exists, preserving the incoming
-cursor; a non-wait call explains how to recover with `show` or normal `scan`,
-while a wait keeps polling. A watcher never repairs a crashed writer. Until the
-next normal locked read/scan recovers it, an unpublished transition need not be
-visible. A stable snapshot/event mismatch without a matching pending marker is
-corruption.
+`needs` remains unlocked and read-only: it follows committed version-2 projection bytes, whose format is unchanged, and loads validated, revision-matched current snapshots for rendered jobs, required gate predecessors and new finished candidates classified by the [wake policy](#what-needs-the-owner). Classified snapshots are cached by generation, job id and revision. It rechecks the event boundary, generation and every rendered or classified snapshot before returning. A selected newer snapshot without its committed event defers the result only when a matching pending marker exists, preserving the incoming cursor; a non-wait call explains how to recover with `show` or normal `scan`, while a wait keeps polling. A watcher never repairs a crashed writer. Until the next normal locked read/scan recovers it, an unpublished transition need not be visible. A stable snapshot/event mismatch without a matching pending marker is corruption.
 
-Cursors remain opaque nonnegative integers, now identifying the v2 generation
-and committed byte offset. Retained v2 cursors resume precisely. Legacy byte-only
-and stopgap-generation cursors, future offsets and offsets splitting a committed
-line conservatively replay current actionable and finished jobs with an
-explanation and a new cursor. This is a one-time cutover replay, not a new wake
-policy. First-use `needs` never migrates: legacy or staged files without a marker
-produce error code 1 and an instruction to run `show` or normal `scan` once. A
-genuinely empty root returns no items and cursor 0 without writing; a waiting
-watcher observes the first published generation normally.
+Cursors remain opaque nonnegative integers, now identifying the v2 generation and committed byte offset. Retained v2 cursors resume precisely. Legacy byte-only and stopgap-generation cursors, future offsets and offsets splitting a committed line conservatively replay current actionable and finished jobs with an explanation and a new cursor when a result is returned; waits still apply the [wake policy](#what-needs-the-owner). This is a one-time cutover replay, not a new wake policy. First-use `needs` never migrates: legacy or staged files without a marker produce error code 1 and an instruction to run `show` or normal `scan` once. A genuinely empty root returns no items and cursor 0 without writing; a waiting watcher observes the first published generation normally.
 
 Each job has `state/jobs/<id>/`, a separate workspace, copied inputs, a
 `WORKFLOW.md`, and execution evidence. Code jobs use a git worktree on their own
@@ -584,25 +567,19 @@ The submit rule for a caller that sends ordered units under one approval:
 
 ### What needs the owner
 
-`taskwatch --root <root> needs` lists what waits for the owner and prints an
-opaque integer `cursor`. Pass it unchanged to `--from`; do not calculate it from
-file size. It is read only: no lock, nothing written, derived on every call.
-See [Job records](#job-records) for generation and cutover replay semantics.
-Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and
-their briefs and counts the decisions in their `brief.md`, or the picks of a design predecessor with the reply template `ok | <id>=<key> | text`; otherwise it shows the reason),
-`NEEDS YOU` (a job in `user_wait`: reason, review round, open findings, rules that repeated
-in earlier reviews), `BLOCKED` (a queued job behind a cancelled or `user_wait` predecessor)
-and, only with `--from`, `FINISHED SINCE THE CURSOR` (a job that is `done` now and was not at
-the cursor, with its verdict, decision count and open findings). At most 20 jobs are shown.
+`taskwatch --root <root> needs` lists what waits for the owner and prints an opaque integer `cursor`. Pass it unchanged to `--from`; do not calculate it from file size. It is read only: no lock, nothing written, derived on every call. See [Job records](#job-records) for generation and cutover replay semantics.
 
-`needs --wait --from <cursor> [--timeout <seconds>] [--interval <seconds>]` blocks until the
-list holds an item the cursor did not, then prints the whole list and a new cursor. An item
-is `(job, stage, reason, entry)`, where `entry` counts the job's `wait`, `approve` and
-`resume` events, so a job that is answered and then stops again for the same reason wakes
-the watcher, and a re-save of the same stop does not. A cursor beyond the ledger lists
-everything again. Exit codes: `0` listed, `3` the `--timeout` (default 82800) passed, `2`
-usage error (`--wait` without `--from`), `1` other error such as a corrupt snapshot of a
-listed job. One watcher per room replaces one `watch` per job:
+Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and their briefs and counts the decisions in their `brief.md`, or the picks of a design predecessor with the reply template `ok | <id>=<key> | text`; otherwise it shows the reason), `NEEDS YOU` (a job in `user_wait`: reason, review round, open findings, rules that repeated in earlier reviews), `BLOCKED` (a queued job behind a cancelled or `user_wait` predecessor) and, only with `--from`, `FINISHED SINCE THE CURSOR` (a job that is `done` now and was not at the cursor, with its verdict, decision count and open findings). At most 20 jobs are shown. A non-wait call keeps listing finished jobs regardless of the wake policy.
+
+`needs --wait --from <cursor> [--include-done] [--timeout <seconds>] [--interval <seconds>]` waits for a new `GATE`, `NEEDS YOU` or `BLOCKED` item, or a newly finished job that needs attention. An item is `(job, stage, reason, entry)`, where `entry` counts the job's `wait`, `approve` and `resume` events, so a job that is answered and then stops again for the same reason wakes the watcher, and a re-save of the same stop does not.
+
+A newly finished job stays quiet only when its latest review is a `PASS` accepted by `job_findings.accepted` with at least one of `ok` or `final` equal to `true`, that review has no findings, its brief passes `brief.problems` and has zero decisions, and, for a design job, `choices.json` is valid and has no picks. An absent or unknown verdict, an unaccepted or failed review, any remaining findings, owner decisions or design picks, and missing, unreadable or invalid review, brief or choices content wake conservatively. Job-store corruption is still an error, not a content problem converted into a wake.
+
+For a result-building code job, brief file and line pointers are checked against the accepted result commit, not the current target checkout or a worktree that normal delivery cleanup may remove. Job-folder evidence remains available as a fallback for paths absent from that commit. Missing result commits, invalid pointers and malformed briefs still wake conservatively.
+
+`--include-done` makes every newly finished job a wake trigger and is valid only with `--wait`; `--wait` always requires `--from`. On a wake, the capped list prioritizes new triggering items, then current waiting items, then clean finished jobs, so a clean completion cannot displace the reason for waking. Clean finished jobs may appear alongside a trigger without triggering a wake themselves. If more than 20 items need attention, use `show` to inspect the omitted jobs before re-arming: the returned cursor covers the whole committed boundary, not only the displayed items. Wake filtering does not change [result delivery](#delivery): the configured delivery command still sends every card unchanged, including for quiet completions.
+
+Exit codes: `0` a list and cursor were printed; `3` the `--timeout` (default 82800 seconds) passed without a wake; `2` a usage error, including `--wait` without `--from` or `--include-done` without `--wait`; `1` another error, such as a corrupt snapshot used for rendering or classification. A timeout does not return or advance a cursor: re-arm with the original cursor. After exit `0`, handle the result and re-arm with its returned cursor. Keep only one watcher per room instead of one `watch` per job:
 
 ```python
 terminal(
@@ -612,16 +589,7 @@ terminal(
 )
 ```
 
-The list is a hint; re-read the state with `show` before acting. See
-[Job records](#job-records) for storage, recovery and cursor cutover.
-`taskwatch --root <root> show [<id>]` prints the job record (or list of records)
-with one derived key, `"activity"` (not persisted and not in `needs`): for a job
-in `work`, `fix`, `check` or `review`, `"<stage> <m>m; last progress <m>m ago:
-<last non-empty progress line>"` (from `started_at`, `last_progress_at` and the
-progress file in the job folder, collapsed to at most 120 characters, or without
-the trailing progress text when empty); for all other stages, `null`.
-An example skill for this loop is in
-[`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
+The list is a hint; re-read the state with `show` before acting. See [Job records](#job-records) for storage, recovery and cursor cutover. `taskwatch --root <root> show [<id>]` prints the job record (or list of records) with one derived key, `"activity"` (not persisted and not in `needs`): for a job in `work`, `fix`, `check` or `review`, `"<stage> <m>m; last progress <m>m ago: <last non-empty progress line>"` (from `started_at`, `last_progress_at` and the progress file in the job folder, collapsed to at most 120 characters, or without the trailing progress text when empty); for all other stages, `null`. An example skill for this loop is in [`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
 
 ### Recovery and decisions
 

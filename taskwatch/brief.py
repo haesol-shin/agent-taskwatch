@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from . import choices
+from .fingerprint import git_fingerprint, resolve_commit
 from .job_env import job_environment
 from .jobs import JobConfig, Jobs, JobState
 from .kinds import kind_label
@@ -57,12 +58,21 @@ def problems(
     roots: tuple[Path, ...],
     awaiting: tuple[str, ...] = (),
     listed: tuple[str, ...] = (),
+    *,
+    commit: tuple[Path, str] | None = None,
 ) -> list[str]:
     """Why the brief at `path` fails the contract; empty when it passes.
 
     `awaiting` are pick ids that `Choices made` must mark as awaiting the owner; `listed` are
     ids it must list.
+    `commit` checks result pointers against that immutable Git commit before the local roots.
     """
+    if commit is not None:
+        try:
+            repo, sha = commit
+            resolve_commit(repo, git_fingerprint(sha))
+        except (OSError, ValueError) as exc:
+            return [f"brief.md: result commit cannot be read: {exc}"]
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -81,7 +91,9 @@ def problems(
     issues += _size_problems(found)
     issues += _choice_problems(found.get("Choices made", []), awaiting, listed)
     for rel, first, last in pointers(text):
-        issues += [f"brief.md: {p}" for p in pointer_problem(rel, first, last, roots)]
+        issues += [
+            f"brief.md: {p}" for p in pointer_problem(rel, first, last, roots, commit=commit)
+        ]
     return issues
 
 
