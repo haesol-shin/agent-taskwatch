@@ -50,8 +50,8 @@ The reviewer finds your answer by heading. Headings 1, 2, 3, 4, 6, 7, 9 and 10 m
 
 ## Units
 
-<!-- A table of the units this work splits into, as [Splitting a plan](review/design.md#splitting-a-plan) asks, or `n/a: one unit`. -->
+<!-- A table of internal work units and independent jobs, as [Splitting a plan](review/design.md#splitting-a-plan) asks, or `n/a: one unit`. Each independently reviewable and mergeable pull request is a separate job, not another publication unit inside this job. -->
 
 ## Public text
 
-<!-- `public_text: none`, or the list of pull request units with `id`, `base` and `head`. -->
+<!-- `public_text: none`, or one item with unchanged `id`, `base` and `head` fields covering the complete job result, as [configuration](configuration.md#public-text) defines. Name the mandatory job-folder `title.txt`, `body.md` and body-only squash `commit.txt`; [Checks](checks.md#public-text-evidence) owns their validation, fingerprint, snapshot, copy and historical status. -->

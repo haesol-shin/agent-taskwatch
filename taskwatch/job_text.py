@@ -14,6 +14,7 @@ from pathlib import Path
 from .fingerprint import (
     EVIDENCE_PREFIX,
     basis_fingerprint,
+    head_sha,
     range_messages,
     resolve_commit,
     text_fingerprint,
@@ -39,25 +40,41 @@ class UnitText:
     tree: str
     title: str
     body: str
+    commit: str
     messages: tuple[str, ...]
 
-    def state(self) -> dict[str, str]:
-        fingerprint = text_fingerprint(self.title, self.body, self.messages)
-        return {"base": self.base, "head": self.head, "tree": self.tree, "fingerprint": fingerprint}
+    def state(self) -> dict:
+        fingerprint = text_fingerprint(self.title, self.body, self.messages, self.commit)
+        return {
+            "base": self.base,
+            "head": self.head,
+            "tree": self.tree,
+            "fingerprint": fingerprint,
+            "text_contract": 2,
+        }
 
 
 def collect(
     job: JobState, workspace: Path, folder: Path, env: Mapping[str, str]
 ) -> dict[str, UnitText]:
     """Read every unit once: refs become shas, so one read gives one consistent state."""
+    evidence = [job.texts, *(r.get("texts", {}) for r in (*job.checks, *job.reviews))]
+    if any(s.get("text_contract") != 2 for record in evidence for s in record.values()):
+        raise ValueError("historical public text cannot acquire text_contract=2; submit a new job")
+    if len(job.public_text) > 1:
+        raise ValueError("split independent publication units into jobs")
     units = {}
     for unit in job.public_text:
         base = resolve_commit(workspace, unit["base"], env)
         head = resolve_commit(workspace, unit["head"], env)
+        if base != resolve_commit(workspace, job.base, env) or head != head_sha(workspace, env):
+            raise ValueError("public text must cover the complete job base and result HEAD")
         commits = range_messages(workspace, base, head, env)
-        title, body = (
-            unit_file(folder, unit["id"], name).read_text(encoding="utf-8") for name in UNIT_FILES
+        title, body, commit = (
+            unit_file(folder, unit["id"], name).read_bytes().decode("utf-8") for name in UNIT_FILES
         )
+        if not all(text.strip() for text in (title, body, commit)):
+            raise ValueError("title.txt, body.md and commit.txt must be nonblank")
         units[unit["id"]] = UnitText(
             unit["id"],
             base,
@@ -65,12 +82,13 @@ def collect(
             tree_sha(workspace, head, env),
             title,
             body,
+            commit,
             tuple(message for _sha, message in commits),
         )
     return units
 
 
-def states(units: Mapping[str, UnitText]) -> dict[str, dict[str, str]]:
+def states(units: Mapping[str, UnitText]) -> dict[str, dict]:
     return {unit.id: unit.state() for unit in units.values()}
 
 
@@ -91,6 +109,7 @@ def _files(units: Mapping[str, UnitText]) -> dict[str, str]:
     for unit in units.values():
         files[f"{unit.id}/title.txt"] = unit.title
         files[f"{unit.id}/body.md"] = unit.body
+        files[f"{unit.id}/commit.txt"] = unit.commit
         for number, message in enumerate(unit.messages, start=1):
             files[f"{unit.id}/commits/{number:02d}.txt"] = message.rstrip("\n") + "\n"
     return files
@@ -193,15 +212,30 @@ def reviewed_copy(
     snapshot = Path(record.get("snapshot", ""))
     if not snapshot.is_dir() or snapshot_digest(snapshot) != record.get("snapshot_sha256"):
         return EXIT_CHANGED, ["snapshot changed since the review"]
-    # The work folder may be gone after delivery, so the commit messages come from the
-    # snapshot, whose hash was just checked. Only the title and body are read live.
-    messages = snapshot_messages(snapshot / unit_id)
-    title, body_now = (
-        unit_file(folder, unit_id, name).read_text(encoding="utf-8") for name in UNIT_FILES
-    )
-    if text_fingerprint(title, body_now, messages) != texts[unit_id]["fingerprint"]:
-        return EXIT_CHANGED, ["text changed since review"]
+    # The workspace may be gone; step messages and publication bytes come from the snapshot.
     state = texts[unit_id]
+    contract = state.get("text_contract")
+    if contract not in (None, 2):
+        return EXIT_NOT_REVIEWED, ["unsupported public text contract"]
+    names = UNIT_FILES if contract == 2 else UNIT_FILES[:2]
+    try:
+        live = [
+            (
+                unit_file(folder, unit_id, name).read_bytes().decode("utf-8")
+                if contract == 2
+                else unit_file(folder, unit_id, name).read_text(encoding="utf-8")
+            )
+            for name in names
+        ]
+        messages = snapshot_messages(snapshot / unit_id)
+        commit = live[2] if contract == 2 else None
+        fingerprint = text_fingerprint(live[0], live[1], messages, commit)
+    except (OSError, UnicodeError):
+        return EXIT_CHANGED, ["text missing since review"]
+    if fingerprint != state["fingerprint"]:
+        return EXIT_CHANGED, ["text changed since review"]
+    if contract is None and (out / "commit.txt").exists():
+        raise ValueError("historical copy needs an output folder without commit.txt")
     evidence = (
         f"{EVIDENCE_PREFIX} round {record['round']} PASS, "
         f"code {state['head'][:7]}, text {state['fingerprint'][:8]}"
@@ -209,7 +243,16 @@ def reviewed_copy(
     out.mkdir(parents=True, exist_ok=True)
     title = out / "title.txt"
     body = out / "body.md"
-    title.write_text((snapshot / unit_id / "title.txt").read_text(encoding="utf-8"), "utf-8")
-    reviewed = without_evidence((snapshot / unit_id / "body.md").read_text(encoding="utf-8"))
+    title.write_bytes((snapshot / unit_id / "title.txt").read_bytes())
+    reviewed = without_evidence((snapshot / unit_id / "body.md").read_bytes().decode("utf-8"))
     body.write_text(f"{reviewed}\n\n{evidence}\n", encoding="utf-8")
-    return 0, [str(title), str(body)]
+    lines = [str(title), str(body)]
+    if contract == 2:
+        commit_path = out / "commit.txt"
+        commit_path.write_bytes((snapshot / unit_id / "commit.txt").read_bytes())
+        lines.append(str(commit_path))
+    else:
+        lines.append(
+            "Historical text: title/body only; no reviewed squash body or landing coverage"
+        )
+    return 0, lines

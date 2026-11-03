@@ -28,32 +28,32 @@ Use this file with the common guidelines when the deliverable is a design: a pla
 
 ## Splitting a plan
 
-Use this section when the design carries a table that splits work into units and jobs. Cite a rule by its id and a check by its code (`S1` to `S8`) in the finding. Split by logical change, not by size. The numbers in the first two rules and the S1 row (400 lines, 10 files, 700 lines, 3 units) are provisional and only signals: they tell the reviewer to confirm that the unit or job is still one logical change. They are a judgment from Google's "Small CLs" (about 100 lines is usual, 1000 too large), SmartBear's review study (200 to 400 lines at a time) and ten measured jobs of this project (sanitized owner record, 2026-11-01), which do not separate 400 from 700 lines. Two later cases show why size alone is the wrong test. One job of this project (sanitized owner record, 2026-11-02) built one unit of 454 lines that changed one thing, the result card; splitting off its `language` key would still have left the unit over 400 lines. And the [gajae-code ultragoal skill](https://github.com/Yeachan-Heo/gajae-code/blob/main/packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md) says "File count or line count alone does not force delegation". The first measured plan (9 units, 3110 lines, several changes) is still caught, because it holds more than one logical change. Change a number here only with a new measurement.
+Use this section when the design carries a table that splits work into units and jobs. Cite a rule by its id and a check by its code (`S1` to `S8`) in the finding. Split by logical change, not by size. The size signals below and in S1 prompt closer scrutiny, not an automatic line threshold or an owner decision. Publication boundaries belong to [configuration](../configuration.md#public-text); each independently reviewable and mergeable pull request requires its own job.
 
 **D-10.** A unit is one logical change and its tests. When a unit is over 400 added plus deleted lines or 10 files, confirm that it is still one logical change; when it is, its size alone is no finding and no decision for the owner.
 
-**D-11.** A job is what one review can judge: one unit, or at most 3 units that share a check. When a job is over 3 units or about 700 lines in total, confirm that it is still one logical change, or units that one review can judge together; when it is, its size alone is no finding and no decision for the owner.
+**D-11.** A code job that prepares public text is one complete-result publication unit, not several independently mergeable pull requests sharing a review. When a job is over about 700 added plus deleted lines or contains more than 3 internal work units, confirm that it is still one logical change; when it is, its size alone is no finding and no decision for the owner. Internal work units do not create separate publication ranges.
 
 **D-12.** Bundle units when one cannot be verified without another, when they edit the same file in turn, or when a unit is a one-line change.
 
-**D-13.** Split a plan into jobs when any one of these holds: a limit of the two rules above is exceeded; the acceptance checks of two units are independent; two units share no file and no output.
+**D-13.** Split independently reviewable and mergeable pull requests into independent jobs, including stacked jobs linked by their predecessor and base. Independent acceptance checks or units sharing no file and no output are reasons to examine that split. Exceeding a size signal alone never requires a split.
 
 **D-14.** Parallel lanes are units that are not predecessors of each other, share no file in the table, and have different output or target folders. A list that is merged by hand and not by file content, such as `CHANGELOG.md`, is not a shared file. A `code` job that builds a result runs in its own worktree, so two such jobs may name the same target repository. Every other kind of job holds the target folder and cannot overlap another job on it. That exception lifts only the target-folder test: two worktrees that edit one file still end in a merge conflict, so the shared-file test applies. The lanes of a level are at most the slots minus the running jobs.
 
 **D-15.** Editing the same file is a predecessor relation. A predecessor with no shared file and no content dependency only sequences work to avoid conflicts, and is a finding.
 
-**D-16.** The unit table is reviewed before work starts, in the same design review pass. A plan without a design job gets a split-only review only when it breaks a request into several pull request units.
+**D-16.** Review the unit table before work starts, in the same design review pass, and map every independent pull request to its own job. A plan without a design job gets a split-only review when it breaks a request into several independent pull requests; it must not package them as publication units inside one job.
 
-**D-17.** An estimate counts only with a file or a function as its basis. Double it: in the measured case the estimates were 2.5 times too low (1240 lines estimated, 3110 actual).
+**D-17.** An estimate counts only with a file or a function as its basis. Double it for size scrutiny so uncertainty is visible; the estimate is not an automatic split threshold.
 
 **D-18.** The table has the columns unit, title, real file paths, estimated lines with basis, predecessors with reason, bundling reason and acceptance check. Run `git ls-files` and `grep` on the paths and record the result of each check:
 
 | Check | Fails when |
 |---|---|
-| S1 size | a unit over 400 lines or 10 files (the estimate times 2), or a job over 700 lines or 3 units, holds more than one logical change, or has no written sentence that says why it is one |
+| S1 size | a unit over 400 lines or 10 files (the estimate times 2), or a job over about 700 lines or 3 internal work units, holds more than one logical change, or has no written sentence that says why it is one; size alone never fails |
 | S2 files | two units that are not predecessors of each other share a file outside the merged-by-hand list |
 | S3 predecessor reason | a predecessor has no reason, or units share files and no predecessor |
-| S4 bundle reason | units in one job lack a sentence (not verifiable alone, same files in turn, same acceptance) |
+| S4 bundle reason | internal work units in one job lack a sentence explaining one inseparable result (not verifiable alone, same files in turn, same acceptance), or independently mergeable pull requests are bundled in that job |
 | S5 too small | a one-sentence or one-line unit sits in its own job while an adjacent unit edits the same file |
 | S6 time | a level of width 2 or more exists and the time was not computed: the agent time of the critical path plus the fixed cost of each job on it, against bundling |
 | S7 verification | a unit has no acceptance check written as a command and its expected output |

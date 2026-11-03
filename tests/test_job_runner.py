@@ -285,7 +285,9 @@ def test_worker_file_grants_match_in_work_fix_and_resume(tmp_path, monkeypatch, 
         )
     }
     if public_text:
-        expected |= {env.folder() / "pr/change" / name for name in ("title.txt", "body.md")}
+        expected |= {
+            env.folder() / "pr/change" / name for name in ("title.txt", "body.md", "commit.txt")
+        }
     env.scenario([{"die_after_content": True}, {}, {}])
     assert env.run("work") == 1
     assert env.run("work", session_dir=env.get().session_dir) == 0

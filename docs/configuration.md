@@ -233,18 +233,19 @@ shell; name a shell explicitly only when the approved check needs one.
 The work must create that check script if it is not already in its workspace.
 The checklist follows the existing nonempty `items` list of boolean `passes`.
 
-For jobs with a work contract, generated workflow and work, fix and resume messages
-grant writes outside the workspace only to these exact job-folder files:
-the configured `progress` and `checklist` paths, `brief.md`, `findings.json`,
-`root-cause.md`, and `pr/<id>/title.txt` and `pr/<id>/body.md` for declared
-`public_text` units only. Instructions enumerate the actual job-specific file paths,
-including nested configured record paths, not a writable folder or wildcard.
-Only parent directories needed for these named files may be created; directory
-deletion and writes to other job-folder files are not authorized.
-All these worker-owned files stay outside the workspace and must never be copied
-into the committed result. Findings are written when repairing review findings;
-root-cause evidence is needed for repeated rules. Neither is mandatory for an
-untouched initial result.
+For jobs with a work contract, generated workflow and work, fix and resume messages grant writes outside the workspace only to the configured `progress` and `checklist` paths, `brief.md`, `findings.json`, `root-cause.md`, and the declared public-text files below.
+
+The exact three public-text grants are `pr/<id>/title.txt`, `pr/<id>/body.md` and `pr/<id>/commit.txt` for the declared `public_text` item only.
+
+Instructions enumerate the actual job-specific file paths, including nested configured record paths, not a writable folder or wildcard.
+
+Only parent directories needed for these named files may be created; directory deletion and writes to other job-folder files are not authorized.
+
+All these worker-owned files stay outside the workspace and must never be copied into the committed result.
+
+Findings are written when repairing review findings; root-cause evidence is needed for repeated rules.
+
+Neither is mandatory for an untouched initial result.
 
 The exception does not include the original prompt, copied inputs, `WORKFLOW.md`,
 reviews, snapshots, logs, sessions or global state. Review-only jobs receive no
@@ -276,22 +277,27 @@ flag and allows work to start. A later `wait` records the current step for appro
 The runner's shell tools have the user's permissions; instructions and
 explicit approval records cannot enforce those permissions.
 
-Code jobs that build a result accept an optional `public_text` list for the pull
-requests the job produces. Each unit is `{"id": "pr1", "base": "<ref>", "head": "HEAD"}`;
-`head` defaults to `HEAD`, and `id` is lowercase letters, digits and hyphens. For a
-stacked series the `base` of a unit is the `head` of the one before. A `base` that
-is not another unit's `head` must resolve in `target` at submit, and the record keeps its
-full commit SHA, so moving that ref later changes neither the reviewed range nor the review's
-staleness. A `base` that is another unit's `head` stays as written, including a head that does
-not exist yet such as `HEAD~1`, and resolves in the work folder at every check, like `head`. The worker writes `pr/<id>/title.txt` and
-`pr/<id>/body.md` in the job folder, never in the work folder. The check fails when a
-file is missing, a unit has no commits, or a commit message breaks the common rules:
-title is `type(scope): summary` or `type: summary` and at most 72 characters, one blank
-line follows the title, no line is longer than 72 characters, no trailer line
-(`Co-authored-by:`, `Signed-off-by:` and similar). There is no limit on bullets.
-The review reads the same text, `taskwatch text <job> [--pr <id>] --out <dir>` hands out the
-reviewed title and body, and the delivery message names each unit's folder and text
-fingerprint; see [review records](checks.md#review-records).
+### Public text
+
+Code jobs that build a result accept an optional `public_text` list with at most one publication unit covering the complete job result.
+
+The item shape remains `{"id": "pr1", "base": "<ref>", "head": "HEAD"}`; `head` defaults to `HEAD`, and `id` is lowercase letters, digits and hyphens.
+
+The item's external `base` resolves and is pinned at submission; checks require that commit to equal the job's effective workspace base, and its `head` must resolve to the complete result `HEAD`.
+
+Partial ranges, alternate heads and several publication items are rejected; equivalent refs are accepted by resolved commit identity.
+
+Independent pull requests require independent jobs; stacked jobs use the job-level `base` and `predecessors` described in [Chains and gates](#chains-and-gates), not multiple publication units in one job.
+
+The worker writes `pr/<id>/title.txt` for the pull request title, `pr/<id>/body.md` for its evidence and known limits, and `pr/<id>/commit.txt` for the mandatory squash commit body.
+
+`commit.txt` is body-only, not a complete commit message and not an optional description; the proposed squash subject comes from `title.txt`.
+
+All three files live in the job folder, never in the work folder.
+
+The check rejects missing or blank required texts, an empty commit range, or invalid text and commit message shapes; [Checks](checks.md#public-text-evidence) owns validation, generated fingerprints, read-only snapshots, reviewed copies and historical status.
+
+Preparing or copying reviewed text does not publish, push, merge or authorize landing.
 
 The check command must exit `0`. Required outputs and a nonempty passing
 checklist must also exist after the command finishes. Minimal checklist:

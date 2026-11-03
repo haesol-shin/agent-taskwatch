@@ -107,9 +107,11 @@ def without_evidence(body: str) -> str:
     return "\n".join(lines).rstrip("\n")
 
 
-def text_fingerprint(title: str, body: str, messages: Sequence[str]) -> str:
-    """Hash of a unit's title, body and commit messages. The evidence line is left out."""
+def text_fingerprint(title: str, body: str, messages: Sequence[str], commit: str | None) -> str:
+    """Hash reviewed text and step messages; None reads historical two-file evidence."""
     rows = [title.rstrip("\n"), without_evidence(body), [m.rstrip("\n") for m in messages]]
+    if commit is not None:
+        rows = [2, title, without_evidence(body), [m.rstrip("\n") for m in messages], commit]
     return hashlib.sha256(json.dumps(rows, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 

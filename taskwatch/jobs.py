@@ -123,8 +123,9 @@ class JobState:
     branch: str = ""
     workspace_state: str = ""
     branch_state: str = ""
-    # Code jobs. Pull request units whose commit messages, title and body the runner checks:
-    # [{"id", "base", "head"}]. Their text files live in the job folder under pr/<id>/.
+    # Code jobs. New submissions declare one complete-result publication unit:
+    # [{"id", "base", "head"}]. Historical records may contain multiple units.
+    # Their text files live in the job folder under pr/<id>/.
     public_text: tuple[Mapping, ...] = ()
     # Per unit: the shas of base, head and tree and the text fingerprint the last check saw.
     texts: Mapping[str, Mapping] = field(default_factory=dict)
@@ -283,6 +284,7 @@ class Jobs:
             host = _host_config(self.state.root)
             data.setdefault("max_reviews", host.max_reviews)
             _resolve_receipt_tokens(data, existing, host.branch_prefix)
+            _public_text_base(data)
             data.update(id=uuid.uuid4().hex, last_progress_at=now)
             self._copy_inputs(data)
             job = JobState(**data)
@@ -351,7 +353,7 @@ _OPTIONAL_FIELDS = {
     "max_reviews",
     "public_text",
 }
-UNIT_FILES = ("title.txt", "body.md")
+UNIT_FILES = ("title.txt", "body.md", "commit.txt")
 _UNIT_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 
 # The headings of docs/spec-template.md. A code or design job's spec answers each one, or says
@@ -519,35 +521,41 @@ def _ref(value: object, label: str) -> str:
 
 
 def _public_text_field(data: dict, review_only: bool) -> None:
-    """Normalize the pull request units; a stacked unit's base may be another unit's head."""
+    """Normalize and pin the sole complete-result publication unit."""
     units = data["public_text"]
     if data["review"] != "code" or review_only:
         raise ValueError("public_text applies only to code jobs that build a result")
     if not isinstance(units, list) or not units:
-        raise ValueError("public_text must be a nonempty list of units")
-    normal = []
-    for unit in units:
-        if not isinstance(unit, dict) or unit.keys() - {"id", "base", "head"} or "base" not in unit:
-            raise ValueError("a public_text unit needs id and base, and may have head")
-        if not isinstance(unit.get("id"), str) or _UNIT_ID.fullmatch(unit["id"]) is None:
-            raise ValueError("a public_text id is lowercase letters, digits and hyphens")
-        normal.append(
-            {
-                "id": unit["id"],
-                "base": _ref(unit["base"], "public_text base"),
-                "head": _ref(unit.get("head", "HEAD"), "public_text head"),
-            }
-        )
-    if len({unit["id"] for unit in normal}) != len(normal):
-        raise ValueError("public_text ids must be unique")
-    # A head may name a commit the job has not made yet, so only an external base is resolved
-    # now, and pinned: a later move of that ref must not change the reviewed range. A base that
-    # is another unit's head stays symbolic.
-    heads = {unit["head"] for unit in normal}
-    for unit in normal:
-        if unit["base"] not in heads:
-            unit["base"] = _resolve_commit(Path(data["target"]), unit["base"], "public_text base")
-    data["public_text"] = normal
+        raise ValueError("public_text must be a list containing exactly one unit")
+    if len(units) != 1:
+        raise ValueError("public_text accepts exactly one unit; split publication units into jobs")
+    unit = units[0]
+    if not isinstance(unit, dict) or unit.keys() - {"id", "base", "head"} or "base" not in unit:
+        raise ValueError("a public_text unit needs id and base, and may have head")
+    if not isinstance(unit.get("id"), str) or _UNIT_ID.fullmatch(unit["id"]) is None:
+        raise ValueError("a public_text id is lowercase letters, digits and hyphens")
+    base = _ref(unit["base"], "public_text base")
+    data["public_text"] = [
+        {
+            "id": unit["id"],
+            "base": _resolve_commit(Path(data["target"]), base, "public_text base"),
+            "head": _ref(unit.get("head", "HEAD"), "public_text head"),
+        }
+    ]
+
+
+def _public_text_base(data: dict) -> None:
+    """Reject a known partial range without changing workspace base selection."""
+    if not data.get("public_text") or not data.get("base"):
+        return
+    try:
+        base = _resolve_commit(Path(data["target"]), data["base"], "base")
+    except ValueError:
+        # A predecessor branch may not exist until its job runs. Workspace creation
+        # resolves it, and the text check compares the resulting effective base.
+        return
+    if data["public_text"][0]["base"] != base:
+        raise ValueError("public_text base must equal the effective job base")
 
 
 def _work_fields(data: dict) -> None:
