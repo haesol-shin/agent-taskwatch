@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Fixed
+- `needs --wait --from <cursor>` stays quiet for accepted clean PASS completions and wakes conservatively for attention; `--include-done` restores every-completion wakes only with `--wait`, timeout preserves the original cursor, and capped output prioritizes wake triggers without changing non-wait listings or delivery cards ([wake policy](docs/configuration.md#what-needs-the-owner)).
 - New publication jobs prepare one complete-result pull request unit with mandatory title, pull request body and squash body; generated contract-2 evidence binds all three texts, while historical title/body records remain readable and explicitly nonlandable ([configuration](docs/configuration.md#public-text), [checks](docs/checks.md#public-text-evidence)).
 - Work-building design submissions reject a missing root `choices.json` output before copying inputs or creating a job, preserving receipt replay and review-only submissions (see [design](docs/kinds/design.md)).
 - Reviewer startup failures retain omp's unavailable-tool diagnostic with the agent definition and required tools; RPC records only a bounded, credential-masked current-attempt stderr excerpt, and failed startup stops the peer and reaps descendants, including those in new sessions, before recovery (see [review launch](docs/review-launch.md#unavailable-required-tools)).

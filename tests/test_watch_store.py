@@ -11,6 +11,7 @@ from taskwatch.job_cursor import decode, encode
 from taskwatch.jobs import Jobs, _digest
 from taskwatch.state import RecordError, state_dir
 from tests.test_jobs import payload
+from tests.test_needs import BRIEF, CLEAN_BRIEF, CLEAN_PASS, Ledger, accepted_done
 
 
 def _cursor(text):
@@ -353,3 +354,175 @@ def test_inconsistent_pending_cannot_hide_stable_corruption(
     path.write_text(json.dumps(pending))
     with pytest.raises(RecordError):
         job_watch.needs(root)
+
+
+def test_quiet_completion_classification_is_cached_until_its_revision_changes(
+    tmp_path, monkeypatch
+):
+    ledger = Ledger(tmp_path)
+    ledger.add(stage="work")
+    cursor = ledger.size()
+    ident = accepted_done(ledger)
+    original = job_watch.brief.problems
+    classifications = []
+    observed = []
+
+    def classify(path, *args, **kwargs):
+        classifications.append(path)
+        return original(path, *args, **kwargs)
+
+    def sleep(seconds):
+        observed.append(len(classifications))
+        if len(observed) == 2:
+            ledger.set(ident, error="Updated completion metadata")
+        elif len(observed) == 3:
+            folder = ledger.jobs.folder(ledger.get(ident))
+            (folder / "brief.md").write_text(BRIEF, encoding="utf-8")
+            ledger.set(ident, error="Decision added")
+        elif len(observed) > 3:
+            pytest.fail("revised completion did not wake the watcher")
+
+    monkeypatch.setattr(job_watch.brief, "problems", classify)
+    code, text = ledger.watch(cursor, sleep)
+    assert code == 0 and ident in text and "decisions: 2" in text
+    assert observed == [1, 1, 2]
+    assert len(classifications) == 3
+
+
+def test_snapshot_ahead_of_clean_candidate_defers_classification_until_recovery(
+    tmp_path, monkeypatch
+):
+    ledger = Ledger(tmp_path)
+    ident = ledger.add(stage="work")
+    cursor = ledger.size()
+    folder = ledger.jobs.folder(ledger.get(ident))
+    (folder / "a.py").write_text("value = 1\n", encoding="utf-8")
+    (folder / "brief.md").write_text(CLEAN_BRIEF, encoding="utf-8")
+    ledger.set(ident, stage="done", reviews=(CLEAN_PASS,))
+    sync = job_store._fsync
+
+    def crash(path):
+        if Path(path).name == "state.json":
+            raise OSError("synthetic pending completion")
+        return sync(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(job_store, "_fsync", crash)
+        with pytest.raises(OSError, match="synthetic pending completion"):
+            ledger.set(ident, reviews=({"verdict": "FAIL", "findings": []},))
+    before = _files(ledger.root)
+    now = [0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    code, text = job_watch.needs(
+        ledger.root,
+        cursor=cursor,
+        wait=True,
+        timeout=2,
+        interval=1,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    assert code == job_watch.TIMED_OUT and "cursor:" not in text
+    assert _files(ledger.root) == before
+    assert ledger.jobs.load()[ident].reviews[-1]["verdict"] == "FAIL"
+    code, text = job_watch.needs(ledger.root, cursor=cursor, wait=True)
+    assert code == 0 and ident in text and "done FAIL" in text
+
+
+@pytest.mark.parametrize("kind", ["byte", "old_generation", "future"])
+def test_quiet_replay_classifies_clean_completion_before_waiting_for_gate(tmp_path, kind):
+    ledger = Ledger(tmp_path)
+    done = accepted_done(ledger)
+    position = ledger.size()
+    generation, offset = decode(position)
+    cursor = {
+        "byte": 1,
+        "old_generation": encode("f" * 32 if generation != "f" * 32 else "e" * 32, 0),
+        "future": encode(generation, offset + 100),
+    }[kind]
+    calls = []
+
+    def sleep(seconds):
+        calls.append(seconds)
+        ledger.add(stage="approval_wait", wait_reason="approval_required")
+
+    code, text = ledger.watch(cursor, sleep)
+    assert code == 0 and len(calls) == 1
+    assert "replaying current items" in text and "1 gate" in text and done in text
+    assert decode(_cursor(text))[0] == generation
+
+
+@pytest.mark.parametrize("include_done", [False, True])
+def test_quiet_completion_watch_is_read_only(tmp_path, monkeypatch, include_done):
+    ledger = Ledger(tmp_path)
+    cursor = ledger.size()
+    accepted_done(ledger)
+    before = _files(ledger.root)
+    now = [0]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("watch acquired writer lock")
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr("taskwatch.state.State.lock", forbidden)
+    code, _ = job_watch.needs(
+        ledger.root,
+        cursor=cursor,
+        wait=True,
+        include_done=include_done,
+        timeout=2,
+        interval=1,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    assert code == (0 if include_done else job_watch.TIMED_OUT)
+    assert _files(ledger.root) == before
+
+
+def test_clean_candidate_snapshot_corruption_is_not_attention_fallback(tmp_path):
+    ledger = Ledger(tmp_path)
+    cursor = ledger.size()
+    ident = accepted_done(ledger)
+    path = ledger.jobs.folder(ledger.get(ident)) / "state.json"
+    row = json.loads(path.read_text(encoding="utf-8"))
+    row["job"]["error"] = "synthetic checksum mismatch"
+    path.write_text(json.dumps(row), encoding="utf-8")
+    before = _files(ledger.root)
+    with pytest.raises(RecordError):
+        job_watch.needs(ledger.root, cursor=cursor, wait=True)
+    assert _files(ledger.root) == before
+
+
+@pytest.mark.parametrize("damage", ["missing", "checksum"])
+def test_cached_quiet_completion_does_not_hide_later_storage_corruption(tmp_path, damage):
+    ledger = Ledger(tmp_path)
+    cursor = ledger.size()
+    ident = accepted_done(ledger)
+    path = ledger.jobs.folder(ledger.get(ident)) / "state.json"
+    now = [0]
+
+    def sleep(seconds):
+        now[0] += seconds
+        if now[0] == 1:
+            if damage == "missing":
+                path.unlink()
+            else:
+                row = json.loads(path.read_text(encoding="utf-8"))
+                row["job"]["error"] = "synthetic post-classification corruption"
+                path.write_text(json.dumps(row), encoding="utf-8")
+
+    with pytest.raises(RecordError):
+        job_watch.needs(
+            ledger.root,
+            cursor=cursor,
+            wait=True,
+            timeout=2,
+            interval=1,
+            clock=lambda: now[0],
+            sleep=sleep,
+        )

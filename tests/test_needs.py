@@ -22,7 +22,22 @@ x
 2. Pick C or D
 ## Where to look
 a.py:1
+## Card
+Synthetic result; decisions are listed above.
+- Complete the synthetic result.
 """
+
+CLEAN_BRIEF = BRIEF.replace("1. Pick A or B\n2. Pick C or D", "none")
+CLEAN_PASS = {"verdict": "PASS", "ok": True, "findings": [], "problems": []}
+
+
+def accepted_done(ledger, **changes):
+    ident = ledger.add(stage="done", reviews=(CLEAN_PASS,), **changes)
+    folder = ledger.jobs.folder(ledger.get(ident))
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "a.py").write_text("value = 1\n", encoding="utf-8")
+    (folder / "brief.md").write_text(CLEAN_BRIEF, encoding="utf-8")
+    return ident
 
 
 class Ledger:
@@ -290,3 +305,188 @@ def test_needs_reads_a_job_stored_before_review_reservations(ledger: Ledger) -> 
     path.write_text(json.dumps(obj), encoding="utf-8")
     code, text = ledger.list()
     assert code == 0 and f"job {job_id} research user_wait review_exhausted" in text
+
+
+@pytest.mark.parametrize("marker", ["ok", "final"])
+def test_quiet_wait_passes_clean_accepted_completion_until_a_gate(ledger: Ledger, marker) -> None:
+    cursor = ledger.size()
+    done = accepted_done(ledger)
+    if marker == "final":
+        ledger.set(done, review_target={"files": ("result.txt",)})
+    ledger.set(done, reviews=({"verdict": "PASS", marker: True, "findings": []},))
+    calls = []
+
+    def sleep(seconds):
+        calls.append(seconds)
+        ledger.add(stage="approval_wait", wait_reason="approval_required")
+
+    code, text = ledger.watch(cursor, sleep)
+    assert code == 0 and len(calls) == 1
+    assert "1 gate" in text and done in text
+    assert "FINISHED SINCE THE CURSOR" in text
+
+
+def test_include_done_wakes_for_clean_accepted_completion(ledger: Ledger) -> None:
+    cursor = ledger.size()
+    done = accepted_done(ledger)
+    code, text = ledger.list(cursor=cursor, wait=True, include_done=True)
+    assert code == 0 and done in text and "FINISHED SINCE THE CURSOR" in text
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "review_only_fail",
+        "open_finding",
+        "decision",
+        "design_pick",
+        "missing_verdict",
+        "unreadable_brief",
+        "missing_brief",
+        "malformed_brief",
+        "malformed_evidence",
+        "unaccepted_pass",
+        "rejected_pass",
+    ],
+)
+def test_completion_uncertainty_wakes_quiet_wait(ledger: Ledger, case) -> None:
+    cursor = ledger.size()
+    ident = accepted_done(ledger)
+    folder = ledger.jobs.folder(ledger.get(ident))
+    review = dict(CLEAN_PASS)
+    if case == "review_only_fail":
+        ledger.set(ident, review_target={"files": ("result.txt",)})
+        review = {"verdict": "FAIL", "final": True, "findings": []}
+    elif case == "open_finding":
+        review["findings"] = [{"severity": "P1", "rule": "S-1", "finding": "Open issue"}]
+    elif case == "decision":
+        (folder / "brief.md").write_text(BRIEF, encoding="utf-8")
+    elif case == "design_pick":
+        choices = {
+            "picks": [
+                {
+                    "id": "storage",
+                    "question": "Which store?",
+                    "options": [
+                        {"key": "A", "label": "First", "evidence": "https://a.invalid"},
+                        {"key": "B", "label": "Second", "evidence": "https://b.invalid"},
+                    ],
+                    "recommended": "A",
+                    "why": "Both satisfy the contract.",
+                    "reversible": "cheap",
+                    "affects": "storage",
+                }
+            ],
+            "decided": [],
+            "existing_tools": [
+                {"need": "storage", "searched": ["one", "two", "three"], "found": []}
+            ],
+        }
+        (folder / "choices.json").write_text(json.dumps(choices), encoding="utf-8")
+        ledger.set(ident, review="design", workspace=str(folder), outputs=("choices.json",))
+    elif case == "missing_verdict":
+        review.pop("verdict")
+    elif case == "unreadable_brief":
+        (folder / "brief.md").write_bytes(b"\xff")
+    elif case == "missing_brief":
+        (folder / "brief.md").unlink()
+    elif case == "malformed_brief":
+        (folder / "brief.md").write_text("No required sections.\n", encoding="utf-8")
+    elif case == "malformed_evidence":
+        review["findings"] = "not a findings list"
+    elif case == "unaccepted_pass":
+        review.pop("ok")
+    elif case == "rejected_pass":
+        review["problems"] = ["Synthetic review contract violation"]
+    ledger.set(ident, reviews=(review,))
+    code, text = ledger.list(cursor=cursor, wait=True)
+    assert code == 0 and ident in text and "FINISHED SINCE THE CURSOR" in text
+
+
+def test_latest_accepted_pass_resolves_historical_findings(ledger: Ledger) -> None:
+    cursor = ledger.size()
+    ident = accepted_done(ledger)
+    historical = {
+        "verdict": "FAIL",
+        "findings": [{"severity": "P1", "rule": "S-1", "finding": "Resolved issue"}],
+    }
+    ledger.set(ident, reviews=(historical, CLEAN_PASS))
+    calls = []
+
+    def sleep(seconds):
+        calls.append(seconds)
+        ledger.add(stage="user_wait", wait_reason="approval_required")
+
+    code, text = ledger.watch(cursor, sleep)
+    assert code == 0 and len(calls) == 1
+    assert f"job {ident} research done PASS; decisions: 0; open none" in text
+
+
+def test_quiet_timeout_does_not_consume_clean_completion_cursor(ledger: Ledger) -> None:
+    cursor = ledger.size()
+    done = accepted_done(ledger)
+    now = [0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    code, text = needs(
+        ledger.root,
+        cursor=cursor,
+        wait=True,
+        timeout=2,
+        interval=1,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    assert code == 3 and "cursor:" not in text
+    code, replay = ledger.list(cursor=cursor, wait=True, include_done=True)
+    assert code == 0 and done in replay
+
+
+@pytest.mark.parametrize("flood", ["clean", "old_waits", "both"])
+def test_wait_render_cap_keeps_the_new_trigger_visible(ledger: Ledger, flood) -> None:
+    if flood in {"old_waits", "both"}:
+        for _ in range(22):
+            ledger.add(stage="user_wait", wait_reason="old_stop")
+    cursor = ledger.size()
+    if flood in {"clean", "both"}:
+        for _ in range(22):
+            accepted_done(ledger)
+    trigger = ledger.add(stage="user_wait", wait_reason="new_stop")
+    code, text = ledger.list(cursor=cursor, wait=True)
+    assert code == 0 and f"job {trigger} research user_wait new_stop" in text
+    first = next(line for line in text.splitlines() if line.startswith("job "))
+    assert first.startswith(f"job {trigger} ")
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "malformed"])
+def test_design_completion_requires_valid_choices_without_picks(ledger: Ledger, damage) -> None:
+    cursor = ledger.size()
+    ident = accepted_done(ledger)
+    folder = ledger.jobs.folder(ledger.get(ident))
+    ledger.set(ident, review="design", workspace=str(folder), outputs=("choices.json",))
+    if damage != "missing":
+        content = (
+            "not json"
+            if damage
+            else json.dumps(
+                {
+                    "picks": [],
+                    "decided": [],
+                    "existing_tools": [
+                        {"need": "storage", "searched": ["one", "two", "three"], "found": []}
+                    ],
+                }
+            )
+        )
+        (folder / "choices.json").write_text(content, encoding="utf-8")
+    calls = []
+
+    def sleep(seconds):
+        calls.append(seconds)
+        ledger.add(stage="approval_wait", wait_reason="approval_required")
+
+    code, text = ledger.watch(cursor, sleep)
+    assert code == 0 and ident in text
+    assert len(calls) == (1 if damage is None else 0)
