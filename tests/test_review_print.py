@@ -3,6 +3,7 @@
 import json
 import re
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -201,20 +202,20 @@ def test_findings_of_a_fail_reach_the_fix_session(env):
     assert env.run("review") == 0
     job = env.get()
     record = job.reviews[-1]
-    assert (job.stage, job.fix_rounds) == ("fix", 1)
+    assert (job.stage, job.reviews_used) == ("fix", 1)
     assert [f["finding"] for f in record["findings"]] == ["F1"]
     assert "> Line one." in record["body"]
 
 
-def test_a_malformed_verdict_fails_the_round_with_the_schema_error(env):
+def test_a_malformed_verdict_retries_the_review_with_the_schema_error(env):
     use(env, answer(verdict="MAYBE"))
     env.to_review()
     assert env.run("review") == 0
     job = env.get()
     record = job.reviews[-1]
-    assert (job.stage, job.fix_rounds, record["ok"]) == ("fix", 1, False)
+    assert (job.stage, job.reviews_used, record["ok"]) == ("review", 1, False)
     assert "does not match the schema" in job.error and "$.verdict" in job.error
-    assert "MAYBE" in record["body"]  # the raw reply is kept for the fix session
+    assert "MAYBE" in record["body"]  # the raw reply is kept
 
 
 def test_a_reply_without_any_verdict_fails_the_round(env):
@@ -229,8 +230,57 @@ def test_a_failing_command_is_a_step_failure_with_its_exit_code(env):
     env.to_review()
     assert env.run("review") == 1
     job = env.get()
-    assert (job.stage, job.fix_rounds) == ("review", 0)
+    assert (job.stage, job.reviews_used, job.retry_not_before) == ("review", 1, 0.0)
     assert "exited with code 3: broken" in job.error
+
+
+@pytest.mark.parametrize(
+    "response", ["", '{"error":"rate_limit_error","message":"quota exceeded"}']
+)
+def test_an_explicit_http_429_on_standard_error_waits_for_its_deadline(env, response):
+    shell = (
+        "cat > /dev/null; echo 'HTTP 429 Too Many Requests' >&2;"
+        f" echo 'Retry-After: 120' >&2; echo '{response}' >&2; exit 1"
+    )
+    use(env, "", shell=shell)
+    env.to_review()
+    before = time.time()
+    assert env.run("review") == 1
+    job = env.get()
+    assert (job.stage, job.reviews_used, job.review_inflight, job.recoveries) == ("review", 0, 0, 0)
+    assert before + 120 <= job.retry_not_before <= time.time() + 120
+    assert "HTTP 429 Too Many Requests" in job.error
+
+
+def test_an_explicit_429_without_a_hint_waits_for_the_owner(env):
+    use(env, "", shell="cat > /dev/null; echo 'status 429: slow down' >&2; exit 1")
+    env.to_review()
+    assert env.run("review") == 1
+    job = env.get()
+    assert (job.stage, job.wait_reason, job.reviews_used) == ("user_wait", "rate_limit", 0)
+
+
+@pytest.mark.parametrize(
+    "shell",
+    [
+        "cat > /dev/null; echo 'HTTP 429 retry-after-ms=100000'; exit 1",  # standard output only
+        "cat > /dev/null; echo 'waited 429 seconds, retry-after-ms=100000' >&2; exit 1",
+        "cat > /dev/null; echo 'HTTP 429 Too Many Requests' >&2",  # exits 0: the reply decides
+        "cat > /dev/null; echo 'HTTP 429 Retry-After: 120' >&2;"
+        " echo 'Unhandled API in mapOptionsForApi: web-search' >&2; exit 1",
+        "cat > /dev/null; echo 'HTTP 429 Retry-After: 120' >&2;"
+        ' echo \'{"status":500,"error":"Unhandled API in mapOptionsForApi: web-search"}\' >&2;'
+        " exit 1",
+        "cat > /dev/null; echo 'HTTP 429 Retry-After: 120' >&2;"
+        ' echo \'{"error":{"type":"api_error","message":"unsupported API"}}\' >&2; exit 1',
+    ],
+)
+def test_generic_mentions_of_429_are_not_a_rate_limit(env, shell):
+    use(env, "", shell=shell)
+    env.to_review()
+    env.run("review")
+    job = env.get()
+    assert (job.retry_not_before, job.wait_reason, job.reviews_used) == (0.0, "", 1)
 
 
 def test_a_command_that_never_finishes_is_stopped(env):

@@ -18,6 +18,7 @@ from taskwatch.fingerprint import files_fingerprint, head_sha
 from taskwatch.job_rpc import FrameDecoder, RpcError
 from taskwatch.job_runner import run_job
 from taskwatch.jobs import JobConfig, Jobs, JobState
+from taskwatch.rate_limit import RateLimit
 from tests.git_fixture import make_repo
 from tests.spec_fixture import VALID_SPEC
 
@@ -131,9 +132,13 @@ class Env:
         return self.jobs.load()[self.job.id]
 
     def put(self, stage: str, **changes) -> JobState:
+        """A launch as the scanner makes it: a review reserves one attempt before it starts."""
         self.attempt += 1
         with self.jobs.state.lock():
             job = self.get()
+            if stage == "review":
+                changes.setdefault("reviews_used", job.reviews_used + 1)
+                changes.setdefault("review_inflight", self.attempt)
             job = replace(job, stage=stage, attempt=self.attempt, unit="u", ended_at=0.0, **changes)
             self.jobs.save(job, 2000.0 + self.attempt)
         return job
@@ -477,34 +482,41 @@ def test_review_command_keeps_work_and_fix_on_the_work_command(env, separate_rev
     assert argv == [worker, reviewer if separate_review else worker, worker]
 
 
-def test_review_failure_counts_a_round_and_failed_fix_keeps_it(env):
+def test_a_failed_review_routes_to_fix_and_a_failed_fix_is_not_a_review(env):
     env.scenario([{"reply": f"{FAIL}\nP1: wrong"}, {"die": True}])
     env.to_review()
     assert env.run("review") == 0
     job = env.get()
-    assert (job.stage, job.fix_rounds, job.ended_at > 0) == ("fix", 1, True)
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("fix", 1, 0)
+    assert job.ended_at > 0
     assert not job.reviews[-1]["ok"] and "P1: wrong" in job.reviews[-1]["body"]
     assert env.run("fix") == 1
     job = env.get()
-    assert (job.stage, job.fix_rounds) == ("fix", 1)
+    assert (job.stage, job.reviews_used, job.recoveries) == ("fix", 1, 0)
     assert "P1: wrong" in env.prompts()[-1]
 
 
-def test_review_stops_after_three_fix_rounds(env):
+@pytest.mark.parametrize("cap", [1, 2, 3])
+def test_the_last_permitted_failed_review_starts_no_fix(env, cap):
     env.scenario([{"reply": f"{FAIL}\nstill wrong"}])
     env.to_review()
-    assert env.run("review", fix_rounds=3) == 0
+    assert env.run("review", reviews_used=cap, max_reviews=cap) == 0
     job = env.get()
-    assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")
-    assert job.fix_rounds == 3
+    assert (job.stage, job.wait_reason, job.resume_stage) == (
+        "user_wait",
+        "review_exhausted",
+        "fix",
+    )
+    assert job.reviews_used == cap
+    assert len(env.prompts()) == 1
 
 
-def test_incomplete_review_output_cannot_pass(env):
+def test_incomplete_review_output_cannot_pass_and_retries_the_review_not_a_fix(env):
     env.scenario([{"reply": "looks fine to me"}] * 2)
     env.to_review()
     assert env.run("review") == 0
     job = env.get()
-    assert (job.stage, job.fix_rounds) == ("fix", 1)
+    assert (job.stage, job.resume_stage, job.reviews_used) == ("review", "review", 1)
     assert "exactly one verdict line" in job.error
     assert len(env.prompts()) == 2  # the review prompt and one follow-up, then the round fails
 
@@ -514,7 +526,7 @@ def test_a_malformed_verdict_is_fixed_in_the_same_session(env):
     env.to_review()
     assert env.run("review") == 0
     job = env.get()
-    assert (job.stage, job.fix_rounds, len(job.reviews)) == ("deliver_pending", 0, 1)
+    assert (job.stage, job.reviews_used, len(job.reviews)) == ("deliver_pending", 1, 1)
     assert job.reviews[-1]["ok"] and "No findings." in job.reviews[-1]["body"]
     first, follow_up = env.prompts()
     assert "independent reviewer" in first
@@ -531,12 +543,13 @@ def test_a_reply_without_reviewer_is_accepted_and_the_runner_names_it(env):
     assert len(env.prompts()) == 1
 
 
-def test_result_changed_during_review_rejects_pass(env):
+def test_result_changed_during_review_rejects_pass_and_returns_through_check(env):
     env.scenario([{"writes": {"out.txt": "ok\nchanged\n"}, "reply": PASS}])
     env.to_review()
     assert env.run("review") == 0
     job = env.get()
-    assert job.stage == "fix" and not job.reviews[-1]["ok"]
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("check", 1, 0)
+    assert not job.reviews[-1]["ok"] and job.reviews[-1]["stale"]
     assert "changed during the review" in job.error
 
 
@@ -650,16 +663,26 @@ def test_async_followup_failure_after_prompt_result_fails_the_step(env):
     assert job.stage == "work" and "stopReason error" in job.error
 
 
-def test_failed_check_after_review_spends_a_fix_round(env):
+def test_failed_check_after_review_uses_recoveries_not_reviews(env):
     env.seed({**GOOD_FILES, "out.txt": "bad\n"})
-    assert env.run("check", fix_rounds=1) == 0
+    assert env.run("check", reviews_used=1) == 0
     job = env.get()
-    assert (job.stage, job.fix_rounds, job.recoveries) == ("fix", 2, 0)
-    assert env.run("check", fix_rounds=3) == 0
+    assert (job.stage, job.reviews_used, job.recoveries) == ("fix", 1, 1)
+    assert env.run("check", recoveries=3) == 0
     job = env.get()
-    assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")
-    assert env.run("check", recoveries=3, fix_rounds=0) == 0
-    assert env.get().wait_reason == "check_failed"
+    assert (job.stage, job.wait_reason, job.reviews_used) == ("user_wait", "check_failed", 1)
+
+
+def test_a_passing_check_resets_recoveries_and_leaves_the_review_cycle(env):
+    env.seed(GOOD_FILES)
+    assert env.run("check", reviews_used=2, review_cycle_start=0, recoveries=2) == 0
+    job = env.get()
+    assert (job.stage, job.recoveries, job.reviews_used, job.review_cycle_start) == (
+        "review",
+        0,
+        2,
+        0,
+    )
 
 
 def test_whole_review_text_survives_chunked_frames(env):
@@ -768,7 +791,10 @@ def test_design_messages_name_defaults_file_and_short_hash(tmp_path, monkeypatch
 
 # --- the launch selects the model ------------------------------------------------------------
 
-QUOTA = {"status": "failed", "error": {"message": "429 usage limit reached"}}
+QUOTA = {
+    "status": "failed",
+    "error": {"message": "429 usage limit reached retry-after-ms=1000"},
+}
 
 
 def set_roles(env, **roles: str) -> None:
@@ -945,3 +971,119 @@ def test_a_failed_model_binding_stops_before_any_prompt_and_keeps_the_transcript
         e for e in events if e in {"step_exit", "session_open"}
     ]
     assert job.ended_at == 0
+
+
+# --- terminal 429 ---------------------------------------------------------------------------
+
+
+def limited(message: str) -> dict:
+    return {"status": "error", "error": {"message": message}}
+
+
+def test_a_429_with_a_deadline_keeps_the_saved_stage_and_spends_nothing(env):
+    env.scenario([limited('429 {"type":"rate_limit_error"} retry-after-ms=60000')])
+    before = time.time()
+    assert env.run("work") == 1
+    job = env.get()
+    assert (job.stage, job.wait_reason, job.recoveries, job.reviews_used) == ("work", "", 0, 0)
+    assert before + 60 <= job.retry_not_before <= time.time() + 60
+    assert job.ended_at > 0 and "retry-after-ms=60000" in job.error
+    event = next(e for e in job.events if e["type"] == "rate_limited")
+    assert (event["stage"], event["retry_not_before"]) == ("work", job.retry_not_before)
+
+
+def test_a_429_without_a_hint_waits_for_the_owner_and_spends_nothing(env):
+    env.scenario([limited("429 usage limit reached")])
+    assert env.run("work", recoveries=2) == 1
+    job = env.get()
+    assert (job.stage, job.wait_reason, job.resume_stage) == ("user_wait", "rate_limit", "work")
+    assert (job.recoveries, job.retry_not_before) == (2, 0.0)
+    assert "usage limit reached" in job.error
+
+
+def test_a_429_in_a_fix_spends_neither_a_recovery_nor_a_review(env):
+    env.scenario([{"reply": f"{FAIL}\nP1: wrong"}, limited("429 retry-after-ms=1000")])
+    env.to_review()
+    assert env.run("review") == 0 and env.get().stage == "fix"
+    assert env.run("fix") == 1
+    job = env.get()
+    assert (job.stage, job.recoveries, job.reviews_used) == ("fix", 0, 1)
+    assert job.retry_not_before > 0
+
+
+@pytest.mark.parametrize("hint", ["retry-after-ms=1000", "no hint"])
+def test_a_429_in_a_review_refunds_only_its_own_reservation(env, hint):
+    env.scenario([limited(f"429 {hint}"), {"reply": f"{PASS}\nNo findings."}])
+    env.to_review()
+    assert env.run("review", reviews_used=2, max_reviews=3) == 1  # earlier attempt: 1 spent
+    job = env.get()
+    assert (job.reviews_used, job.review_inflight, job.reviews) == (1, 0, ())
+    assert job.stage == ("review" if "ms" in hint else "user_wait")
+    assert job.recoveries == 0
+    assert env.run("review") == 0  # the due retry reserves again and completes
+    job = env.get()
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("deliver_pending", 2, 0)
+
+
+def test_a_stale_attempt_cannot_refund_or_park_a_newer_attempt(env):
+    env.to_review()
+    old = env.put("review")
+    env.put("review")  # the scanner relaunched: a newer attempt holds the reservation
+    assert job_runner._rate_limited(env.jobs, old, "429", RateLimit(None)) == 2
+    job = env.get()
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("review", 2, env.attempt)
+
+
+def test_an_accepted_verdict_is_never_refunded(env):
+    env.scenario([{"reply": f"{FAIL}\nP1: wrong"}])
+    env.to_review()
+    old = env.put("review")
+    assert run_job(env.jobs, env.config, env.job.id, env.attempt) == 0
+    assert job_runner._rate_limited(env.jobs, old, "429", RateLimit(None)) == 2
+    job = env.get()
+    assert (job.stage, job.reviews_used, len(job.reviews)) == ("fix", 1, 1)
+
+
+@pytest.mark.parametrize("outcome", ["malformed", "rate_limit", "failure"])
+def test_a_completed_attempt_cannot_call_again_or_accept_late_output(env, outcome):
+    turns = (
+        [{"reply": "not a verdict"}, {"reply": "still not a verdict"}]
+        if outcome == "malformed"
+        else [limited("429 retry-after-ms=60000" if outcome == "rate_limit" else "unsupported API")]
+    )
+    env.scenario([*turns, {"reply": PASS}])
+    env.to_review()
+    old = env.put("review")
+    assert run_job(env.jobs, env.config, env.job.id, env.attempt) == (
+        0 if outcome == "malformed" else 1
+    )
+    completed = env.get()
+    prompts = len(env.prompts())
+    assert completed.stage == "review" and completed.review_inflight == 0
+    assert run_job(env.jobs, env.config, env.job.id, env.attempt) == 2
+    assert job_runner._rate_limited(env.jobs, old, "429", RateLimit(None)) == 2
+    assert env.get() == completed
+    assert len(env.prompts()) == prompts
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Unhandled API in mapOptionsForApi: web-search", "upstream said 429 once, retry-after-ms=999"],
+)
+def test_other_terminal_failures_stay_ordinary(env, message):
+    env.scenario([limited(message)])
+    assert env.run("work") == 1
+    job = env.get()
+    assert (job.stage, job.retry_not_before, job.ended_at) == ("work", 0.0, 0.0)
+    assert message in job.error
+    assert [e["type"] for e in job.events if e["type"] in {"step_failed", "rate_limited"}] == [
+        "step_failed"
+    ]
+
+
+def test_a_reply_that_only_mentions_429_is_not_a_rate_limit(env):
+    env.scenario([{"reply": f"{PASS}\nThe client retries after a 429, retry-after-ms=5"}])
+    env.to_review()
+    assert env.run("review") == 0
+    job = env.get()
+    assert (job.stage, job.retry_not_before) == ("deliver_pending", 0.0)

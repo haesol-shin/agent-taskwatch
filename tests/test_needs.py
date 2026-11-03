@@ -8,7 +8,7 @@ import pytest
 
 from taskwatch.job_cli import main
 from taskwatch.job_watch import needs
-from taskwatch.jobs import Jobs
+from taskwatch.jobs import Jobs, _digest
 from tests.test_jobs import payload
 
 BRIEF = """## Why
@@ -247,3 +247,46 @@ def test_a_gate_after_a_design_with_picks_shows_the_reply_template(ledger: Ledge
     root = ledger.root.resolve()
     approve = f"taskwatch --root {root} approve {gate} --reason <your words>"
     assert f"  decisions: 2 picks   reply: ok | <id>=<key> | text   then: {approve}" in text
+
+
+def test_a_known_rate_limit_wait_is_not_a_human_need_but_a_parked_deadline_is_shown(
+    ledger: Ledger,
+) -> None:
+    cooling = ledger.add(stage="review", retry_not_before=5000.0, ended_at=1.0)
+    exhausted = ledger.add(
+        stage="user_wait", wait_reason="review_exhausted", retry_not_before=5000.0
+    )
+    code, text = ledger.list()
+    assert code == 0
+    assert text.splitlines()[0] == "needs: 1 need you, 0 gate, 0 blocked"
+    assert cooling not in text
+    assert f"job {exhausted} research user_wait review_exhausted" in text
+    assert "  retry not before: 1970-01-01T01:23:20Z (resume does not skip it)" in text
+    plain = ledger.add(stage="user_wait", wait_reason="rate_limit")
+    assert "retry not before" not in "\n".join(
+        line for line in ledger.list()[1].splitlines() if plain in line
+    )
+
+
+def test_a_finite_deadline_outside_the_calendar_range_is_still_shown(ledger: Ledger) -> None:
+    identifier = ledger.add(stage="user_wait", wait_reason="approval", retry_not_before=1e20)
+    code, text = ledger.list()
+    assert code == 0 and identifier in text
+    assert "retry not before: epoch 1e+20 seconds (resume does not skip it)" in text
+
+
+def test_needs_reads_a_job_stored_before_review_reservations(ledger: Ledger) -> None:
+    job_id = ledger.add(stage="user_wait", wait_reason="review_exhausted")
+    path = ledger.jobs.folder(ledger.get(job_id)) / "state.json"
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    old = {
+        k: v
+        for k, v in obj["job"].items()
+        if k not in {"max_reviews", "reviews_used", "review_cycle_start", "review_inflight"}
+        and k != "retry_not_before"
+    }
+    old["fix_rounds"] = 3
+    obj["job"], obj["sha256"] = old, _digest({"revision": obj["revision"], "job": old})
+    path.write_text(json.dumps(obj), encoding="utf-8")
+    code, text = ledger.list()
+    assert code == 0 and f"job {job_id} research user_wait review_exhausted" in text

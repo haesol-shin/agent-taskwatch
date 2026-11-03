@@ -12,7 +12,7 @@ from taskwatch import job_delivery, job_runner
 from taskwatch.job_cli import main as cli_main
 from taskwatch.job_runner import run_job
 from taskwatch.job_scan import scan_jobs
-from taskwatch.jobs import MAX_FIX_ROUNDS, JobConfig, Jobs, JobState
+from taskwatch.jobs import JobConfig, Jobs, JobState
 from tests.test_job_runner import FAIL, FAKE, GIT, PASS
 from tests.test_job_scan import FakeService
 
@@ -62,9 +62,15 @@ class Review:
         return self.jobs.load()[self.job.id]
 
     def run(self, stage: str = "review", **changes) -> int:
+        """A launch as the scanner makes it: a review reserves one attempt before it starts."""
         self.attempt += 1
         with self.jobs.state.lock():
-            job = replace(self.get(), stage=stage, attempt=self.attempt, unit="u", **changes)
+            current = self.get()
+            changes.setdefault("ended_at", 0.0)
+            if stage == "review":
+                changes.setdefault("reviews_used", current.reviews_used + 1)
+                changes.setdefault("review_inflight", self.attempt)
+            job = replace(current, stage=stage, attempt=self.attempt, unit="u", **changes)
             self.jobs.save(job, 2000.0 + self.attempt)
         return run_job(self.jobs, self.config, self.job.id, self.attempt)
 
@@ -143,29 +149,37 @@ def test_fail_is_the_result_of_a_review_only_job_not_a_reason_to_fix(review):
     review.scenario([{"reply": f"{FAIL}\nP1: wrong"}])
     assert review.run() == 0
     job = review.get()
-    assert (job.stage, job.fix_rounds) == ("deliver_pending", 0)
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("deliver_pending", 1, 0)
     record = job.reviews[-1]
     assert (record["verdict"], record["ok"], record["final"]) == ("FAIL", False, True)
     assert "P1: wrong" in record["body"]
 
 
-def test_an_answer_without_a_verdict_costs_a_round_and_reviews_again(review):
+def test_an_answer_without_a_verdict_uses_one_attempt_and_reviews_again(review):
     review.scenario([{"reply": "looks fine"}, {"reply": "still fine"}, {"reply": PASS}])
     assert review.run() == 0
     job = review.get()
-    assert (job.stage, job.fix_rounds, job.reviews[-1]["final"]) == ("review", 1, False)
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("review", 1, 0)
+    assert job.reviews[-1]["final"] is False
     assert "exactly one verdict line" in job.error
     assert review.run("review", ended_at=0.0) == 0
     job = review.get()
     assert (job.stage, [r["round"] for r in job.reviews]) == ("deliver_pending", [1, 2])
+    assert job.reviews_used == 2
     assert "round 2" in review.prompts()[-1] and "not accepted" in review.prompts()[-1]
 
 
-def test_rounds_are_capped_like_other_jobs(review):
-    review.scenario([{"reply": "no verdict"}] * 2)
-    assert review.run("review", fix_rounds=MAX_FIX_ROUNDS) == 0
-    job = review.get()
-    assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")
+@pytest.mark.parametrize("cap", [1, 2, 3])
+def test_invalid_answers_are_capped_by_max_reviews_and_never_start_a_fix(review, cap):
+    review.jobs.save(replace(review.get(), max_reviews=cap), 1500.0)
+    review.scenario([{"reply": "no verdict"}] * 2 * cap)
+    for used in range(1, cap + 1):
+        assert review.run("review") == 0
+        job = review.get()
+        assert job.reviews_used == used
+        assert job.stage == ("review" if used < cap else "user_wait")
+    assert (job.wait_reason, job.resume_stage) == ("review_exhausted", "review")
+    assert len(review.prompts()) == 2 * cap  # each attempt is a prompt and one repair follow-up
 
 
 def test_a_target_that_changed_during_the_review_is_not_accepted(review):

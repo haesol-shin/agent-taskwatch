@@ -291,3 +291,99 @@ def test_submit_receipt_base_uses_configured_branch_prefix_and_rejects_unknown_t
         jobs.submit(_code_payload(tmp_path, "msg-1:bad2", base="@msg-1:missing"), 40)
     with pytest.raises(ValueError, match="not a code job"):
         jobs.submit(_code_payload(tmp_path, "msg-1:bad3", base="@msg-1:src"), 40)
+
+
+# --- max_reviews and the review cycle -------------------------------------------------------
+
+
+def host_config(root: Path, **extra) -> Path:
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    data = {**json.loads(path.read_text(encoding="utf-8")), **extra}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_init_writes_the_default_and_the_loader_reads_it(tmp_path):
+    root = tmp_path / "root"
+    path = host_config(root)
+    assert json.loads(path.read_text(encoding="utf-8"))["max_reviews"] == 3
+    assert load_job_config(root).max_reviews == 3
+
+
+def test_max_reviews_is_per_job_over_host_over_built_in_and_frozen_at_submit(tmp_path):
+    root = tmp_path / "root"
+    jobs = Jobs(root)
+    assert jobs.submit(payload(tmp_path, "a"), 1).max_reviews == 3  # before any host config
+    path = host_config(root, max_reviews=2)
+    assert jobs.submit(payload(tmp_path, "b"), 2).max_reviews == 2
+    assert jobs.submit({**payload(tmp_path, "c"), "max_reviews": 1}, 3).max_reviews == 1
+    path.write_text(
+        json.dumps({**json.loads(path.read_text(encoding="utf-8")), "max_reviews": 3}),
+        encoding="utf-8",
+    )
+    stored = {job.receipt_key: job.max_reviews for job in Jobs(root).load().values()}
+    assert stored == {"a": 3, "b": 2, "c": 1}  # a later host change leaves a stored job alone
+
+
+BAD_COUNTS = [True, None, "2", 2.0, 0, 4, -1, [2]]
+
+
+@pytest.mark.parametrize("value", BAD_COUNTS)
+def test_an_invalid_per_job_max_reviews_is_refused_before_anything_is_stored(tmp_path, value):
+    jobs = Jobs(tmp_path / "root")
+    with pytest.raises(ValueError, match="max_reviews"):
+        jobs.submit({**payload(tmp_path), "max_reviews": value}, 1)
+    assert jobs.load() == {}
+    assert not any((jobs.state.dir / "jobs").glob("*"))
+
+
+@pytest.mark.parametrize("value", BAD_COUNTS)
+def test_an_invalid_host_max_reviews_is_a_config_error_and_blocks_submission(tmp_path, value):
+    root = tmp_path / "root"
+    host_config(root, max_reviews=value)
+    with pytest.raises(ValueError, match="max_reviews"):
+        load_job_config(root)
+    with pytest.raises(ValueError, match="max_reviews"):
+        Jobs(root).submit(payload(tmp_path), 1)
+    assert Jobs(root).load() == {}
+
+
+def parked(tmp_path, **changes):
+    jobs = Jobs(tmp_path / "root")
+    job = jobs.submit(payload(tmp_path), 10)
+    job = replace(job, **changes)
+    jobs.save(job, 11)
+    return jobs, job
+
+
+def test_resume_opens_a_fresh_cycle_and_keeps_every_record(tmp_path):
+    history = ({"round": 1, "seq": 1, "ok": False}, {"round": 2, "seq": 2, "ok": False})
+    jobs, job = parked(
+        tmp_path,
+        stage="user_wait",
+        wait_reason="review_exhausted",
+        resume_stage="fix",
+        reviews=history,
+        reviews_used=3,
+        recoveries=2,
+        review_inflight=4,
+        retry_not_before=99.0,
+    )
+    assert main(["--root", str(jobs.state.root), "resume", job.id, "--reason", "again"]) == 0
+    current = jobs.load()[job.id]
+    assert (current.stage, current.resume_stage, current.recoveries) == ("queued", "fix", 0)
+    assert (current.reviews_used, current.review_cycle_start, current.review_inflight) == (0, 2, 0)
+    assert current.reviews == history and current.events[-1]["type"] == "resume"
+    assert current.retry_not_before == 99.0  # a resume never skips a rate-limit deadline
+
+
+def test_approval_waits_keep_the_review_cycle(tmp_path):
+    jobs, job = parked(
+        tmp_path, stage="review", reviews_used=2, review_cycle_start=1, reviews=({"round": 1},) * 2
+    )
+    root = str(jobs.state.root)
+    assert main(["--root", root, "wait", job.id, "--reason", "needs a gate"]) == 0
+    assert main(["--root", root, "approve", job.id, "--reason", "ok"]) == 0
+    current = jobs.load()[job.id]
+    assert (current.stage, current.reviews_used, current.review_cycle_start) == ("queued", 2, 1)

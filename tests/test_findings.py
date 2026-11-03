@@ -9,8 +9,10 @@ import pytest
 
 from taskwatch import job_findings, job_runner
 from taskwatch.executor import _finding_lines
+from taskwatch.job_cli import main as cli_main
 from taskwatch.job_findings import notes, repeated_rules, sync_index
 from tests.git_fixture import git
+from tests.test_job_runner import GOOD_FILES, Env
 from tests.test_public_text import UnitEnv
 from tests.verdicts import CODE_FAIL as FAIL
 from tests.verdicts import CODE_PASS as PASS
@@ -154,28 +156,158 @@ def test_a_fix_round_needs_an_entry_for_every_finding(unit_env):
     assert unit_env.problems() == ["findings.json has no entry for r1.F2"]
 
 
+def head(env: UnitEnv) -> str:
+    return git(env.tree, "rev-parse", "HEAD")
+
+
+def more_commit(env: UnitEnv, name: str = "more.txt") -> str:
+    (env.tree / name).write_text("m\n", encoding="utf-8")
+    git(env.tree, "add", name)
+    git(env.tree, "commit", "-m", "fix(x): more\n\nWhy.")
+    return head(env)
+
+
+def fixed(commit=None, ident="r1.F1", **extra) -> dict:
+    entry = {"id": ident, "status": "fixed", **extra}
+    return {**entry, "commit": commit} if commit is not None else entry
+
+
 def test_fixed_needs_a_change_since_the_review(unit_env):
     failed_review(unit_env, line("F1"))
-    write_entries(unit_env, [{"id": "r1.F1", "status": "fixed"}])
+    write_entries(unit_env, [fixed(head(unit_env))])
     problems = unit_env.problems()
     assert len(problems) == 1 and "neither the code nor the public text changed" in problems[0]
 
 
-def test_fixed_passes_when_only_the_body_was_edited(unit_env):
+def test_a_code_fix_names_a_later_commit_that_head_contains(unit_env):
     failed_review(unit_env, line("F1"))
-    unit_env.write_text("body.md", "a corrected body\n")
-    write_entries(unit_env, [{"id": "r1.F1", "status": "fixed"}])
-    assert unit_env.problems() == []
+    first = more_commit(unit_env)
+    second = more_commit(unit_env, "again.txt")
+    for commit in (first, second):  # the fix may be any commit between the review and HEAD
+        write_entries(unit_env, [fixed(commit)])
+        assert unit_env.problems() == []
     assert unit_env.get().stage == "review"
 
 
-def test_fixed_passes_when_the_code_changed(unit_env):
+def side_commit(env: UnitEnv) -> str:
+    """A commit that follows the reviewed head but that HEAD does not contain."""
+    git(env.tree, "checkout", "-q", "-b", "side")
+    side = more_commit(env, "side.txt")
+    git(env.tree, "checkout", "-q", "-")
+    return side
+
+
+@pytest.mark.parametrize(
+    ("kind", "fragment"),
+    [
+        ("missing", "needs `commit`"),
+        ("text", "needs `commit`"),
+        ("short", "needs `commit`"),
+        ("unresolved", "is not a commit of the work folder"),
+        ("reviewed", "is not a later commit than the reviewed"),
+        ("base", "is not a later commit than the reviewed"),
+        ("unreachable", "is not a later commit than the reviewed"),
+    ],
+)
+def test_a_code_fix_without_verifiable_commit_evidence_is_rejected(unit_env, kind, fragment):
     failed_review(unit_env, line("F1"))
-    (unit_env.tree / "more.txt").write_text("m\n", encoding="utf-8")
-    git(unit_env.tree, "add", "more.txt")
-    git(unit_env.tree, "commit", "-m", "fix(x): more\n\nWhy.")
-    write_entries(unit_env, [{"id": "r1.F1", "status": "fixed", "commit": "unchecked"}])
+    reviewed = head(unit_env)
+    side = side_commit(unit_env)
+    more_commit(unit_env)
+    commit = {
+        "missing": None,
+        "text": "unchecked",
+        "short": reviewed[:12],
+        "unresolved": "0" * 40,
+        "reviewed": reviewed,  # a pre-review commit
+        "base": git(unit_env.tree, "rev-parse", f"{reviewed}~1"),
+        "unreachable": side,
+    }[kind]
+    write_entries(unit_env, [fixed(commit)])
+    problems = unit_env.problems()
+    assert len(problems) == 1 and fragment in problems[0], problems
+
+
+def test_a_text_only_fix_names_the_current_head_and_a_changed_text(unit_env):
+    failed_review(unit_env, line("F1"))
+    reviewed = head(unit_env)
+    unit_env.write_text("body.md", "a corrected body\n")
+    for commit, ok in ((None, False), ("0" * 40, False), (reviewed, True)):
+        write_entries(unit_env, [fixed(commit)])
+        problems = unit_env.problems()
+        assert (problems == []) is ok, problems
+    assert unit_env.get().stage == "review"
+
+
+def test_a_text_only_fix_cannot_borrow_an_older_commit(unit_env):
+    failed_review(unit_env, line("F1"))
+    unit_env.write_text("body.md", "a corrected body\n")
+    write_entries(unit_env, [fixed(git(unit_env.tree, "rev-parse", "HEAD~1"))])
+    assert any("public text only names the current HEAD" in p for p in unit_env.problems())
+
+
+def test_a_legacy_review_without_a_reviewed_head_cannot_prove_a_code_fix(unit_env):
+    failed_review(unit_env, line("F1"))
+    job = unit_env.get()
+    legacy = {k: v for k, v in job.reviews[-1].items() if k not in {"reviewed_head", "texts"}}
+    unit_env.jobs.save(replace(job, reviews=(*job.reviews[:-1], legacy)), 3000.0)
+    write_entries(unit_env, [fixed(more_commit(unit_env))])
+    assert any("recorded no reviewed head" in p for p in unit_env.problems())
+
+
+def test_a_legacy_review_can_anchor_on_its_recorded_unit_head(unit_env):
+    failed_review(unit_env, line("F1"))
+    job = unit_env.get()
+    legacy = {k: v for k, v in job.reviews[-1].items() if k != "reviewed_head"}
+    unit_env.jobs.save(replace(job, reviews=(*job.reviews[:-1], legacy)), 3000.0)
+    write_entries(unit_env, [fixed(more_commit(unit_env))])
     assert unit_env.problems() == []
+
+
+def test_a_new_code_review_records_the_head_it_judged(unit_env):
+    failed_review(unit_env, line("F1"))
+    assert unit_env.get().reviews[-1]["reviewed_head"] == head(unit_env)
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        ("{not json", "is not valid JSON"),
+        ('{"id": "r1.F1"}', "must be a JSON list"),
+        ('["r1.F1"]', "entry 1 needs an id"),
+        ('[{"status": "not_fixed", "reason": "x"}]', "entry 1 needs an id"),
+        ('[{"id": "F1", "status": "not_fixed", "reason": "x"}]', "entry 1 needs an id"),
+        (
+            '[{"id": "r1.F1", "status": "not_fixed", "reason": "x"},'
+            ' {"id": "r1.F1", "status": "not_fixed", "reason": "y"}]',
+            "more than one entry for r1.F1",
+        ),
+        ('[{"id": "r1.F1", "status": "done"}]', "needs status fixed or not_fixed"),
+        ('[{"id": "r1.F1"}]', "needs status fixed or not_fixed"),
+        ("[]", "has no entry for r1.F1"),
+    ],
+)
+def test_a_malformed_findings_record_is_rejected(unit_env, text, fragment):
+    failed_review(unit_env, line("F1"))
+    (unit_env.folder() / "findings.json").write_text(text, encoding="utf-8")
+    assert any(fragment in p for p in unit_env.problems())
+
+
+def test_a_non_code_result_needs_a_changed_result_and_no_commit(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.scenario([{"reply": "\n".join([FAIL, body(line("F1"))])}])
+    env.to_review()
+    assert env.run("review") == 0
+    entries = [{"id": "r1.F1", "status": "fixed"}]
+    (env.folder() / "findings.json").write_text(json.dumps(entries), encoding="utf-8")
+    assert env.run("check") == 0
+    assert any(
+        "neither the code nor the public text changed" in p
+        for p in env.get().checks[-1]["problems"]
+    )
+    env.seed({**GOOD_FILES, "out.txt": "ok\n\n"})  # the check still passes; the result changed
+    assert env.run("check") == 0
+    assert not env.get().checks[-1]["problems"]
 
 
 @pytest.mark.parametrize("entry", [{"status": "not_fixed"}, {"status": "not_fixed", "reason": " "}])
@@ -195,34 +327,87 @@ def test_a_not_fixed_reason_reaches_the_next_reviewer(unit_env):
     assert "r1.F1 (P1) not_fixed: premise is false" in prompt
 
 
-def test_permission_aware_worker_repairs_findings_and_repeated_rule(unit_env):
+@pytest.mark.parametrize("malformed", ["no verdict", f"{PASS}\n{body(line('F2'))}"])
+def test_a_malformed_retry_keeps_the_last_substantive_findings_and_reasons(unit_env, malformed):
+    failed_review(unit_env, line("F1", "P1", location="retained.py:12"))
+    write_entries(unit_env, [{"id": "r1.F1", "status": "not_fixed", "reason": "premise is false"}])
+    assert unit_env.problems() == []
+    unit_env.scenario([{"reply": malformed}] * 2 + [{"reply": PASS}])
+    assert unit_env.run("review") == 0
+    assert unit_env.get().stage == "review"
+    job_findings.sync_index(unit_env.jobs.state, unit_env.get(), unit_env.folder(), 3000.0)
+    assert all(
+        row["finding"] != "r2.F2" for row in unit_env.jobs.state.read_records(job_findings.INDEX)
+    )
+    assert unit_env.problems() == []
+    assert unit_env.run("review") == 0
+    prompt = unit_env.prompts()[-1]
+    assert "r1.F1 (P1) not_fixed: premise is false" in prompt
+    assert "retained.py:12" in prompt
+
+
+def test_an_unknown_status_in_retained_history_is_rejected(unit_env):
+    failed_review(unit_env, line("F1"))
+    write_entries(
+        unit_env,
+        [
+            {"id": "r0.F1", "status": "done"},
+            {"id": "r1.F1", "status": "not_fixed", "reason": "premise is false"},
+        ],
+    )
+    assert any("r0.F1 needs status fixed or not_fixed" in p for p in unit_env.problems())
+
+
+def test_a_fixed_finding_reaches_the_next_reviewer_with_its_verified_commit(unit_env):
+    failed_review(unit_env, line("F1", "P1"))
+    commit = more_commit(unit_env)
+    write_entries(unit_env, [fixed(commit)])
+    assert unit_env.problems() == []
+    unit_env.scenario([{"reply": PASS}])
+    assert unit_env.run("review") == 0
+    assert f"r1.F1 (P1) fixed {commit[:12]}" in unit_env.prompts()[-1]
+
+
+def test_findings_of_the_last_failed_review_are_checked_across_a_resume(unit_env):
+    failed_review(unit_env, line("F1"))
+    write_entries(unit_env, [])
+    with unit_env.jobs.state.lock():
+        job = unit_env.get()
+        unit_env.jobs.save(replace(job, review_cycle_start=len(job.reviews)), 3000.0)
+    assert unit_env.problems() == ["findings.json has no entry for r1.F1"]
+
+
+def test_permission_aware_worker_records_findings_and_the_root_cause_note(unit_env):
     env = unit_env
     failed_review(env, line("F1", rule="K-7"))
     folder = env.folder()
-    for round_no in (1, 2):
-        entries = json.dumps([{"id": f"r{round_no}.F1", "status": "fixed"}])
-        writes = {
-            str(folder / "findings.json"): entries,
-            str(folder / "pr/pr/title.txt"): "fix(x): correct evidence\n",
-            str(folder / "pr/pr/body.md"): f"Corrected evidence, round {round_no}.\n",
-        }
-        if round_no == 2:
-            writes[str(folder / "root-cause.md")] = NOTE
-        env.scenario([{"writes": writes, "require_write_grants": True}])
-        assert env.run("fix") == 0
-        assert env.get().stage == "check"
-        assert env.problems() == []
-        assert env.get().stage == "review"
-        assert not env.get().wait_reason
-        if round_no == 1:
-            env.scenario([{"reply": "\n".join([FAIL, body(line("F1", rule="K-7"))])}])
-            assert env.run("review") == 0
-            assert env.get().stage == "fix"
+    # Round 1: findings.json, title and body are written through the named grants only.
+    first = {
+        str(folder / "findings.json"): json.dumps([fixed(head(env))]),
+        str(folder / "pr/pr/title.txt"): "fix(x): correct evidence\n",
+        str(folder / "pr/pr/body.md"): "Corrected evidence, round 1.\n",
+    }
+    env.scenario([{"writes": first, "require_write_grants": True}])
+    assert env.run("fix") == 0
+    assert env.problems() == []
+    env.scenario([{"reply": "\n".join([FAIL, body(line("F1", rule="K-7"))])}])
+    assert env.run("review") == 0
+    job = env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "root_cause_required")
+    # The owner resumes after the analysis; the next fix writes its record and note by grant.
+    (folder / "root-cause.md").write_text(NOTE, encoding="utf-8")
+    assert cli_main(["--root", str(env.jobs.state.root), "resume", job.id, "--reason", "ok"]) == 0
+    second = {
+        str(folder / "findings.json"): json.dumps([fixed(head(env), "r2.F1")]),
+        str(folder / "pr/pr/body.md"): "Corrected evidence, round 2.\n",
+        str(folder / "root-cause.md"): NOTE + "\nMore: checked.\n",
+    }
+    env.scenario([{"writes": second, "require_write_grants": True}])
+    assert env.run("fix") == 0
+    assert env.problems() == []
     assert env.get().checks[-1]["noted"] == {"K-7": "a spec heading"}
     assert git(env.tree, "status", "--porcelain") == ""
-    assert git(env.tree, "diff", "--name-only", env.get().base, "HEAD") == "out.txt"
-    assert (folder / "findings.json").is_file()
-    assert (folder / "root-cause.md").read_text() == NOTE
+    assert (folder / "root-cause.md").read_text().startswith(NOTE)
     assert not (env.tree / "pr").exists()
 
 
@@ -296,22 +481,151 @@ def test_an_accepted_prevention_names_none(tmp_path):
     assert job_findings.named_preventions(tmp_path, ["K-7"]) == {}
 
 
+def reply(*rules: str) -> dict:
+    lines = [line(f"F{n}", rule=rule) for n, rule in enumerate(rules, 1)]
+    return {"reply": "\n".join([FAIL, body(*lines)])}
+
+
+def next_round(env: UnitEnv, rules: tuple[str, ...], answered: int) -> None:
+    """Answer the last review's findings with a verified commit, then run the next failing
+    review."""
+    commit = more_commit(env, f"round{answered}.txt")
+    last = job_findings.last_failed(env.get().reviews)
+    write_entries(env, [fixed(commit, job_findings.finding_id(last, f)) for f in last["findings"]])
+    assert env.problems() == []
+    env.scenario([reply(*rules)])
+    assert env.run("review") == 0
+
+
+def test_the_same_rule_in_two_consecutive_rounds_stops_for_a_root_cause(unit_env):
+    failed_review(unit_env, line("F1", rule="K-7"))
+    commit = more_commit(unit_env)
+    write_entries(unit_env, [fixed(commit)])
+    assert unit_env.problems() == []
+    (unit_env.folder() / "root-cause.md").write_text(NOTE, encoding="utf-8")  # an older note
+    unit_env.scenario([reply("K-7")])
+    prompts = len(unit_env.prompts())
+    assert unit_env.run("review") == 0
+    job = unit_env.get()
+    assert (job.stage, job.wait_reason, job.resume_stage) == (
+        "user_wait",
+        "root_cause_required",
+        "fix",
+    )
+    assert "K-7" in job.error and "rounds 1 and 2" in job.error
+    stop = [e for e in job.events if e.get("reason") == "root_cause_required"][-1]
+    assert (stop["rules"], stop["rounds"], stop["exhausted"]) == (("K-7",), (1, 2), False)
+    assert stop["note_digest"] == job_findings.note_digest(unit_env.folder())
+    assert len(unit_env.prompts()) == prompts + 1  # nothing ran after the stop
+
+
+def resume(env: UnitEnv) -> int:
+    argv = ["--root", str(env.jobs.state.root), "resume", env.get().id, "--reason", "analysed"]
+    return cli_main(argv)
+
+
+def test_a_resume_after_the_stop_needs_a_changed_complete_note(unit_env, capsys):
+    failed_review(unit_env, line("F1", rule="K-7"))
+    (unit_env.folder() / "root-cause.md").write_text(NOTE, encoding="utf-8")
+    next_round(unit_env, ("K-7",), 1)
+    assert unit_env.get().wait_reason == "root_cause_required"
+    assert resume(unit_env) == 1  # the note that existed before the stop is not enough
+    assert "has not changed since the stop" in capsys.readouterr().err
+    note = unit_env.folder() / "root-cause.md"
+    note.write_text(NOTE.replace("Prevention: a spec heading\n", "") + "\n", encoding="utf-8")
+    assert resume(unit_env) == 1
+    assert "needs a `Prevention:` line" in capsys.readouterr().err
+    note.write_text(NOTE.replace("rushed", "rushed again in round 2"), encoding="utf-8")
+    assert resume(unit_env) == 0
+    job = unit_env.get()
+    assert (job.stage, job.resume_stage, job.reviews_used) == ("queued", "fix", 0)
+    assert job.review_cycle_start == len(job.reviews) == 2
+
+
+@pytest.mark.parametrize(
+    "rounds",
+    [
+        [("K-7",), ("K-8",)],
+        [("other",), ("other",)],
+        [("K-7",), ("K-8",), ("K-7",)],
+        [("K-7", "K-8"), ("K-9",)],
+    ],
+    ids=["different", "other", "not consecutive", "no shared rule"],
+)
+def test_only_a_rule_shared_by_consecutive_rounds_stops(unit_env, rounds):
+    failed_review(unit_env, *[line(f"F{n}", rule=r) for n, r in enumerate(rounds[0], 1)])
+    for answered, rules in enumerate(rounds[1:], 1):
+        next_round(unit_env, rules, answered)
+        job = unit_env.get()
+        last = answered == len(rounds) - 1 and len(rounds) == 3  # the cycle's last permitted review
+        expected = ("user_wait", "review_exhausted") if last else ("fix", "")
+        assert (job.stage, job.wait_reason) == expected, job.error
+
+
+def test_a_malformed_round_does_not_erase_the_preceding_substantive_round(unit_env):
+    failed_review(unit_env, line("F1", rule="K-7"))
+    commit = more_commit(unit_env)
+    write_entries(unit_env, [fixed(commit)])
+    assert unit_env.problems() == []
+    unit_env.scenario([{"reply": "no verdict"}] * 2 + [reply("K-7")])
+    assert unit_env.run("review") == 0
+    job = unit_env.get()
+    assert (job.stage, job.reviews_used, job.reviews[-1]["findings"]) == ("review", 2, ())
+    assert unit_env.run("review") == 0
+    job = unit_env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "root_cause_required")
+    assert [r["round"] for r in job.reviews] == [1, 2, 3]
+    assert [e for e in job.events if e.get("reason") == "root_cause_required"][-1]["rounds"] == (
+        1,
+        3,
+    )
+
+
+def test_a_repeat_in_a_new_cycle_does_not_trigger_the_consecutive_stop(unit_env):
+    unit_env.jobs.save(replace(unit_env.get(), max_reviews=1), 1500.0)
+    failed_review(unit_env, line("F1", rule="K-7"))
+    assert unit_env.get().wait_reason == "review_exhausted"
+    assert resume(unit_env) == 0
+    next_round(unit_env, ("K-7",), 1)
+    job = unit_env.get()
+    # The new cycle holds one review, so the repeat is not consecutive; it still exhausts it.
+    assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")
+
+
+def test_root_cause_takes_precedence_over_an_exhausted_cycle(unit_env):
+    unit_env.jobs.save(replace(unit_env.get(), max_reviews=2), 1500.0)
+    failed_review(unit_env, line("F1", rule="K-7"))
+    next_round(unit_env, ("K-7",), 1)
+    job = unit_env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "root_cause_required")
+    assert "review limit is also reached" in job.error
+    assert [e for e in job.events if e.get("reason") == "root_cause_required"][-1]["exhausted"]
+
+
+def test_a_repeat_that_is_not_consecutive_still_needs_the_note(unit_env):
+    failed_review(unit_env, line("F1", rule="K-7"))
+    next_round(unit_env, ("K-8",), 1)
+    next_round(unit_env, ("K-7",), 2)  # K-8 came between: not the consecutive stop
+    job = unit_env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")
+    assert resume(unit_env) == 0
+    write_entries(unit_env, [fixed(more_commit(unit_env, "round3.txt"), "r3.F1")])
+    assert any("root-cause.md needs a section `## K-7`" in p for p in unit_env.problems())
+
+
 def test_a_repeat_after_a_named_prevention_is_told_to_the_reviewer(unit_env):
-    """Round 1 and 2 break K-7 and the note names a prevention; round 3 breaks it again."""
+    """Round 1 and 2 break K-7 and stop; after the analysis round 3 breaks it again."""
     (unit_env.folder() / "root-cause.md").write_text(NOTE, encoding="utf-8")
     failed_review(unit_env, line("F1", rule="K-7"))
-    write_entries(unit_env, [{"id": "r1.F1", "status": "not_fixed", "reason": "r"}])
-    assert unit_env.problems() == []  # no earlier K-7: no note needed, `noted` is empty
-    assert unit_env.get().checks[-1].get("recurred") == {}
-    unit_env.scenario([{"reply": "\n".join([FAIL, body(line("F1", rule="K-7"))])}])
-    assert unit_env.run("review") == 0
-    write_entries(unit_env, [{"id": "r2.F1", "status": "not_fixed", "reason": "r"}])
-    assert unit_env.problems() == []  # repeated in round 2: the note is complete
+    next_round(unit_env, ("K-7",), 1)
+    assert unit_env.get().wait_reason == "root_cause_required"
+    (unit_env.folder() / "root-cause.md").write_text(NOTE + "\nMore: round 2.\n", encoding="utf-8")
+    assert resume(unit_env) == 0
+    next_round(unit_env, ("K-7",), 2)
     check = unit_env.get().checks[-1]
     assert check["noted"] == {"K-7": "a spec heading"} and check["recurred"] == {}
-    unit_env.scenario([{"reply": "\n".join([FAIL, body(line("F1", rule="K-7"))])}])
-    assert unit_env.run("review") == 0
-    write_entries(unit_env, [{"id": "r3.F1", "status": "not_fixed", "reason": "r"}])
+    commit = more_commit(unit_env, "round3.txt")
+    write_entries(unit_env, [fixed(commit, "r3.F1")])
     assert unit_env.problems() == []
     assert unit_env.get().checks[-1]["recurred"] == {"K-7": "a spec heading"}
     unit_env.scenario([{"reply": PASS}])
@@ -319,16 +633,6 @@ def test_a_repeat_after_a_named_prevention_is_told_to_the_reviewer(unit_env):
     prompt = unit_env.prompts()[-1]
     assert "repeated after a note named this prevention: a spec heading" in prompt
     assert "Root-cause note for K-7" in prompt
-
-
-def test_a_repeat_without_a_note_goes_back_to_the_fix_round(unit_env):
-    failed_review(unit_env, line("F1", rule="K-7"))
-    write_entries(unit_env, [{"id": "r1.F1", "status": "not_fixed", "reason": "r"}])
-    assert unit_env.problems() == []
-    unit_env.scenario([{"reply": "\n".join([FAIL, body(line("F1", rule="K-7"))])}])
-    assert unit_env.run("review") == 0
-    write_entries(unit_env, [{"id": "r2.F1", "status": "not_fixed", "reason": "r"}])
-    assert any("root-cause.md needs a section `## K-7`" in p for p in unit_env.problems())
 
 
 # --- the index -----------------------------------------------------------------------------

@@ -57,6 +57,23 @@ def resolve_commit(repo: Path, ref: str, env: Mapping[str, str] | None = None) -
     return git_fingerprint(out.decode("utf-8").strip())
 
 
+def is_ancestor(
+    repo: Path, ancestor: str, descendant: str, env: Mapping[str, str] | None = None
+) -> bool:
+    """Whether `ancestor` is `descendant` or reachable from it; a FingerprintError on any other
+    git failure, so an unreadable repository is never read as an answer."""
+    proc = subprocess.run(
+        _git_cmd(repo, ["merge-base", "--is-ancestor", ancestor, descendant]),
+        check=False,
+        capture_output=True,
+        env=env,
+    )
+    if proc.returncode not in {0, 1}:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or "git merge-base failed"
+        raise FingerprintError(detail)
+    return proc.returncode == 0
+
+
 def range_messages(
     repo: Path, base: str, head: str, env: Mapping[str, str] | None = None
 ) -> list[tuple[str, str]]:

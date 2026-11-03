@@ -18,15 +18,14 @@ directories are suitable only for synthetic tests.
   "stall_seconds": 1800,
   "omp_command": ["omp"],
   "rpc_timeout": 3600,
-  "deliver_command": ["false", "{message}"]
+  "deliver_command": ["false", "{message}"],
+  "max_reviews": 3
 }
 ```
 
-All keys shown above are required. The three numeric settings are positive integer counts
-or seconds. `omp_command` is an argument list prefix. Checks use the submission's
-`check_command`, not this model command. `deliver_command` is described in
-[Delivery](#delivery). The draft value
-`["false", "{message}"]` is intentionally disabled: it can never send, so edit it before use.
+All keys shown above except `max_reviews` are required. The three numeric settings are positive integer counts or seconds. `omp_command` is an argument list prefix. Checks use the submission's `check_command`, not this model command. `deliver_command` is described in [Delivery](#delivery). The draft value `["false", "{message}"]` is intentionally disabled: it can never send, so edit it before use.
+
+`max_reviews` limits the reviews of one cycle; see [Review limit](#review-limit).
 
 Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run
 independent reviews with a different command prefix. Like `omp_command`, it must
@@ -46,7 +45,7 @@ reads the agent definition and those guidelines when the review starts:
 
 ### Model selection
 
-Each RPC process that taskwatch launches (work, fix, and a review in the default `rpc` mode) chooses its model from its own command, and taskwatch binds the job conversation to that model. After the protocol handshake it reads the launched model from `get_state` (`model.provider`, `model.id`), then opens the conversation with `open_session` carrying `sessionDir` and that `provider` and `modelId`, and sends the prompt only after the open succeeded and `get_state` shows the same model. The saved model of a resumed conversation therefore never answers a prompt; the conversation file, its earlier messages and its directory stay as they were. A resume after a usage-limit failure follows the same rule as any other new process, and the existing recovery and resume policy still decides when one is launched.
+Each RPC process that taskwatch launches (work, fix, and a review in the default `rpc` mode) chooses its model from its own command, and taskwatch binds the job conversation to that model. After the protocol handshake it reads the launched model from `get_state` (`model.provider`, `model.id`), then opens the conversation with `open_session` carrying `sessionDir` and that `provider` and `modelId`, and sends the prompt only after the open succeeded and `get_state` shows the same model. The saved model of a resumed conversation therefore never answers a prompt; the conversation file, its earlier messages and its directory stay as they were. A retry after a usage-limit failure follows the same rule as any other new process; [Rate limits](#rate-limits) say when it is launched.
 
 taskwatch does not read omp's configuration or route between providers. A command that selects a role gets omp's current role order at every launch:
 
@@ -65,7 +64,7 @@ Set `"review_mode": "print"` to review with a tool that is not omp (Codex, Claud
 
 In print mode the command runs once per review, in the job's folder, with the review message on its standard input. Besides `{guidelines}` and `{review}`, an argument that is exactly `{schema}` becomes the path of the verdict JSON Schema file (a copy of [`docs/launch/review-verdict.schema.json`](launch/review-verdict.schema.json) in the job folder) and exactly `{output}` the path of a file where the tool may write its last message. The reply must be one JSON object that follows the schema; [`docs/launch/taskwatch-print.md`](launch/taskwatch-print.md) is the text the reviewer reads. The schema has the keys the verdict line and the finding lines have in an RPC review, so the same rules decide what is accepted.
 
-taskwatch looks for the verdict in the `{output}` file first, then in the standard output. In each it accepts the object itself (plain, or in a code fence), the object inside a wrapper (`structured_output` or `result` of `claude -p --output-format json`, `response` of `gemini -p --output-format json`), or the last line of a JSON-lines stream that holds it. It validates the object against the schema and fails the round with the schema path of the first errors (`$.findings[0].severity: 'P9' is not one of ...`) when it does not match; the raw reply is kept as the review text. There is no session, so there is no same-session repair: a malformed reply costs a round. A command that exits with a nonzero code or runs longer than `rpc_timeout` seconds fails the step with that reason.
+taskwatch looks for the verdict in the `{output}` file first, then in the standard output. In each it accepts the object itself (plain, or in a code fence), the object inside a wrapper (`structured_output` or `result` of `claude -p --output-format json`, `response` of `gemini -p --output-format json`), or the last line of a JSON-lines stream that holds it. It validates the object against the schema and fails the round with the schema path of the first errors (`$.findings[0].severity: 'P9' is not one of ...`) when it does not match; the raw reply is kept as the review text. There is no session, so there is no same-session repair: a malformed reply uses its review attempt and the review runs again. A command that exits with a nonzero code or runs longer than `rpc_timeout` seconds fails the step with that reason, unless its standard error holds an explicit HTTP 429 diagnostic, which is a [rate limit](#rate-limits).
 
 taskwatch cannot restrict the tools of the other command; see [the limits](review-launch.md#print-mode-limits). Give each tool its read-only flags, as below. These examples were written on 2026-11-02 from the tools' own help or official pages; only `codex` is installed on the host that wrote them, so the `claude` and `gemini` lines are not run here.
 
@@ -117,6 +116,16 @@ Optionally add `"language"`, `"en"` or `"ko"`, to choose the language of the car
 ```json
 "language": "ko"
 ```
+
+### Review limit
+
+Optionally add `"max_reviews"`, an integer from 1 to 3, to set how many reviews one cycle may run. The first review counts, so `1` reviews once and stops for the owner when it fails, and `3`, the default, allows the first review and two more. A submission may carry its own `max_reviews` with the same range. The per-job value wins over the host value, and the host value wins over the built-in default. The result is frozen into the job when it is submitted, so a later change of the host setting does not change a job that exists. A boolean, `null`, a string, a fractional number or a value outside 1 to 3 is rejected, and a submission that carries one is refused before anything is stored. The `init` draft writes the default.
+
+```json
+"max_reviews": 2
+```
+
+A review is counted when it is reserved, before it starts, and never after it returns. [Recovery and decisions](#recovery-and-decisions) lists what the count includes and how a resume, an older record and a rate limit treat it.
 
 ### Job environment
 
@@ -243,14 +252,9 @@ worker-owned file exception. Preparing declared public text grants no authority
 to publish it. Any action outside the recorded scope and named file exceptions
 still requires the existing wait-before-action approval procedure.
 
-`inputs`, `predecessors`, `expected_wait_seconds`, and `approval_required` are
-optional. Every other example field is required. Each entry of `predecessors` is
-an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored
-record keeps the resolved job ids. Derive the receipt key from the approval
-message and its job number. A repeated key returns the original job even if other
-arguments differ.
-The command records the caller's approval assertion; it cannot authenticate
-the conversation.
+`inputs`, `predecessors`, `expected_wait_seconds`, `approval_required`, and `max_reviews` are optional. Every other example field is required. Each entry of `predecessors` is an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored record keeps the resolved job ids. Derive the receipt key from the approval message and its job number. A repeated key returns the original job even if other arguments differ. The command records the caller's approval assertion; it cannot authenticate the conversation.
+
+`max_reviews` is the review limit of this job. When it is absent the job takes the host setting; see [Review limit](#review-limit).
 
 A job with `predecessors` gets one block per predecessor in the work and review
 messages: its id, kind label (`research` for `review: source`, `design`,
@@ -421,13 +425,9 @@ the review step, in the target directory itself.
 
 `review_target` is exactly one of `{"files": ["relative/path"]}` (files under `target`) or
 `{"commit": "<revision>"}` (resolved to a full SHA when the job is submitted). `inputs`,
-`predecessors`, `expected_wait_seconds`, and `approval_required` work as for other jobs.
+`predecessors`, `expected_wait_seconds`, `approval_required`, and `max_reviews` work as for other jobs.
 
-The verdict is the result. A parsed `PASS` or `FAIL` is recorded and delivered; a `FAIL` does
-not start a fix, because there is nothing to fix. An answer with no acceptable verdict line, or a
-target that changed during the review, costs a round and reviews again. The cap is the one other jobs have: the first review plus three
-retries, four reviews in all; after that the job stops for user judgment (`review_exhausted`). The review record and
-job state are in `show <id>`.
+The verdict is the result. A parsed `PASS` or `FAIL` is recorded and delivered; a `FAIL` does not start a fix, because there is nothing to fix. An answer with no acceptable verdict line, or a target that changed during the review, uses its review attempt and reviews again, up to `max_reviews` attempts in all; after that the job stops for user judgment (`review_exhausted`). The review record and job state are in `show <id>`.
 
 ### Timer entry point
 
@@ -636,11 +636,17 @@ relaunch. It parks the job as `user_wait` with `wait_reason: disk_full` and
 `error: disk_full: <path> has <n> bytes free, the floor is <bytes>`, and uses no recovery. Free
 space, then `resume` the job.
 
-Three consecutive failed recoveries stop for user judgment. Passing checks
-reset that recovery budget. The independent review has a separate per-cycle
-cap of three automatic fix rounds. A fresh review uses `docs/review/` profiles
-and the existing verdict JSON contract. Fingerprints and review basis are
-computed by code; changing either invalidates the earlier pass.
+Three consecutive failed recoveries stop for user judgment. A passing check resets that recovery budget and nothing else. A work, fix or check failure uses only this budget and never a review.
+
+The independent review has its own budget: at most `max_reviews` attempts per cycle, the first included. The scanner reserves each attempt in the locked write that launches the review, so a crash, a reboot, a stall, a lost start or a stale answer cannot hide one: every launched review uses one, whether it ended with a verdict, a malformed answer, an interrupted run or a result that went stale. The one same-session repair of a malformed reply is part of its attempt. An answer with no accepted verdict reviews again directly while an attempt is left and parks at `user_wait/review_exhausted` when none is; it never starts a fix. A `FAIL` or blocking verdict starts a fix only when a later review is still available, so the last permitted review that fails parks at `review_exhausted` without a fix. A result or review basis that changed during a review returns through `check` before the next reserved review. A parsed `PASS`, and the parsed verdict of a review-only job, are delivered whatever the count. Review rounds are numbered across the whole job and never restart, so finding ids `r<round>.F<n>` stay unique. `show <id>` prints `max_reviews`, `reviews_used`, `review_cycle_start` (an index into the retained review records), `review_inflight` (the attempt that holds a reservation its review has not completed) and `retry_not_before`.
+
+Two consecutive substantive failed reviews of one cycle that share a rule id stop the job at `user_wait/root_cause_required` before anything else runs; the root-cause note it asks for is described in [checks](checks.md#finding-records-and-repeated-rules). When the same review also reaches the limit, `root_cause_required` is the reason and the stop notes both.
+
+An explicit `resume` opens a new review cycle at the saved stage: it sets the count to zero, starts the cycle after the last review record, clears the recovery budget and keeps every review record and event. A job that stopped at `review_exhausted` after a failed review resumes into `fix`; one that stopped for answers without a verdict resumes into `review`. `wait` and `approve` keep the cycle. Nothing else resets it: not a passing check, a scan or a restart.
+
+A record written before this accounting has `fix_rounds` and no review fields. It is decoded as it is read and never rewritten. Its count is the number of unique review launches since the latest explicit resume when its events prove a complete cycle (every review record has its launch, and a running review has its own), without the launches that ended in a terminal 429. The stored `fix_rounds` is a lower bound and never the count itself. A job that never started has used nothing. When the history cannot prove the remaining capacity, the cycle counts as used up before another model call: a job at `fix` or `review` parks at `user_wait/review_exhausted` for an explicit resume, and any other stage reaches the same stop at its next review. Its `max_reviews` is 3, whatever the host sets later.
+
+A fresh review uses `docs/review/` profiles and the existing verdict JSON contract. Fingerprints and review basis are computed by code; changing either invalidates the earlier pass.
 
 ```sh
 taskwatch --root <root> wait <id> --reason "Unapproved external write"
@@ -649,12 +655,7 @@ taskwatch --root <root> resume <id> --reason "Approved a new fix cycle"
 taskwatch --root <root> cancel <id> --reason "User cancelled"
 ```
 
-Wait and cancel fence late output immediately. The scanner confirms service
-termination before reusing the slot or target. Approval resumes the saved step;
-an explicit user resume opens a new recovery/fix cycle. Resuming a review fix
-reserves its first round before launch. Check repairs keep the separate recovery
-budget. Commands do not send messages themselves; scans send results and stop
-notices. The runner does not reconcile an external outcome.
+Wait and cancel fence late output immediately. The scanner confirms service termination before reusing the slot or target. Approval resumes the saved step; an explicit user resume opens a new review cycle and a new recovery budget. Commands do not send messages themselves; scans send results and stop notices. The runner does not reconcile an external outcome.
 
 `approve --reason` appends `Gate <date>: <reason>` to the approval source; the
 original approval stays and the worker and reviewer see both. `approve --scope`
@@ -664,3 +665,15 @@ actually approved.
 
 After checks and review pass, the stage is `deliver_pending`, not `done`; see
 [Delivery](#delivery).
+
+### Rate limits
+
+A terminal HTTP 429 of a model call ends the step without using a recovery or a review. Only the terminal failure counts: the error of the finished prompt (`prompt ended error: 429 ...`) of an RPC session, or an explicit HTTP 429 in the final diagnostic block of a failed print-mode review command's standard error. Retry header lines and a JSON response body may follow that status. A later plain-text failure or a structured error with another status or error type supersedes it. A tool output, a prompt or an earlier model fallback that mentions 429 does not. When the last failure after a fallback is something else, such as an unsupported API, the step fails like any other failure.
+
+The evidence is an integer `retry-after-ms` or a `Retry-After` value in the same diagnostic, either integer seconds or an HTTP date (RFC 9110 section 10.2.3). The millisecond form is the provider's own, not an RFC fraction. When several hints are present, the latest finite deadline wins, without an arbitrary duration cap. A negative or fractional number, a malformed integer token, a nonfinite deadline or an unreadable date is not a hint. The diagnostic stays in `error` with anything that looks like a credential masked.
+
+With a deadline, the runner records `retry_not_before` (epoch seconds), keeps the saved stage and returns the review attempt it reserved, and only that attempt: an accepted verdict and the reservation of another attempt are never returned. The scanner confirms the service dead and frees its execution slot, so other jobs run, but a job in a shared target folder keeps its target and no other writer starts there. No scan or reboot launches the step before the deadline. At or after it, the next scan takes a free slot, applies the usual predecessor, approval, cancellation and target gates, and starts exactly one attempt of the saved stage, which clears the deadline. A zero or past deadline is due at the next scan or wake, never sooner. The wait is not a decision for the owner, so `needs` does not list it, and it adds nothing to the stall time. `wait`, `approve` and `resume` keep a future deadline; only the due launch or `cancel`, which removes the retry for good, clears it. A `user_wait` that still has a deadline shows it in `needs`.
+
+`needs` renders a deadline in UTC when it fits the calendar; a finite deadline outside that range is shown as epoch seconds instead.
+
+Without a usable hint the job stops at `user_wait` with `wait_reason: rate_limit` and no counter used, because nothing guesses a delay. `resume` clears that stop, since it has no deadline.

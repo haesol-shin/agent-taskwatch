@@ -19,6 +19,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+from .rate_limit import RateLimit, print_rate_limit, scrub
+
 SCHEMA_NAME = "review-verdict.schema.json"
 WRAPPER_KEYS = (
     "structured_output",
@@ -34,6 +36,7 @@ _FENCE = re.compile(r"^```[A-Za-z0-9_-]*\s*\n(.*?)\n```\s*$", re.DOTALL)
 _DEPTH = 6
 MAX_ERRORS = 5
 KEEP_CHARS = 20000
+STDERR_CHARS = 4000
 
 
 class ReplyError(ValueError):
@@ -41,7 +44,13 @@ class ReplyError(ValueError):
 
 
 class RunError(Exception):
-    """The review command could not run to the end: exit code, timeout."""
+    """The review command could not run to the end: exit code, timeout.
+
+    `rate_limit` is set when a failed command's standard error holds an explicit HTTP 429."""
+
+    def __init__(self, message: str = "", rate_limit: RateLimit | None = None) -> None:
+        super().__init__(message)
+        self.rate_limit = rate_limit
 
 
 # --- run -----------------------------------------------------------------------------------
@@ -121,8 +130,12 @@ def run(
             reader.join(5)
     out = b"".join(chunks).decode("utf-8", "replace")
     if proc.returncode != 0 and not abort.is_set():
+        detail = _tail(stderr_path)
+        limit = print_rate_limit(_tail(stderr_path, STDERR_CHARS))
         raise RunError(
-            f"the review command exited with code {proc.returncode}: {_tail(stderr_path)}"
+            f"the review command exited with code {proc.returncode}: "
+            f"{scrub(detail) if limit else detail}",
+            limit,
         )
     return out
 
@@ -132,7 +145,7 @@ def _tail(path: Path, size: int = 400) -> str:
         text = path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
-    return text[-size:].replace("\n", " ")
+    return text[-size:]
 
 
 # --- find ----------------------------------------------------------------------------------
