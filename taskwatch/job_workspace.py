@@ -39,7 +39,7 @@ def _git(repo: str | Path, env: Mapping[str, str], *args: str, timeout: float = 
     ) as proc:
         try:
             out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except BaseException:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate()
@@ -57,8 +57,8 @@ def _resolve(repo: str | Path, env: Mapping[str, str], rev: str) -> str | None:
     return proc.stdout if proc.returncode == 0 and proc.stdout else None
 
 
-def default_branch(target: str, env: Mapping[str, str]) -> str:
-    proc = _git(target, env, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+def default_branch(target: str, env: Mapping[str, str], *, timeout: float = LOCAL_TIMEOUT) -> str:
+    proc = _git(target, env, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", timeout=timeout)
     if proc.returncode == 0 and proc.stdout.startswith("origin/"):
         return proc.stdout[len("origin/") :]
     return FALLBACK_BRANCH
