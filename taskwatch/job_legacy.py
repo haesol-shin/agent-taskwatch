@@ -60,6 +60,25 @@ def _cycle(data: dict) -> tuple[int, int, int] | None:
         if not _number(when) or any(not _number(review.get("at")) for review in reviews):
             return None
         start = sum(review["at"] < when for review in reviews)
+    if not launches:
+        managed_only = all(
+            event.get("type") in {"wait", "approve"}
+            or (
+                event.get("source") == "scan"
+                and event.get("kind") in {"approval_wait", "unit_released"}
+            )
+            for event in events[cut + 1 :]
+        )
+        never_started = data["attempt"] == 0 and not reviews and not data.get("unit")
+        fresh_resume = cut >= 0 and not reviews[start:]
+        unused = (
+            data["stage"] in {"queued", "approval_wait"}
+            and data.get("fix_rounds", 0) == 0
+            and managed_only
+            and (never_started or fresh_resume)
+        )
+        if not unused:
+            return None
     used = sum(not excluded for excluded in launches.values())
     if not _correlated(events[cut + 1 :], reviews[start:], launches):
         return None

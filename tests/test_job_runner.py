@@ -992,6 +992,35 @@ def test_a_429_with_a_deadline_keeps_the_saved_stage_and_spends_nothing(env):
     assert (event["stage"], event["retry_not_before"]) == ("work", job.retry_not_before)
 
 
+@pytest.mark.parametrize("stage", ["work", "review"])
+def test_a_pre_epoch_retry_date_is_saved_and_retried_once_by_the_scanner(env, stage):
+    from taskwatch.job_scan import scan_jobs
+    from tests.test_job_scan import FakeService
+
+    env.scenario([limited("429 Retry-After: Wed, 31 Dec 1969 23:59:59 GMT")])
+    if stage == "review":
+        env.to_review()
+    assert env.run(stage, recoveries=2) == 1
+    limited_job = env.get()
+    assert (limited_job.stage, limited_job.retry_not_before, limited_job.recoveries) == (
+        stage,
+        0.0,
+        2,
+    )
+    assert limited_job.ended_at > 0 and limited_job.review_inflight == 0
+    assert limited_job.reviews_used == 0
+    service = FakeService()
+    service.states[limited_job.unit] = "inactive"
+    now = time.time()
+    assert scan_jobs(env.jobs, env.config, now=now, boot_id="synthetic", service=service) == [
+        limited_job.id
+    ]
+    assert len(service.started) == 1
+    assert env.get().attempt == limited_job.attempt + 1
+    assert env.get().reviews_used == int(stage == "review")
+    assert scan_jobs(env.jobs, env.config, now=now + 1, boot_id="synthetic", service=service) == []
+
+
 def test_a_429_without_a_hint_waits_for_the_owner_and_spends_nothing(env):
     env.scenario([limited("429 usage limit reached")])
     assert env.run("work", recoveries=2) == 1

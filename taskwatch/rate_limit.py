@@ -12,11 +12,17 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from datetime import timezone
 from email.utils import parsedate_to_datetime
 
 _DAYS = r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
 _MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-_DATE = rf"{_DAYS}, \d{{2}} {_MONTHS} \d{{4}} \d{{2}}:\d{{2}}:\d{{2}} GMT"
+_LONG_DAYS = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+_DATE = (
+    rf"(?:{_DAYS}, [0-9]{{2}} {_MONTHS} [0-9]{{4}} [0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}} GMT"
+    rf"|{_LONG_DAYS}, [0-9]{{2}}-{_MONTHS}-[0-9]{{2}} [0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}} GMT"
+    rf"|{_DAYS} {_MONTHS} (?: [0-9]|[0-9]{{2}}) [0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}} [0-9]{{4}})"
+)
 _MILLISECONDS = re.compile(
     r"\bretry-after-ms[\"']?\s*[=:]\s*[\"']?([0-9]+)(?=$|[\s\"',;}\]])", re.IGNORECASE
 )
@@ -32,6 +38,7 @@ _PRINT_429 = re.compile(
     re.IGNORECASE,
 )
 _HINT_LINE = re.compile(r"^retry-after(?:-ms)?[\"']?\s*[=:]", re.IGNORECASE)
+_FINAL_ERROR = re.compile(r"\b(?:final|terminal)\s+(?:error|failure|failed)\s*[:=]", re.IGNORECASE)
 _SECRET = re.compile(
     r"(?i)(bearer\s+|authorization[\"']?\s*[=:]\s*[\"']?|api[_-]?key[\"']?\s*[=:]\s*[\"']?"
     r"|token[\"']?\s*[=:]\s*[\"']?)[A-Za-z0-9._~+/=-]{8,}|\bsk-[A-Za-z0-9_-]{8,}"
@@ -59,10 +66,13 @@ def _deadlines(text: str, now: float) -> list[float]:
             found.append(now + float(value))
             continue
         try:
-            found.append(parsedate_to_datetime(value).timestamp())
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            found.append(when.timestamp())
         except (ValueError, TypeError, OverflowError):
             continue
-    return [d for d in found if math.isfinite(d)]
+    return [max(0.0, d) for d in found if math.isfinite(d)]
 
 
 def _limit(text: str, now: float | None) -> RateLimit:
@@ -77,7 +87,7 @@ def prompt_rate_limit(message: str, now: float | None = None) -> RateLimit | Non
 
 def print_rate_limit(stderr: str, now: float | None = None) -> RateLimit | None:
     """Read the final HTTP diagnostic block, not a rate limit from an earlier fallback."""
-    lines = stderr.strip().splitlines()
+    lines = _diagnostic_lines(stderr)
     for index in range(len(lines) - 1, -1, -1):
         if not _PRINT_429.search(lines[index]):
             continue
@@ -93,6 +103,31 @@ def print_rate_limit(stderr: str, now: float | None = None) -> RateLimit | None:
                 return None
         return _limit("\n".join(lines[index:]), now)
     return None
+
+
+def _diagnostic_lines(stderr: str) -> list[str]:
+    """An explicit final-error marker starts a new diagnostic, even on the same line."""
+    decoder = json.JSONDecoder()
+    parts = []
+    start = index = 0
+    while index < len(stderr):
+        if stderr[index] in "{[":
+            try:
+                _, size = decoder.raw_decode(stderr[index:])
+            except ValueError:
+                pass
+            else:
+                index += size
+                continue  # A marker inside a structured response is not a new diagnostic.
+        marker = _FINAL_ERROR.match(stderr, index)
+        if marker and index > start:
+            parts.append(stderr[start:index].rstrip(" ;"))
+            start = index
+            index = marker.end()
+        else:
+            index += 1
+    parts.append(stderr[start:])
+    return "\n".join(parts).strip().splitlines()
 
 
 def _rate_limit_body(payload: object) -> bool:

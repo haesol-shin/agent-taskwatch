@@ -68,6 +68,30 @@ def test_a_retry_after_date_is_an_absolute_deadline():
 
 
 @pytest.mark.parametrize(
+    "date",
+    [
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994",
+    ],
+)
+def test_all_http_date_forms_are_absolute_utc_deadlines(monkeypatch, date):
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setenv("TZ", "EST5")
+            time.tzset()
+            error = limit_of(f"429 Retry-After: {date}")
+            assert error.rate_limit.retry_at == 784111777.0
+    finally:
+        time.tzset()
+
+
+def test_a_pre_epoch_http_date_is_an_already_due_nonnegative_deadline():
+    error = limit_of("429 Retry-After: Wed, 31 Dec 1969 23:59:59 GMT")
+    assert error.rate_limit.retry_at == 0.0
+
+
+@pytest.mark.parametrize(
     "message",
     [
         "429 usage limit reached",

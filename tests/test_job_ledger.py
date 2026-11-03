@@ -126,6 +126,52 @@ def test_a_job_that_never_started_has_used_nothing(tmp_path):
     assert not hasattr(job, "fix_rounds")
 
 
+@pytest.mark.parametrize(
+    ("stage", "attempt", "fix_rounds"),
+    [("review", 5, 0), ("fix", 5, 1), ("queued", 5, 0), ("check", 5, 0), ("queued", 0, 1)],
+)
+def test_empty_history_cannot_prove_an_executed_legacy_cycle(tmp_path, stage, attempt, fix_rounds):
+    jobs, job = load_old(tmp_path, fix_rounds, stage=stage, attempt=attempt, events=[], reviews=[])
+    assert job.reviews_used == job.max_reviews
+    if stage in {"fix", "review"}:
+        from taskwatch.job_scan import scan_jobs
+        from taskwatch.jobs import JobConfig
+        from tests.test_job_scan import FakeService
+
+        service = FakeService()
+        assert job.stage == "user_wait" and job.wait_reason == "review_exhausted"
+        assert scan_jobs(jobs, JobConfig(), now=20.0, boot_id="synthetic", service=service) == []
+        assert service.started == []
+
+
+@pytest.mark.parametrize("unit", ["", "previous.service"])
+def test_an_unexecuted_explicit_resume_proves_a_fresh_empty_cycle(tmp_path, unit):
+    events = [
+        launch(2, at=5.0),
+        done(6.0),
+        {"type": "resume", "at": 10.0, "reason": "again"},
+    ]
+    _, job = load_old(
+        tmp_path, events=events, reviews=[old_review(6.0)], stage="queued", attempt=3, unit=unit
+    )
+    assert (job.stage, budget(job)) == ("queued", (0, 1, 0, 3))
+
+
+@pytest.mark.parametrize(
+    ("stage", "events"),
+    [
+        ("queued", [{"type": "wait", "at": 2.0}, {"type": "approve", "at": 3.0}]),
+        (
+            "approval_wait",
+            [{"source": "scan", "kind": "approval_wait", "at": 2.0, "attempt": 0}],
+        ),
+    ],
+)
+def test_approval_events_do_not_spend_an_unexecuted_legacy_cycle(tmp_path, stage, events):
+    _, job = load_old(tmp_path, stage=stage, events=events)
+    assert (job.stage, budget(job)) == (stage, (0, 0, 0, 3))
+
+
 def test_the_cycle_counts_every_launch_since_the_latest_resume_including_interrupted_ones(
     tmp_path,
 ):

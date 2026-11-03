@@ -235,7 +235,12 @@ def test_a_failing_command_is_a_step_failure_with_its_exit_code(env):
 
 
 @pytest.mark.parametrize(
-    "response", ["", '{"error":"rate_limit_error","message":"quota exceeded"}']
+    "response",
+    [
+        "",
+        '{"error":"rate_limit_error","message":"quota exceeded"}',
+        '{"error":"rate_limit_error","message":"previous final error: retrying; quota exceeded"}',
+    ],
 )
 def test_an_explicit_http_429_on_standard_error_waits_for_its_deadline(env, response):
     shell = (
@@ -273,6 +278,12 @@ def test_an_explicit_429_without_a_hint_waits_for_the_owner(env):
         " exit 1",
         "cat > /dev/null; echo 'HTTP 429 Retry-After: 120' >&2;"
         ' echo \'{"error":{"type":"api_error","message":"unsupported API"}}\' >&2; exit 1',
+        "cat > /dev/null;"
+        " echo 'HTTP 429 Retry-After: 60; final error:"
+        " Unhandled API in mapOptionsForApi: web-search'"
+        " >&2; exit 1",
+        "cat > /dev/null; echo 'HTTP 429 Retry-After: 60 terminal failure: unsupported API'"
+        " >&2; exit 1",
     ],
 )
 def test_generic_mentions_of_429_are_not_a_rate_limit(env, shell):
