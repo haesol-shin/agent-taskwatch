@@ -35,6 +35,61 @@ def payload(tmp_path: Path, receipt="message:1") -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    "outputs,error",
+    [
+        (["design.md"], "choices.json"),
+        (["nested/choices.json"], "choices.json"),
+        (["../choices.json"], "stay in the workspace"),
+        ([42], "outputs needs nonempty strings"),
+        ("choices.json", "outputs must be"),
+    ],
+)
+def test_design_rejects_incomplete_outputs_before_copy(tmp_path, outputs, error):
+    jobs = Jobs(tmp_path / "root")
+    data = _code_payload(tmp_path, "design", review="design", outputs=outputs)
+    with pytest.raises(ValueError, match=error):
+        jobs.submit(data)
+    assert not jobs.load()
+    assert not (jobs.state.dir / "jobs").exists()
+    assert data["outputs"] == outputs
+
+
+@pytest.mark.parametrize("output", ["choices.json", "./choices.json"])
+def test_design_root_output_and_receipt_replay(tmp_path, output):
+    jobs = Jobs(tmp_path / "root")
+    data = _code_payload(tmp_path, "design", review="design", outputs=["design.md", output])
+    first = jobs.submit(data)
+    assert first.outputs == ("design.md", output)
+    Path(data["intent"]).unlink()
+    repeated = jobs.submit({**data, "outputs": ["design.md"]})
+    assert repeated == first
+    assert Path(first.intent).is_file()
+    assert list(jobs.load()) == [first.id]
+
+
+def test_design_with_dot_slash_choices_still_passes_the_end_check(tmp_path):
+    from taskwatch.job_runner import _brief_problems
+
+    jobs = Jobs(tmp_path / "root")
+    job = jobs.submit(
+        _code_payload(tmp_path, "design", review="design", outputs=["./choices.json"]), 10
+    )
+    problems = _brief_problems(jobs, job, tmp_path, tmp_path)
+    assert not any("must be listed in outputs" in problem for problem in problems)
+
+
+def test_review_only_design_does_not_require_worker_outputs(tmp_path):
+    jobs = Jobs(tmp_path / "root")
+    data = payload(tmp_path)
+    for key in ("outputs", "check_command", "checklist", "progress"):
+        del data[key]
+    data.update(review="design", review_target={"files": ["intent.md"]})
+    job = jobs.submit(data)
+    assert job.outputs == ("intent.md",)
+    assert job.review_target == {"files": ("intent.md",)}
+
+
 def test_idempotent_submit_copies_inputs_and_preserves_original(tmp_path):
     jobs = Jobs(tmp_path / "root")
     data = payload(tmp_path)

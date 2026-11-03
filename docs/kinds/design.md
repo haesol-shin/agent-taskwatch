@@ -3,7 +3,7 @@
 A design job decides how something should be built before it is built, so the owner can choose between real options.
 
 - Inputs: the intent, the spec with the template headings, and the result of any predecessor (for example a research result), listed in the message. When the spec or a work input lists the owner's other repositories and rule files (the conventions to share), read them.
-- Result: the files named in `outputs`, usually `design.md`, and always `choices.json`, which must be one of the `outputs` so the review covers it.
+- Result: the files named in `outputs`, usually `design.md`, and always root `choices.json`, which must be declared so independent review covers it. Submission rejects a missing or nested-only declaration before copying inputs or creating a job; `./choices.json` names the same root output. Review-only design jobs have no worker output requirement. Existing records remain readable and still face end checks.
 - Check: the job's `check_command` (heading and size checks), the required files and the checklist, the `choices.json` check below, then the brief check.
 - Review: the common rules, `design.md` and the `design_check` of the verdict line.
 - Brief: `Choices made` lists what the design decided and marks every pick `awaiting owner`: the owner answers later, at the gate on the next job, so this job never needs an answer.

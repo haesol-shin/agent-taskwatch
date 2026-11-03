@@ -16,13 +16,18 @@ the tools, the extensions, the overlay or the system prompt; those that would ar
 """
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 import re
+import selectors
 import shlex
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -270,6 +275,173 @@ def build(args: argparse.Namespace) -> Plan:
     return plan(agent, _guideline_files(folder, args.review), layer, args.omp, work)
 
 
+_STDERR_LIMIT = 64 * 1024
+_DRAIN_AFTER_EXIT = 1.0
+_CANCEL_GRACE = 1.0
+_FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+# The two startup rejections of omp's tool selection, at the start of a line: an unknown name in
+# `--tools`, and a built-in tool that its settings disable. Runtime tool errors do not match.
+_TOOL_REJECTION = re.compile(
+    rb"^(?:Error:[ \t]*)?"
+    rb"(?:Unknown tools?\b[^\r\n]{0,40}:|Built-in tool unavailable[^\r\n]{0,40}:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _die_with_parent() -> None:
+    """Run in the child before exec: a killed launcher must not leave omp running."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+
+
+def _children() -> set[int]:
+    """Direct children of this launcher thread, including subreaper adoptions."""
+    return {int(pid) for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()}
+
+
+class _Run:
+    """One supervised omp run: its own process group, stderr relay and cancellation."""
+
+    def __init__(self, command: list[str]) -> None:
+        self.command = command
+        self.proc: subprocess.Popen | None = None
+        self.cancelled = 0
+        self.kill_at: float | None = None
+        self.excerpt = bytearray()
+        self.rejection = b""
+
+    def send(self, signum: int) -> None:
+        if self.proc is not None:
+            try:
+                os.killpg(self.proc.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    def forward(self, signum: int, _frame: object) -> None:
+        self.cancelled = signum
+        self.kill_at = time.monotonic() + _CANCEL_GRACE
+        self.send(signum)
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            self.command,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            preexec_fn=_die_with_parent,
+        )
+        if self.cancelled:
+            self.send(self.cancelled)
+
+    def relay(self) -> None:
+        """Copy stderr as it arrives. After omp exits, leftover holders get a short drain."""
+        assert self.proc is not None and self.proc.stderr is not None
+        exited = 0.0
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.proc.stderr, selectors.EVENT_READ)
+            while selector.get_map() or self.proc.poll() is None:
+                if self.kill_at is not None and time.monotonic() >= self.kill_at:
+                    self.send(signal.SIGKILL)
+                    self.kill_at = None
+                if self.proc.poll() is not None:
+                    self.send(signal.SIGKILL)
+                    if not exited:
+                        self.reap_adopted()
+                        exited = time.monotonic()
+                    if time.monotonic() - exited > _DRAIN_AFTER_EXIT:
+                        return
+                for key, _ in selector.select(0.05):
+                    chunk = os.read(key.fd, 16384)
+                    if chunk:
+                        self.copy(chunk)
+                    else:
+                        selector.unregister(key.fileobj)
+
+    def copy(self, chunk: bytes) -> None:
+        view = memoryview(chunk)
+        while view:
+            view = view[os.write(sys.stderr.fileno(), view) :]
+        self.excerpt.extend(chunk)
+        del self.excerpt[:-_STDERR_LIMIT]
+        match = _TOOL_REJECTION.search(self.excerpt)
+        if match:
+            # Keep the named rejection and its valid-tools list at the end of the eventual
+            # error, inside the tail that the RPC client records.
+            start = max(0, match.start() - 512)
+            self.rejection = bytes(self.excerpt[start : match.start() + 8192])
+
+    def reap(self) -> None:
+        """Kill the group, then collect adopted descendants even if they changed session."""
+        if self.proc is None:
+            return
+        self.send(signal.SIGKILL)
+        self.proc.wait()
+        if self.proc.stderr is not None:
+            self.proc.stderr.close()
+        self.reap_adopted()
+
+    def reap_adopted(self) -> None:
+        # This standalone launcher owns all of its children. An exiting child can
+        # make /proc's children list omit a live sibling, so only ECHILD from the
+        # kernel is proof that cleanup is complete, never an empty /proc snapshot.
+        while True:
+            try:
+                exited = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                return
+            if exited is not None:
+                os.waitpid(exited.si_pid, 0)
+                continue
+            for pid in _children():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def _supervise(command: list[str], agent_path: Path, required: str) -> int:
+    """Keep stdout inherited and own only this invocation's process group and stderr."""
+    # A dead omp can leave children behind. Adopt them so killing the owned group also
+    # reaps them, rather than leaving zombies for the caller's service manager.
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0:  # PR_GET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "cannot read child-subreaper state")
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "cannot own reviewer descendants")
+    run = _Run(command)
+    handlers = {}
+    try:
+        for signum in _FORWARDED:
+            handlers[signum] = signal.signal(signum, run.forward)
+        run.start()
+        run.relay()
+        assert run.proc is not None
+        status = run.proc.wait()
+        if status and run.rejection:
+            print(_tool_advice(agent_path, required, run.rejection), file=sys.stderr)
+    finally:
+        run.reap()
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        libc.prctl(36, previous.value, 0, 0, 0)
+    terminating = run.cancelled or (-status if status < 0 else 0)
+    if terminating:
+        if terminating not in (signal.SIGKILL, signal.SIGSTOP):
+            signal.signal(terminating, signal.SIG_DFL)
+        os.kill(os.getpid(), terminating)
+    return status
+
+
+def _tool_advice(agent_path: Path, required: str, rejection: bytes) -> str:
+    return (
+        f"\nreviewer_launch: omp rejected required tools for --agent {agent_path}; "
+        f"effective required tools: {required or '(none)'}. "
+        "Enable the named tool in the effective omp configuration, or correct "
+        "the agent definition to declare the tools the review actually requires. "
+        "Tools and grants were not changed.\n" + rejection.decode("utf-8", errors="replace")
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args, passthrough = _parser().parse_known_args(argv)
     try:
@@ -288,11 +460,11 @@ def main(argv: list[str] | None = None) -> int:
         print(shlex.join(command))
         return 0
     try:
-        os.execvp(command[0], command)
+        required = built.argv[built.argv.index("--tools") + 1] if "--tools" in built.argv else ""
+        return _supervise(command, args.agent, required)
     except OSError as exc:
         print(f"reviewer_launch: cannot run {command[0]}: {exc}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import base64
 import binascii
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -20,6 +21,7 @@ from .rate_limit import RateLimit, prompt_rate_limit, scrub
 
 DEFAULT_FRAME_BYTES = 1 << 20
 DEFAULT_REASSEMBLED_BYTES = 64 << 20
+STARTUP_STDERR_BYTES = 16384
 OPEN_SESSION_NEEDS = (
     "the omp command must support the public open_session provider and modelId "
     'override (docs/configuration.md, "Model selection")'
@@ -150,6 +152,7 @@ class RpcClient:
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._stderr = None
+        self._stderr_start = 0
         self._ready: dict | None = None
         self._responses: dict[str, dict] = {}
         self._results: dict[str, dict] = {}
@@ -174,6 +177,7 @@ class RpcClient:
         if self.stderr_path is not None:
             self.stderr_path.parent.mkdir(parents=True, exist_ok=True)
             self._stderr = self.stderr_path.open("ab")
+            self._stderr_start = self._stderr.tell()
         try:
             self._proc = subprocess.Popen(
                 self.argv,
@@ -182,12 +186,22 @@ class RpcClient:
                 stdout=subprocess.PIPE,
                 stderr=self._stderr if self._stderr else subprocess.DEVNULL,
                 env=dict(self.env) if self.env is not None else os.environ.copy(),
+                start_new_session=True,
             )
         except OSError as exc:
             self._close_stderr()
             raise RpcError(f"cannot start omp: {exc}") from exc
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
+        try:
+            self._negotiate(timeout)
+        except RpcError as exc:
+            self.close(kill=True)
+            detail = self._startup_stderr()
+            exc.args = (scrub(f"{exc}" + (f": {detail}" if detail else "")),)
+            raise
+
+    def _negotiate(self, timeout: float) -> None:
         ready = self._wait(lambda: self._ready, timeout, "ready frame")
         frame_limit = ready.get("maxFrameBytes")
         if type(frame_limit) is int and frame_limit > 0:
@@ -199,6 +213,16 @@ class RpcClient:
         self._decoder.max_bytes = int(
             ready.get("maxReassembledFrameBytes") or DEFAULT_REASSEMBLED_BYTES
         )
+
+    def _startup_stderr(self) -> str:
+        """The tail of this attempt's stderr, masked before it is cut so no token is split."""
+        if self.stderr_path is None:
+            return ""
+        with self.stderr_path.open("rb") as stream:
+            end = stream.seek(0, os.SEEK_END)
+            stream.seek(max(self._stderr_start, end - 4 * STARTUP_STDERR_BYTES))
+            text = scrub(stream.read().decode("utf-8", errors="replace"))
+        return text.encode()[-STARTUP_STDERR_BYTES:].decode("utf-8", errors="ignore").strip()
 
     def _read(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -400,19 +424,20 @@ class RpcClient:
         proc = self._proc
         code = self._exit
         if proc is not None and self._exit is None:
-            if kill and proc.poll() is None:
-                proc.kill()
-            else:
+            if kill:
+                self._signal_group(signal.SIGTERM)
+            if proc.poll() is not None or not kill:
                 try:
                     if proc.stdin:
                         proc.stdin.close()
                 except OSError:
                     pass
             try:
-                code = proc.wait(timeout=10)
+                code = proc.wait(timeout=2 if kill else 10)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                self._signal_group(signal.SIGKILL)
                 code = proc.wait()
+            self._signal_group(signal.SIGKILL)
             if self._reader:
                 self._reader.join(timeout=5)
             if proc.stdout:
@@ -428,6 +453,13 @@ class RpcClient:
             raise self._failure
         if code != 0:
             raise RpcError(f"omp exited with code {code}")
+
+    def _signal_group(self, signum: int) -> None:
+        if self._proc is not None:
+            try:
+                os.killpg(self._proc.pid, signum)
+            except ProcessLookupError:
+                pass
 
     def _close_stderr(self) -> None:
         if self._stderr is not None:

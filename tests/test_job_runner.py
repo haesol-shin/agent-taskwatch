@@ -106,7 +106,7 @@ class Env:
                 "target": str(target),
                 "intent": str(tmp_path / "intent.md"),
                 "spec": str(tmp_path / "spec.md"),
-                "outputs": ["out.txt"],
+                "outputs": ["out.txt", "choices.json"] if review == "design" else ["out.txt"],
                 "check_command": CHECK,
                 "checklist": "checklist.json",
                 "progress": "PROGRESS.md",
@@ -595,6 +595,20 @@ def test_nonzero_exit_or_persistence_notice_fails_a_settled_step(env):
     env.scenario([work_turn(notice=True)])
     assert env.run("work") == 1
     assert "session-persistence" in env.get().error
+
+
+def test_startup_tool_diagnostic_is_recorded_without_rate_wait(env):
+    peer = (
+        "import sys; "
+        "print('Unknown tool: ast_grep. Valid tools: read, task', file=sys.stderr); "
+        "sys.exit(7)"
+    )
+    env.config = replace(env.config, omp_command=(sys.executable, "-c", peer))
+    assert env.run("work") == 1
+    job = env.get()
+    assert "ast_grep" in job.error and "read, task" in job.error
+    assert "7" in job.error and job.retry_not_before == 0
+    assert job.stage == "work" and not job.wait_reason
 
 
 def test_oversize_frame_is_rejected(env):
