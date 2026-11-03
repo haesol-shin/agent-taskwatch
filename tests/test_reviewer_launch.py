@@ -1,5 +1,6 @@
 """The reviewer launcher builds the omp command from an agent file and the guideline folder."""
 
+import ctypes
 import json
 import os
 import selectors
@@ -347,35 +348,108 @@ def test_a_runtime_tool_error_is_not_a_startup_rejection(tmp_path, guidelines):
     assert result.stderr == b"read tool: file not found\nInvalid tool call arguments\n"
 
 
-def test_a_descendant_outside_the_group_cannot_hold_the_launcher(tmp_path, guidelines):
+@pytest.fixture
+def child_subreaper():
+    """Give orphaned synthetic peers a deterministic reaper instead of relying on PID 1."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    try:
+        yield
+    finally:
+        assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+def detached_peer(pid_file, after):
+    """Two detached generations that keep both output pipes open and ignore SIGTERM."""
+    return (
+        "import os, signal, time\nfrom pathlib import Path\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    read_fd, write_fd = os.pipe()\n"
+        "    grandchild = os.fork()\n"
+        "    if grandchild == 0:\n"
+        "        os.setsid()\n"
+        "        os.close(read_fd)\n"
+        "        os.write(write_fd, str(os.getpid()).encode())\n"
+        "        os.close(write_fd)\n"
+        "        while True: time.sleep(1)\n"
+        "    os.close(write_fd)\n"
+        "    grandchild_pid = os.read(read_fd, 40).decode()\n"
+        "    os.close(read_fd)\n"
+        f"    Path({str(pid_file)!r}).write_text(f'{{os.getpid()}} {{grandchild_pid}}')\n"
+        "    while True: time.sleep(1)\n"
+        f"while not Path({str(pid_file)!r}).exists(): time.sleep(0.01)\n" + after
+    )
+
+
+def cleanup_detached(pid_file):
+    """Failure cleanup only: success assertions must precede this fallback."""
+    if not pid_file.exists():
+        return
+    for pid in map(int, pid_file.read_text().split()):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.parametrize("mode", ["exit", "rpc_exit", "rpc_timeout"])
+def test_detached_descendants_are_reaped_without_holding_output_pipes(
+    tmp_path, guidelines, child_subreaper, mode
+):
     pid_file = tmp_path / "escaped"
     argv, env = launch_fixture(
         tmp_path,
         guidelines,
-        "import os, time\nfrom pathlib import Path\n"
-        "if os.fork() == 0:\n"
-        "    os.setsid()\n"
-        f"    Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
-        "    time.sleep(30)\n"
-        "    os._exit(0)\n"
-        f"while not Path({str(pid_file)!r}).exists(): time.sleep(0.01)\n"
-        "os._exit(5)\n",
+        detached_peer(
+            pid_file,
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n"
+            if mode == "rpc_timeout"
+            else "os._exit(5)\n",
+        ),
     )
+    if mode != "exit":
+        # An outer subprocess deadline catches close() blocking on a reader's stdout lock.
+        # The actual RPC reader still receives the launcher's inherited stdout pipe.
+        driver = (
+            "import json, sys\nfrom pathlib import Path\n"
+            "from taskwatch.job_rpc import RpcClient, RpcError\n"
+            f"rpc = RpcClient(json.loads(sys.argv[1]), Path.cwd(), "
+            f"stderr_path=Path({str(tmp_path / 'rpc.stderr')!r}))\n"
+            "try:\n"
+            f"    rpc.start({0.5 if mode == 'rpc_timeout' else 5})\n"
+            "except RpcError as exc:\n"
+            "    print(type(exc).__name__ + ': ' + str(exc), flush=True)\n"
+            "else:\n"
+            "    raise AssertionError('unexpected ready')\n"
+            "finally:\n"
+            "    rpc.close(kill=True)\n"
+        )
+        argv = [sys.executable, "-c", driver, json.dumps(argv)]
     started = time.monotonic()
     try:
-        result = subprocess.run(
-            argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10
-        )
-        assert result.returncode == 5 and time.monotonic() - started < 8
+        result = subprocess.run(argv, env=env, capture_output=True, timeout=8)
+        assert result.returncode == (5 if mode == "exit" else 0)
+        if mode == "rpc_exit":
+            assert b"code 5" in result.stdout
+        elif mode == "rpc_timeout":
+            assert b"RpcTimeout:" in result.stdout
+        assert time.monotonic() - started < 7
+        for pid in map(int, pid_file.read_text().split()):
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
     finally:
-        if pid_file.exists():
-            try:
-                os.kill(int(pid_file.read_text()), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        cleanup_detached(pid_file)
 
 
-def test_killing_the_launcher_does_not_leave_omp_running(tmp_path, guidelines):
+def test_killing_the_launcher_does_not_leave_omp_running(tmp_path, guidelines, child_subreaper):
     ready = tmp_path / "ready"
     argv, env = launch_fixture(
         tmp_path,
@@ -385,23 +459,31 @@ def test_killing_the_launcher_does_not_leave_omp_running(tmp_path, guidelines):
         "time.sleep(60)\n",
     )
     proc = subprocess.Popen(argv, env=env)
+    pid = None
     try:
         wait_for_file(ready, proc)
         pid = int(ready.read_text())
         proc.kill()
         proc.wait(timeout=10)
+        # The test is the next subreaper. Reap its adopted peer and check the real
+        # termination signal, rather than calling a zombie "still running".
         until = time.monotonic() + 5
         while time.monotonic() < until:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                pid = None
+                assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
+                break
             time.sleep(0.05)
-        pytest.fail("omp outlived the launcher")
+        else:
+            pytest.fail("omp outlived the launcher")
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        if pid is not None:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
 
 
 def test_normal_exit_also_stops_and_reaps_leftover_descendants(tmp_path, guidelines):

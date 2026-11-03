@@ -294,6 +294,11 @@ def _die_with_parent() -> None:
     libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
 
 
+def _children() -> set[int]:
+    """Direct children of this launcher thread, including subreaper adoptions."""
+    return {int(pid) for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()}
+
+
 class _Run:
     """One supervised omp run: its own process group, stderr relay and cancellation."""
 
@@ -339,7 +344,9 @@ class _Run:
                     self.kill_at = None
                 if self.proc.poll() is not None:
                     self.send(signal.SIGKILL)
-                    exited = exited or time.monotonic()
+                    if not exited:
+                        self.reap_adopted()
+                        exited = time.monotonic()
                     if time.monotonic() - exited > _DRAIN_AFTER_EXIT:
                         return
                 for key, _ in selector.select(0.05):
@@ -363,18 +370,32 @@ class _Run:
             self.rejection = bytes(self.excerpt[start : match.start() + 8192])
 
     def reap(self) -> None:
-        """Kill what is left of the group and collect every adopted descendant."""
+        """Kill the group, then collect adopted descendants even if they changed session."""
         if self.proc is None:
             return
         self.send(signal.SIGKILL)
         self.proc.wait()
         if self.proc.stderr is not None:
             self.proc.stderr.close()
+        self.reap_adopted()
+
+    def reap_adopted(self) -> None:
+        # This standalone launcher owns all of its children. An exiting child can
+        # make /proc's children list omit a live sibling, so only ECHILD from the
+        # kernel is proof that cleanup is complete, never an empty /proc snapshot.
         while True:
             try:
-                os.waitpid(-self.proc.pid, 0)
+                exited = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             except ChildProcessError:
-                break
+                return
+            if exited is not None:
+                os.waitpid(exited.si_pid, 0)
+                continue
+            for pid in _children():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def _supervise(command: list[str], agent_path: Path, required: str) -> int:
