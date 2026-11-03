@@ -96,3 +96,38 @@ def test_show_cli_includes_derived_activity_without_storing_it(
     for job in jobs.load().values():
         row = json.loads((jobs.folder(job) / "state.json").read_text())
         assert "activity" not in row["job"]
+
+
+def test_show_land_exposes_publication_install_and_stop_facts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    jobs = Jobs(tmp_path / "root")
+    job = jobs.submit(payload(tmp_path), 100.0)
+    land = {
+        "phase": "install",
+        "pr": {"number": 7, "url": "https://forge.invalid/acme/repo/pull/7"},
+        "S": "a" * 40,
+        "tree_verified": True,
+        "install": {"status": "unknown"},
+    }
+    jobs.save(replace(job, stage="land", land_state=land), 200.0)
+    assert main(["--root", str(jobs.state.root), "show", job.id]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert "land " in shown["activity"]
+    assert "PR #7" in shown["activity"]
+    assert "install unknown" in shown["activity"]
+    assert shown["land_state"]["S"] == "a" * 40
+    jobs.save(
+        replace(
+            jobs.load()[job.id],
+            stage="user_wait",
+            resume_stage="land",
+            wait_reason="land_install_failed",
+            error="install interrupted",
+        ),
+        300.0,
+    )
+    assert main(["--root", str(jobs.state.root), "show", job.id]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["wait_reason"] == "land_install_failed"
+    assert stopped["land_state"] == land

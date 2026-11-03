@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .jobs import JobState
 
-ACTIVE_STAGES = frozenset({"work", "fix", "check", "review"})
+ACTIVE_STAGES = frozenset({"work", "fix", "check", "review", "land"})
 MAX_LINE_CHARS = 120
 
 
@@ -34,6 +34,26 @@ def _last_progress_line(job: JobState, folder: Path) -> str:
     return ""
 
 
+def land_facts(job: JobState) -> list[str]:
+    """Concrete publication outcomes shared by activity and owner-facing needs."""
+    state = job.land_state
+    if not state:
+        return []
+    facts = []
+    if phase := state.get("phase"):
+        facts.append(f"phase {_line(phase)}")
+    if pr := state.get("pr"):
+        facts.append(f"PR #{_line(pr.get('number', '?'))} {_line(pr.get('url', ''))}".rstrip())
+    if merged := state.get("S"):
+        facts.append(f"merged {_line(merged)}")
+        facts.append("tree verified" if state.get("tree_verified") else "tree not verified")
+    if install := state.get("install"):
+        facts.append(f"install {_line(install.get('status', 'unknown'))}")
+    if error := state.get("last_error"):
+        facts.append(f"error {_line(error)}")
+    return facts
+
+
 def activity(job: JobState, folder: Path, now: float | None = None) -> str | None:
     """Return the one-line activity summary for an active job, or None when not running."""
     if job.stage not in ACTIVE_STAGES:
@@ -42,5 +62,7 @@ def activity(job: JobState, folder: Path, now: float | None = None) -> str | Non
     started = _minutes(current, job.started_at)
     ago = _minutes(current, job.last_progress_at)
     head = f"{job.stage} {started}m; last progress {ago}m ago"
+    if job.stage == "land":
+        return f"{head}: {'; '.join(land_facts(job))}" if job.land_state else head
     line = _last_progress_line(job, folder)
     return f"{head}: {line}" if line else head

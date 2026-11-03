@@ -661,3 +661,28 @@ def test_job_folder_evidence_under_a_result_file_name_stays_quiet(ledger):
         sleep=sleep,
     )
     assert code == 3 and "cursor:" not in text
+
+
+def test_needs_exposes_landing_stop_and_retained_merge_install_facts(ledger: Ledger) -> None:
+    identifier = ledger.add(
+        stage="user_wait",
+        resume_stage="land",
+        wait_reason="land_install_failed",
+        error="install acknowledgement lost",
+        land_state={
+            "phase": "install",
+            "pr": {"number": 7, "url": "https://forge.invalid/acme/repo/pull/7"},
+            "S": "a" * 40,
+            "tree_verified": True,
+            "install": {"status": "unknown"},
+        },
+    )
+    code, text = ledger.list()
+    assert code == 0
+    assert f"job {identifier} research user_wait land_install_failed" in text
+    assert "PR #7 https://forge.invalid/acme/repo/pull/7" in text
+    assert f"merged {'a' * 40}" in text
+    assert "tree verified" in text
+    assert "install unknown" in text
+    assert "install acknowledgement lost" in text
+    assert f"resume {identifier}" in text

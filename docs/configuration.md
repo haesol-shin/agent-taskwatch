@@ -27,6 +27,8 @@ All keys shown above except `max_reviews` are required. The three numeric settin
 
 `max_reviews` limits the reviews of one cycle; see [Review limit](#review-limit).
 
+`install_command` is optional and defaults to `null`; [Automatic landing](#automatic-landing) owns its host-only argv contract, frozen identity and explicit retry rules.
+
 Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run
 independent reviews with a different command prefix. Like `omp_command`, it must
 be a nonempty list of nonempty strings. When omitted, reviews use `omp_command`;
@@ -129,14 +131,7 @@ A review is counted when it is reserved, before it starts, and never after it re
 
 ### Job environment
 
-Optionally add `"env"`, an object of string keys and string values, to set the environment of
-every process the runner starts for a job: the omp worker (work, fix, review, including the
-reviewer command), the check command, and the git commands the runner runs. A systemd job
-starts with a minimal `PATH`, so tools such as `gitleaks` in `~/.local/bin` or `omp` plugins in
-`~/.bun/bin` are missing for a commit hook until you add them here. Values are used as written,
-except in `PATH`, where `~` and `$HOME` expand and `$PATH` stands for the inherited value. No
-shell runs. Anything that is not an object of strings is a config error; omitting `env` or
-leaving it empty keeps the inherited environment. The `init` draft omits this key.
+Optionally add `"env"`, an object of string keys and string values, to set the environment of every process the runner starts for a job: the omp worker (work, fix, review, including the reviewer command), check command, runner git/forge commands and enabled install hook. A systemd job starts with a minimal `PATH`, so tools such as `gitleaks` in `~/.local/bin` or omp plugins in `~/.bun/bin` can need entries here. Values are used as written, except in `PATH`, where `~` and `$HOME` expand and `$PATH` stands for the inherited value. No shell runs implicitly. Anything other than an object of strings is a config error; omitting `env` or leaving it empty keeps the inherited environment. The `init` draft omits this key.
 
 ```json
 "env": {"PATH": "~/.local/bin:~/.bun/bin:$PATH"}
@@ -150,15 +145,7 @@ Optional `<root>/taskwatch/defaults.json` holds standing owner answers for desig
 
 A `code` job that builds a result works in `state/jobs/<id>/worktree`, on its own branch.
 
-- Base. Before the worktree is created, the runner runs `git fetch origin <default branch>`
-  without prompting and with a 5 second cap. The default branch is the one `origin/HEAD`
-  names, or `main`. The worktree starts at `origin/<default branch>`. If the fetch fails or the
-  target has no `origin`, the local ref is used and the job records `base_note: "base may be
-  stale: <reason>"`. The optional submission field `base` (a commit or branch of the target, or
-  `@<receipt key>` for the branch `<branch_prefix><first 8 characters of the id>` of an existing
-  code job) replaces the base, for work stacked on another job's branch; it is used as written,
-  with no fetch, and `@<receipt key>` is stored as the resolved branch name. Afterwards `base`
-  in the record is the commit used.
+- Base. Before creating a worktree without an explicit base, the runner runs noninteractive `git fetch origin <default branch>` with a 5 second cap; the branch is the one `origin/HEAD` names, or `main`. It starts from `origin/<default branch>`; a failed fetch or missing origin records `base_note: "base may be stale: <reason>"` and uses the local ref. An explicit `base` commit or branch is used without that creation fetch. `base: "@<receipt key>"` retains the original predecessor relationship: a nonlanding predecessor supplies its branch, while a landed predecessor supplies verified immutable squash commit S, not a branch that cleanup can delete. Workspace creation pins the effective base commit. Landing always requires a fresh successful fetch, regardless of the creation fallback; see [Automatic landing](#automatic-landing).
 - Branch. `<branch_prefix><first 8 characters of the job id>`. Optionally add
   `"branch_prefix"` to `jobs-config.json` (default `"taskwatch/"`): letters, digits, `_` and
   `-`, with parts joined by `/`. A resumed job reuses its worktree and branch.
@@ -253,7 +240,7 @@ worker-owned file exception. Preparing declared public text grants no authority
 to publish it. Any action outside the recorded scope and named file exceptions
 still requires the existing wait-before-action approval procedure.
 
-`inputs`, `predecessors`, `expected_wait_seconds`, `approval_required`, and `max_reviews` are optional. Every other example field is required. Each entry of `predecessors` is an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored record keeps the resolved job ids. Derive the receipt key from the approval message and its job number. A repeated key returns the original job even if other arguments differ. The command records the caller's approval assertion; it cannot authenticate the conversation.
+`inputs`, `predecessors`, `expected_wait_seconds`, `approval_required`, `max_reviews`, and `land` are optional. Every other example field is required. Each entry of `predecessors` is an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored record keeps the resolved job ids. Derive the receipt key from the approval message and its job number. A repeated key returns the original job even if other arguments differ. The command records the caller's approval assertion; it cannot authenticate the conversation.
 
 `max_reviews` is the review limit of this job. When it is absent the job takes the host setting; see [Review limit](#review-limit).
 
@@ -387,10 +374,7 @@ backing up the job folders, as well as the other state ledgers.
 
 Cursors remain opaque nonnegative integers, now identifying the v2 generation and committed byte offset. Retained v2 cursors resume precisely. Legacy byte-only and stopgap-generation cursors, future offsets and offsets splitting a committed line conservatively replay current actionable and finished jobs with an explanation and a new cursor when a result is returned; waits still apply the [wake policy](#what-needs-the-owner). This is a one-time cutover replay, not a new wake policy. First-use `needs` never migrates: legacy or staged files without a marker produce error code 1 and an instruction to run `show` or normal `scan` once. A genuinely empty root returns no items and cursor 0 without writing; a waiting watcher observes the first published generation normally.
 
-Each job has `state/jobs/<id>/`, a separate workspace, copied inputs, a
-`WORKFLOW.md`, and execution evidence. Code jobs use a git worktree on their own
-branch; see [Code job work folders](#code-job-work-folders). This command does not merge or
-apply results.
+Each job has `state/jobs/<id>/`, a separate workspace, copied inputs, a `WORKFLOW.md`, and execution evidence. Code jobs use a git worktree on their own branch; see [Code job work folders](#code-job-work-folders). Results are not merged or installed unless [automatic landing](#automatic-landing) was explicitly enabled at submission.
 
 #### Review-only jobs
 
@@ -417,6 +401,57 @@ the review step, in the target directory itself.
 `predecessors`, `expected_wait_seconds`, `approval_required`, and `max_reviews` work as for other jobs.
 
 The verdict is the result. A parsed `PASS` or `FAIL` is recorded and delivered; a `FAIL` does not start a fix, because there is nothing to fix. An answer with no acceptable verdict line, or a target that changed during the review, uses its review attempt and reviews again, up to `max_reviews` attempts in all; after that the job stops for user judgment (`review_exhausted`). The review record and job state are in `show <id>`.
+
+### Automatic landing
+
+The optional submission boolean `land` defaults to `false`, including for historical jobs. Nonlanding jobs retain local-result delivery and need neither `gh` nor an install hook. `land: true` requires a result-building `review: code` job, exactly one complete-result `public_text` declaration and nonempty `approval_source` and `approval_scope`. It is the caller's assertion that the recorded authority covers publication, merge and any enabled install hook, not authentication of a conversation or keyword matching of natural-language scope. Neither worker output nor an accepted PASS grants that authority. Existing `approval_required` gates still apply; editing live files cannot make a historical job landable.
+
+The checked `text_contract: 2` marker is generated after work/check/review, not accepted as a caller `public_text` key. Landing shares delivery's acceptance checks: accepted PASS, clean code fingerprint, declared-output digest, basis and guideline hashes, unchanged checked texts, snapshot digest and accepted check identity/log hash. Only reviewed snapshot publication bytes are used.
+
+#### Host install command
+
+The optional host `jobs-config.json` key `install_command` defaults to `null` (disabled). When enabled it is a nonempty argv list of nonempty strings, not a shell command or per-job executable override. Include `{sha}` for the full observed squash commit S; optional `{target}` expands to the persisted absolute repository target, which is also the working directory. For example, a host-trusted wrapper can be configured as:
+
+```json
+"install_command": ["approved-installer", "--sha", "{sha}", "--target", "{target}"]
+```
+
+A recognizable pinned source is an argv element that is a `git+https` or `git+ssh` URL ending `@{sha}`, or an HTTPS GitHub archive URL containing `{sha}`. Its host, owner and repository must match the transaction origin and its expanded pin must be S, otherwise execution is rejected. Any other argv is a host-trusted wrapper: its contract is to verify the target's origin and exact S before installation, never install a mutable checkout. Selection follows argv shape, not a mode flag. taskwatch does not prove wrapper correctness or infer it from the executable's name.
+
+The hook identity, expanded argv and hash are frozen for the transaction, including when the hook is disabled. A changed or disabled host configuration parks as `land_hook_changed`; resume cannot adopt a replacement. Restore the frozen configuration or cancel. Execution uses the job environment, noninteractive stdin, captured exit/log and an independent 300 second timeout, with no implicit shell. This is separate from L5's CI deadline.
+
+#### Lifecycle L1 through L8
+
+The deterministic `land` step runs in the existing transient service, not a model, and emits evidence heartbeats every 15 seconds. R is the accepted result commit, T its tree, B the accepted base, M freshly fetched `origin/<default branch>`, H the publication head and S the observed squash commit.
+
+1. **L1, accepted identity.** Require the shared freshness evidence, contract-2 snapshot and one entire-result unit whose head/tree is R/T. Before publication stale evidence follows existing check/review recovery; after publication it parks as `land_review_stale`, preserving identity.
+2. **L2, base.** Require a successful fetch and M=B, or M exactly equal to a declared same-repository predecessor's successfully landed S with tree(B)=tree(S), verified final tree and successful installation when configured. Otherwise park as `land_base_moved`; there is no stale-fetch fallback, cherry-pick, rebase or automatic conflict resolution.
+3. **L3, publication head.** Construct H with `git commit-tree T -p M`, using the reviewed title, one blank line and reviewed `commit.txt`. Verify its parent/tree and persist H plus commit metadata before pushing the deterministic `<job.branch>-land` branch. Retries reuse that object, not a new timestamp. An absent remote ref permits a normal same-H push, equal H resumes, and foreign H parks as `land_head_changed`; no blind force push.
+4. **L4, pull request.** Search all PR states by exact repository/head/base before creating. Reuse only one matching H, title, body and deterministic evidence footer; creation uses `--body-file`. Duplicate, edited or CLOSED-unmerged PRs park as `land_pr_mismatch`; ambiguous lookup parks as `land_interrupted` without creation. Persist the PR number/URL, never generate replacement prose or a replacement PR.
+5. **L5, CI.** Persist `started_at` and absolute `deadline=started_at+rpc_timeout` at the first observation after PR creation or reconciliation. Query registration immediately and again at 15 seconds if absent; missing registration after grace parks. Poll registered pending work every 20 seconds within that deadline. Require all registered checks/status contexts and all PR CI workflow runs for H, including optional workflows, to finish successfully, with at least one successful CI workflow run. No required checks is acceptable only with nonempty successful CI; missing, stale, empty, skipped-only, cancelled or failed evidence is not green.
+6. **L6, merge.** Immediately fetch/recheck M, exact PR H/base/text, mergeability, supported capabilities and green CI identity. Validate the final subject including deterministic ` (#n)` suffix under existing message rules, without rewriting it. Request head-pinned direct squash with reviewed snapshot commit body; only observed MERGED with full S is success. Refusal parks as `land_merge_failed` or a specific mismatch. Exit zero, a queue, auto-merge or unknown outcome is not success; no `--admin` or protection changes.
+7. **L7, final tree.** Persist discovered S before fetching and verifying tree(S)=T, current `origin/<default branch>` contains S and its tree is T; record that observed main SHA too. A mismatch parks as `land_tree_mismatch` with the merge visibly retained, no installation, rollback or replacement PR.
+8. **L8, install and deliver.** After L7, run only the approved frozen host hook or proceed if absent. Successful installation or no hook reaches `deliver_pending`, then the existing card/send-once/unknown-delivery policy. Normal cleanup follows delivery and never force-deletes dirty or unintegrated worktrees or job records.
+
+The CI expected set is protection/ruleset required checks plus everything registered for H after registration grace, using the latest attempt for each run. A workflow suppressed by path or other filters that never registers cannot be discovered through this evidence; landing does not claim to prove such a workflow ran.
+
+One rerun round freezes all then-failed H Actions run IDs. Each ID's intent is saved before `gh run rerun --failed` and spends that ID's budget even if acknowledgement is lost. Recovery may issue unissued members of that frozen round, never add IDs or repeat issued intents. A frozen run failing again, a new failure after the round or deadline expiry parks as `land_ci_failed`. Automatic restart cannot reset the deadline. A distinct explicit owner resume from that stop may open a fresh observation window/grace only after revalidating H/base/text, retaining the same transaction/PR and consumed rerun budgets. The CI window spans L5 only and cannot block an explicitly resumed install retry after merge.
+
+Head pinning does not atomically pin the merge base: an external writer can move the default branch after L6. L7 detects a wrong final tree and prevents installation but cannot undo a completed merge. Repository serialization protects only taskwatch and cooperating processes, not arbitrary external writers.
+
+#### Reconciliation, stops and restart
+
+`land_state`, default empty and frozen with the job snapshot, retains phase/transaction identity, R/T/B/M/H, repository/default branch, review/check/text/snapshot digests, deterministic branch and operation intent, PR identity, CI IDs/deadline/rerun budgets, S/observed main, frozen hook/argv hash/outcome/log and last error. Writes use existing attempt/stage CAS, `Jobs.save`, state lock and Store prepare/recover; the v2 current snapshot remains authoritative, with compact projection events rather than a second landing ledger. Storage recovery never performs external actions.
+
+Every external write has a durable intent before invocation and an observed outcome afterward. Recovery queries the exact remote H and saved/discovered PR. OPEN requires all guards again; MERGED resumes L7, never a second merge; CLOSED-unmerged stops. After a saved create intent, even a successful all-state lookup with zero matches remains unknown and parks as `land_interrupted`. A distinct explicit owner resume repeats the lookup and, only if still zero, authorizes one create by atomically consuming that resume entry's token with the next create intent. Automatic restart or replay of that entry grants no new create.
+
+Install outcomes are `not_started`, `started`, `succeeded`, `failed` and `unknown`. Persist `started` before invocation; nonzero exit is `failed`, interruption or timeout is `unknown`, and confirmed exit zero is `succeeded`. Failed/unknown outcomes park as `land_install_failed` with the concrete outcome and never automatically replay. Each distinct explicit owner resume entry authorizes one retry of the frozen argv after rechecking S/T/current main; its token is persisted and consumed atomically with `started` under attempt/stage CAS. Restart or replay of the same entry cannot grant another retry; a later distinct owner resume can. Success skips the hook even if delivery fails later.
+
+Landing stops use `user_wait` with `resume_stage: land` and retain their facts for `show`/`needs`; use existing `resume` or `cancel`, not a generic retry option. Resume does not approve changed external input or publication content: those require existing check/review. After merge, freshness failure retains S and parks, never requeues a new publication, merge or install. Unknown result delivery still requires explicit acceptance of duplicate-message risk before resending the card.
+
+L1 through installation is serialized by the canonical real git common directory, not target spelling: scheduler reservations and an inherited nonblocking lock there cover aliases, linked worktrees, orphan subprocesses and other taskwatch roots. Reservations survive `user_wait` while an old unit may live and are released only after confirmed death, never an ambiguous systemd result. Stale/cancelled attempts abort child process groups. Long git/forge/CI/hook operations run outside the global state lock; independent work/check/review worktrees remain parallel.
+
+The original `@receipt` relationship is durable. At successor workspace creation a landed predecessor must satisfy existing downstream readiness plus recorded merge, verified S/tree and installation success when configured; the immutable effective base resolves to S even after its branch is cleaned. Nonlanded predecessors keep branch-based behavior. Multiple predecessors order jobs, not automatically combine branches.
 
 ### Timer entry point
 
@@ -509,10 +544,7 @@ read only and exits `2` for an unknown job. The facts are written by the runner 
 record: kind, verdict, review rounds, check result, result location, changed files, open finding
 counts and time. Why, what changed, decisions and pointers come from the worker's `brief.md`.
 
-Before sending, the result fingerprint, declared output content digest, review
-basis and the text fingerprint of each unit must match the accepted PASS. The output digest also covers Git-ignored files.
-Changed, missing, or unreadable evidence returns to `check`, spending the existing
-recovery budget; exhaustion stops at `user_wait/result_unstable`.
+Before sending, the result fingerprint, declared output content digest including Git-ignored files, review basis and checked text evidence must match the accepted PASS, using the same acceptance policy as landing. Changed, missing, or unreadable evidence normally returns to `check`, spending the existing recovery budget; exhaustion stops at `user_wait/result_unstable`. After publication, stale evidence parks as `land_review_stale`; after a recorded merge it retains S and never requeues into another publication, merge or install.
 
 After scheduling work and result deliveries, each scan sends one short stop
 notice for every new `user_wait` or `approval_wait` entry through the same
@@ -559,7 +591,7 @@ Publishing is a gate, not a kind. The common chain is research, a gate, design, 
 
 The submit rule for a caller that sends ordered units under one approval:
 
-1. Submit the units in order, each with the receipt key `<approval message>:<n>` and `predecessors` naming the unit before it by its receipt key (or its id). Because receipt keys are known before submit, the whole chain can be submitted in one pass; the stored record keeps the resolved ids. The message of the successor lists each predecessor's result, so the prompt needs no pasted path; for a stacked code unit set `base` to `@<predecessor receipt key>` (or `<branch_prefix><first 8 characters of its id>`). Units with no order between them are submitted together without `predecessors`.
+1. Submit the units in order, each with the receipt key `<approval message>:<n>` and `predecessors` naming the unit before it by its receipt key (or its id). Receipt keys permit submitting a ready chain in one pass; the stored record keeps resolved ids. A successor lists each predecessor's result, so no pasted path is needed. For a stacked code unit prefer `base: "@<predecessor receipt key>"`: it preserves a landed predecessor's verified immutable S even after branch cleanup, while a nonlanded predecessor still supplies its branch. Multiple predecessors order jobs, not combine branches. Units without ordering can be submitted together without `predecessors`; [Automatic landing](#automatic-landing) owns the extra landed-readiness requirements.
 2. A unit that needs the owner's decision on an earlier result (a design before its implementation) carries `approval_required: true`. It stays queued until every predecessor is `done`, then waits in `approval_wait` with the brief of the predecessor ready. Show the owner the output of `taskwatch brief <predecessor>`, then pass the owner's reply to `approve --reason`, preceded for picks by one line `PICKS: ok` or `PICKS: <id>=<key|text> ...`. The reply is appended to the approval source, so the worker and the reviewer see it as the owner's decision.
 3. A unit whose `spec`, `intent` or `inputs` must be a predecessor's output cannot be submitted early: those files are copied and hashed at submit. Submit it after the output exists.
 4. A cancelled or stopped predecessor leaves its successors queued; `needs` lists them as blocked. Cancel or resubmit them.
@@ -589,20 +621,13 @@ terminal(
 )
 ```
 
-The list is a hint; re-read the state with `show` before acting. See [Job records](#job-records) for storage, recovery and cursor cutover. `taskwatch --root <root> show [<id>]` prints the job record (or list of records) with one derived key, `"activity"` (not persisted and not in `needs`): for a job in `work`, `fix`, `check` or `review`, `"<stage> <m>m; last progress <m>m ago: <last non-empty progress line>"` (from `started_at`, `last_progress_at` and the progress file in the job folder, collapsed to at most 120 characters, or without the trailing progress text when empty); for all other stages, `null`. An example skill for this loop is in [`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
+The list is a hint; re-read the state with `show` before acting. See [Job records](#job-records) for storage, recovery and cursor cutover. `taskwatch --root <root> show [<id>]` prints the job record (or list of records) with one derived key, `"activity"` (not persisted and not in `needs`): for a job in `work`, `fix`, `check`, `review` or `land`, `"<stage> <m>m; last progress <m>m ago: <last non-empty progress line>"` (from `started_at`, `last_progress_at` and the progress file in the job folder, collapsed to at most 120 characters, or without the trailing progress text when empty); for all other stages, `null`. Landing stops expose the concrete reason and retained PR, merge and install facts; inspect `land_state` with `show` before resuming or cancelling. An example skill for this loop is in [`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
 
 ### Recovery and decisions
 
-The job retains its parallel slot through work, checks, review, and fixes.
-A job that works in a shared folder (a non-code job, or a review-only job) locks its target
-across these stages; a code job that builds a result does not, because its worktree is its
-own (see [Code job work folders](#code-job-work-folders)). A blocked predecessor leaves
-the successor queued. An unrelated target can still start.
-Dead or reboot-interrupted runs resume only after the old service is known
-to have stopped. An unknown service outcome requires user judgment.
-Unchanged progress and output content first produces a stall suspicion;
-an unchanged scan at least 300 seconds later stops the service and recovers.
-Log growth alone is not progress. Expected waits delay stall recovery.
+The job retains its parallel slot through work, checks, review, fixes and landing. A job that works in a shared folder (a non-code job, or a review-only job) locks its target across these stages; a result-building code job has an independent worktree, but landing additionally reserves its canonical repository through install (see [Automatic landing](#automatic-landing)). A blocked predecessor leaves the successor queued. An unrelated target can still start.
+
+Dead or reboot-interrupted runs resume only after the old service is known to have stopped. An unknown service outcome requires user judgment. Unchanged progress and output content first produces a stall suspicion; an unchanged scan at least 300 seconds later stops the service and recovers. Log growth alone is not progress. Expected waits delay stall recovery.
 
 When a run is found dead and the filesystem of the job folder or of `TMPDIR` (the configured
 `env` value, else the system temporary folder) has less than 256 MiB free, the scan does not
@@ -629,7 +654,7 @@ taskwatch --root <root> resume <id> --reason "Approved a new fix cycle"
 taskwatch --root <root> cancel <id> --reason "User cancelled"
 ```
 
-Wait and cancel fence late output immediately. The scanner confirms service termination before reusing the slot or target. Approval resumes the saved step; an explicit user resume opens a new review cycle and a new recovery budget. Commands do not send messages themselves; scans send results and stop notices. The runner does not reconcile an external outcome.
+Wait and cancel fence late output immediately. The scanner confirms service termination before reusing the slot, target or landing repository reservation. Approval resumes the saved step; an explicit user resume opens a new review cycle and a new recovery budget. Commands do not send messages themselves; scans send results and stop notices. Landing reconciles only its persisted exact external identities as described in [Automatic landing](#automatic-landing); arbitrary worker actions and unknown result deliveries are not reconciled.
 
 `approve --reason` appends `Gate <date>: <reason>` to the approval source; the
 original approval stays and the worker and reviewer see both. `approve --scope`
@@ -637,8 +662,7 @@ records a replacement approved scope. Omit it to preserve the original scope,
 such as an initial approval wait. Do not use a broader scope than the user
 actually approved.
 
-After checks and review pass, the stage is `deliver_pending`, not `done`; see
-[Delivery](#delivery).
+After checks and review pass, an eligible job with `land: true` enters `land`; all others enter `deliver_pending`. Successful verified landing and install, or no configured hook, then reaches `deliver_pending`, not `done`; see [Delivery](#delivery).
 
 ### Rate limits
 
