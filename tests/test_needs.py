@@ -636,3 +636,28 @@ def test_completion_symlink_pointers(ledger, cleaned, target, extra, expected):
     )
     assert code == expected
     assert ("cursor:" not in text) if expected == 3 else (ident in text)
+
+
+def test_job_folder_evidence_under_a_result_file_name_stays_quiet(ledger):
+    cursor = ledger.size()
+    ident, _ = committed_completion(ledger, "out.txt/evidence.txt:1")
+    job = ledger.get(ident)
+    folder = ledger.jobs.folder(job)
+    (folder / "out.txt").mkdir()
+    (folder / "out.txt" / "evidence.txt").write_text("Synthetic record\n", encoding="utf-8")
+    ledger.set(ident, **settle(job, dict(os.environ), {job.target}))
+    now = [0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    code, text = needs(
+        ledger.root,
+        cursor=cursor,
+        wait=True,
+        timeout=2,
+        interval=1,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    assert code == 3 and "cursor:" not in text

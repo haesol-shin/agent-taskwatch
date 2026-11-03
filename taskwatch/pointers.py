@@ -60,6 +60,9 @@ def _commit_content(repo: Path, sha: str, name: PurePosixPath) -> bytes | None:
             resolved.append(part)
         elif kind == b"blob" and not pending:
             return _git_ok(repo, ["cat-file", "blob", oid.decode()])
+        elif not hops:
+            # A plain path that does not name a file in the commit may be job-folder evidence.
+            return None
         else:
             raise ValueError("pointer does not name a file")
     raise ValueError("pointer does not name a file")
