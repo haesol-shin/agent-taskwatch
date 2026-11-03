@@ -53,7 +53,7 @@ from .jobs import (
     JobState,
     progress_fingerprint,
 )
-from .kinds import kind_label
+from .kinds import declares_choices, kind_label
 from .rate_limit import RateLimit
 from .review_docs import docs_dir, profile_names
 
@@ -1048,7 +1048,7 @@ def _brief_problems(jobs: Jobs, job: JobState, workspace: Path, folder: Path) ->
     roots = (workspace, folder, Path(job.target))
     problems = []
     if choices.is_design(job):
-        if choices.FILE not in job.outputs:
+        if not declares_choices(job.outputs):
             problems.append(f"{choices.FILE} must be listed in outputs so the review covers it")
         problems += choices.problems(
             workspace,

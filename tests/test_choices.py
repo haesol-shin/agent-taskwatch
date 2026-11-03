@@ -148,7 +148,9 @@ def _payload(tmp_path: Path, receipt: str, **extra) -> dict:
 
 def _jobs(tmp_path: Path):
     jobs = Jobs(tmp_path / "root")
-    design = jobs.submit(_payload(tmp_path, "r1", review="design"), 1000.0)
+    design = jobs.submit(
+        _payload(tmp_path, "r1", review="design", outputs=["design.md", "choices.json"]), 1000.0
+    )
     work = tmp_path / "design-work"
     work.mkdir()
     (work / "choices.json").write_text(json.dumps(VALID), encoding="utf-8")

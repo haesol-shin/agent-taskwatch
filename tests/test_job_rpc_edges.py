@@ -26,6 +26,56 @@ def test_chunk_sequence_cut_off_by_peer_shutdown_fails_the_step(tmp_path):
             rpc.finish()
 
 
+def test_startup_error_uses_only_current_stderr_and_reaps_peer(tmp_path):
+    stderr = tmp_path / "stderr"
+    stderr.write_text("stale 429 retry-after-ms=90000\n")
+    peer = (
+        "import sys; "
+        "print('Unknown tool: ast_grep. Valid tools: read, task', file=sys.stderr); "
+        "print('Authorization: Bearer synthetic-secret', file=sys.stderr); sys.exit(7)"
+    )
+    rpc = RpcClient([sys.executable, "-c", peer], tmp_path, stderr_path=stderr)
+    with pytest.raises(RpcError) as info:
+        rpc.start(5)
+    text = str(info.value)
+    assert "ast_grep" in text and "read, task" in text and "7" in text
+    assert "stale" not in text and "synthetic-secret" not in text
+    assert info.value.rate_limit is None
+    assert rpc.close() == 7
+
+
+@pytest.mark.parametrize("kind", ["malformed", "timeout", "exit"])
+def test_startup_failures_keep_cause_and_bound_diagnostic(tmp_path, kind):
+    action = {
+        "malformed": "print('not json', flush=True); time.sleep(60)",
+        "timeout": "time.sleep(60)",
+        "exit": "sys.exit(9)",
+    }[kind]
+    peer = (
+        "import sys,time; sys.stderr.write('x' * 1000000 + '\\ncurrent failure\\n'); "
+        f"sys.stderr.flush(); {action}"
+    )
+    rpc = RpcClient([sys.executable, "-c", peer], tmp_path, stderr_path=tmp_path / "stderr")
+    with pytest.raises(RpcError) as info:
+        rpc.start(0.5)
+    cause = {"malformed": "bad rpc line", "timeout": "timed out", "exit": "code"}[kind]
+    assert cause in str(info.value)
+    assert "current failure" in str(info.value)
+    assert len(str(info.value).encode()) < 17000
+    assert rpc.close() is not None
+
+
+def test_a_credential_split_by_the_excerpt_boundary_is_not_exposed(tmp_path):
+    peer = (
+        "import sys; sys.stderr.write('x' * 16340 + ' Authorization: Bearer ' + 'a' * 40 + '\\n');"
+        " sys.exit(4)"
+    )
+    rpc = RpcClient([sys.executable, "-c", peer], tmp_path, stderr_path=tmp_path / "stderr")
+    with pytest.raises(RpcError) as info:
+        rpc.start(5)
+    assert "a" * 8 not in str(info.value)
+
+
 def ended(status: str, message: str) -> dict:
     return {"agentInvoked": True, "status": status, "error": {"message": message}}
 

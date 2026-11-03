@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def submit(tmp_path: Path, spec: str, review: str = "code"):
     data = {**payload(tmp_path), "review": review}
+    if review == "design":
+        data["outputs"] = ["design.md", "choices.json"]
     Path(data["spec"]).write_text(spec, encoding="utf-8")
     return Jobs(tmp_path / "root").submit(data, 10)
 

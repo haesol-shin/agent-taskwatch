@@ -13,12 +13,12 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .jobs import Jobs, JobState
-from .kinds import kind_label
+from .kinds import CHOICES_FILE as FILE
+from .kinds import builds_design
 from .pointers import pointer_problem, pointers
 from .review_docs import docs_dir
 from .review_print import MAX_ERRORS, validate
 
-FILE = "choices.json"
 DEFAULTS_FILE = "defaults.json"
 DEFAULTS_SCHEMA = "defaults.schema.json"
 MAX_PICKS = 5
@@ -32,7 +32,7 @@ _HEADING = re.compile(r"^(#{1,6})\s")
 
 
 def is_design(job: JobState) -> bool:
-    return kind_label(job) == "design"
+    return builds_design(job.review, job.review_target)
 
 
 def load(path: Path) -> tuple[dict | None, list[str]]:

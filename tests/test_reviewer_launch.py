@@ -2,11 +2,14 @@
 
 import json
 import os
+import selectors
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -142,14 +145,294 @@ def test_editing_a_guideline_changes_the_next_command_and_files(tmp_path):
 # --- the program ----------------------------------------------------------------------------
 
 
-def test_main_without_print_command_replaces_itself_with_omp(
-    tmp_path, guidelines, omp, monkeypatch
+def launch_fixture(tmp_path, guidelines, source, agent_text=AGENT):
+    peer = tmp_path / "fake-omp"
+    peer.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
+    peer.chmod(0o700)
+    env = dict(
+        os.environ,
+        HOME=str(tmp_path / "home"),
+        TMPDIR=str(tmp_path),
+        PI_CODING_AGENT_DIR=str(tmp_path / "config"),
+        PYTHONPATH=str(Path(reviewer_launch.__file__).resolve().parent.parent),
+    )
+    argv = [
+        sys.executable,
+        "-m",
+        "taskwatch.reviewer_launch",
+        "--agent",
+        str(agent_file(tmp_path, agent_text)),
+        "--guidelines",
+        str(guidelines),
+        "--omp",
+        str(peer),
+        "--work-dir",
+        str(tmp_path / "work"),
+    ]
+    return argv, env
+
+
+def test_supervision_preserves_binary_stdout_and_drains_large_stderr(tmp_path, guidelines):
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, sys\n"
+        "for _ in range(256):\n"
+        "    os.write(2, b'e' * 16384)\n"
+        "    os.write(1, bytes(range(256)) * 64)\n"
+        "sys.exit(0)\n",
+    )
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=15)
+    assert result.returncode == 0
+    assert result.stdout == bytes(range(256)) * (64 * 256)
+    assert result.stderr == b"e" * (16384 * 256)
+
+
+@pytest.mark.parametrize("tool", ["ast_grep", "unknown_review_tool", "task"])
+def test_required_tool_rejection_names_agent_effective_tools_and_original_diagnostic(
+    tmp_path, guidelines, tool
 ):
-    seen = []
-    monkeypatch.setattr(os, "execvp", lambda file, argv: seen.append((file, argv)))
-    args = ["--agent", str(agent_file(tmp_path)), "--guidelines", str(guidelines), "--omp", omp]
-    assert main([*args, "--work-dir", str(tmp_path / "work"), "-p", "go"]) == 0
-    assert seen[0][0] == omp and seen[0][1][1:3] == ["-p", "go"]
+    diagnostic = f"Unknown tool: {tool}. Valid tools: read, grep"
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        f"import sys\nsys.stderr.write({diagnostic!r} + '\\n')\nsys.exit(23)\n",
+        AGENT.replace("tools: read, find, grep, bash", f"tools: read, {tool}"),
+    )
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+    assert result.returncode == 23 and result.stdout == b""
+    error = result.stderr.decode()
+    assert diagnostic in error
+    assert f"--agent {tmp_path / 'reviewer.md'}" in error
+    assert f"effective required tools: read,{tool}" in error
+    assert "task" in error.split("effective required tools:", 1)[1].split(".", 1)[0]
+    assert "Enable the named tool" in error and "agent definition" in error
+
+
+def test_streams_are_visible_before_peer_exit_and_stdin_remains_connected(tmp_path, guidelines):
+    frame = b'{"type":"ready"}\r\n'
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, sys\n"
+        f"os.write(1, {frame!r})\n"
+        "os.write(2, b'startup is running\\n')\n"
+        "assert sys.stdin.buffer.readline() == b'continue\\n'\n",
+    )
+    proc = subprocess.Popen(
+        argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        chunks = {"stdout": b"", "stderr": b""}
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+            deadline = time.monotonic() + 10
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, "output was held until peer exit"
+                for key, _ in selector.select(remaining):
+                    chunks[key.data] += os.read(key.fd, 4096)
+                    selector.unregister(key.fileobj)
+        assert proc.poll() is None
+        assert chunks == {"stdout": frame, "stderr": b"startup is running\n"}
+        proc.communicate(b"continue\n", timeout=10)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.communicate(timeout=10)
+
+
+def test_tool_context_is_bounded_and_survives_large_shutdown_stderr(tmp_path, guidelines):
+    diagnostic = b"Unknown tool: ast_grep. Valid tools: read, task\n"
+    padding_size = 2 * 1024 * 1024
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, sys\n"
+        f"os.write(2, {diagnostic!r})\n"
+        f"for _ in range({padding_size // 16384}): os.write(2, b'x' * 16384)\n"
+        "sys.exit(23)\n",
+        AGENT.replace("tools: read, find, grep, bash", "tools: read, ast_grep"),
+    )
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=15)
+    original = diagnostic + b"x" * padding_size
+    assert result.returncode == 23 and result.stderr.startswith(original)
+    context = result.stderr[len(original) :]
+    assert diagnostic in context
+    assert b"effective required tools: read,ast_grep,task" in context
+    assert len(context) < 12 * 1024
+    assert diagnostic in result.stderr[-16 * 1024 :]
+
+
+def test_non_tool_failure_is_not_reclassified_or_annotated(tmp_path, guidelines):
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, sys\nos.write(2, b'configuration is unreadable\\n')\nsys.exit(37)\n",
+    )
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+    assert result.returncode == 37
+    assert result.stderr == b"configuration is unreadable\n"
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
+def test_child_signal_remains_signal_termination(tmp_path, guidelines, signum):
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        f"import os\nos.kill(os.getpid(), {signum})\n",
+    )
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+    assert result.returncode == -signum
+
+
+def wait_for_file(path, proc):
+    until = time.monotonic() + 10
+    while time.monotonic() < until:
+        if path.exists():
+            return
+        assert proc.poll() is None, "launcher exited before the peer was ready"
+        time.sleep(0.01)
+    pytest.fail("synthetic peer did not become ready")
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_cancellation_stops_and_reaps_signal_ignoring_descendants(tmp_path, guidelines, signum):
+    ready = tmp_path / "ready"
+    forwarded = tmp_path / "forwarded"
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, signal, time\nfrom pathlib import Path\n"
+        f"forwarded = Path({str(forwarded)!r})\n"
+        "def received(signum, frame):\n"
+        "    forwarded.write_text(str(signum))\n"
+        "signal.signal(signal.SIGTERM, received)\n"
+        "signal.signal(signal.SIGINT, received)\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    while True: time.sleep(1)\n"
+        f"Path({str(ready)!r}).write_text(f'{{os.getpid()}} {{child}}')\n"
+        "while True: time.sleep(1)\n",
+    )
+    proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        wait_for_file(ready, proc)
+        pids = [int(pid) for pid in ready.read_text().split()]
+        proc.send_signal(signum)
+        proc.communicate(timeout=10)
+        assert proc.returncode == -signum
+        assert int(forwarded.read_text()) == signum
+        for pid in pids:
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            proc.communicate(timeout=10)
+
+
+def test_a_runtime_tool_error_is_not_a_startup_rejection(tmp_path, guidelines):
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, sys\n"
+        "os.write(2, b'read tool: file not found\\nInvalid tool call arguments\\n')\n"
+        "sys.exit(3)\n",
+    )
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+    assert result.returncode == 3
+    assert result.stderr == b"read tool: file not found\nInvalid tool call arguments\n"
+
+
+def test_a_descendant_outside_the_group_cannot_hold_the_launcher(tmp_path, guidelines):
+    pid_file = tmp_path / "escaped"
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, time\nfrom pathlib import Path\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        f"    Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        f"while not Path({str(pid_file)!r}).exists(): time.sleep(0.01)\n"
+        "os._exit(5)\n",
+    )
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10
+        )
+        assert result.returncode == 5 and time.monotonic() - started < 8
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_killing_the_launcher_does_not_leave_omp_running(tmp_path, guidelines):
+    ready = tmp_path / "ready"
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, time\nfrom pathlib import Path\n"
+        f"Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+    )
+    proc = subprocess.Popen(argv, env=env)
+    try:
+        wait_for_file(ready, proc)
+        pid = int(ready.read_text())
+        proc.kill()
+        proc.wait(timeout=10)
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        pytest.fail("omp outlived the launcher")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_normal_exit_also_stops_and_reaps_leftover_descendants(tmp_path, guidelines):
+    pid_file = tmp_path / "descendant"
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        "import os, time\nfrom pathlib import Path\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    while True: time.sleep(1)\n"
+        f"Path({str(pid_file)!r}).write_text(str(child))\n"
+        "os._exit(19)\n",
+    )
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+    assert result.returncode == 19
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
+def test_print_command_does_not_launch_peer(tmp_path, guidelines):
+    marker = tmp_path / "launched"
+    argv, env = launch_fixture(
+        tmp_path,
+        guidelines,
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('launched')\n",
+    )
+    result = subprocess.run([*argv, "--print-command"], env=env, capture_output=True, timeout=10)
+    assert result.returncode == 0 and result.stderr == b""
+    assert shlex.split(result.stdout.decode())[0] == str(tmp_path / "fake-omp")
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -163,7 +446,7 @@ def test_main_without_print_command_replaces_itself_with_omp(
 def test_bad_input_stops_before_omp_runs(
     tmp_path, guidelines, omp, capsys, monkeypatch, extra, message
 ):
-    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("omp must not start"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: pytest.fail("omp must not start"))
     args = ["--agent", str(agent_file(tmp_path)), "--guidelines", str(guidelines), "--omp", omp]
     args += [part.replace("{tmp}", str(tmp_path)) for part in extra]
     assert main(args) == 1
@@ -288,7 +571,7 @@ console.log(JSON.stringify([
 def test_options_that_would_widen_the_review_are_refused(
     tmp_path, guidelines, omp, capsys, monkeypatch, extra
 ):
-    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("omp must not start"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: pytest.fail("omp must not start"))
     args = ["--agent", str(agent_file(tmp_path)), "--guidelines", str(guidelines), "--omp", omp]
     assert main([*args, "--work-dir", str(tmp_path / "w"), *extra]) == 1
     assert "would widen" in capsys.readouterr().err

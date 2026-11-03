@@ -26,6 +26,12 @@ The files are written under a name that holds their content hash (default `$TMPD
 
 Enforcement. `--tools` alone does not limit a command-line session: omp still adds custom tools, MCP servers and plugin agents it discovers, and listing the places to look is never complete. So the launcher generates `enforce.mjs` next to the prompt and loads it with `--trusted-extension`, which makes it the only extension. Inside omp it blocks every call of a tool outside the list (`tool_call`, main session only) and every spawn of an agent outside `spawns` (`before_subagent_spawn`), whatever source the tool or agent came from. A blocked call returns `tool X is not in the reviewer's tool list` or `agent X is not in the reviewer's spawns` to the model. What it does not cover: the tools of sub-agents you allow (they follow their own definitions), and a tool whose name equals an allowed name.
 
+### Unavailable required tools
+
+omp's effective tool registry is authoritative. When startup rejects a selected tool, the launcher preserves omp's diagnostic, including the offending name and valid tools, and adds the agent-definition path, effective required tools (including spawn-injected `task`) and correction advice. Correct the definition or deliberately enable the required capability in your own omp configuration; the launcher never filters tools or changes settings. See this section when a launch fails before a prompt.
+
+The launcher supervises argv execution without a shell, leaves stdout bytes unchanged, streams stderr continuously and keeps only bounded diagnostic context. It starts omp in its own session for print and RPC runs, so it is not meant for an interactive terminal session. Normal exit status and signal termination are preserved; cancellation is forwarded to the child group, descendants are stopped and reaped, and omp is killed if the launcher itself is killed. At RPC startup failure, taskwatch stops the peer before recovery and records a bounded, credential-masked excerpt from this attempt's stderr, not an earlier attempt. Non-tool errors retain their cause and are not classified as model rate limits merely because stderr mentions 429.
+
 ## Through taskwatch
 
 Set the review step's command in `jobs-config.json`:
@@ -69,6 +75,6 @@ python3 -m taskwatch.reviewer_launch \
   -p "Round 1. Review commit <sha> of the repository in the current directory against the intent in intent.md and the spec in spec.md."
 ```
 
-`--print-command` prints the `omp` command instead of running it, so you can read it or run `omp` yourself. `--guidelines` defaults to the folder installed with the package.
+`--print-command` prints the `omp` command instead of running it, so you can read it or run `omp` yourself. It is not proof that the selected tools are available; see [Unavailable required tools](#unavailable-required-tools). `--guidelines` defaults to the folder installed with the package.
 
 Both paths receive the same guideline text. They differ only in the launch layer and in the message.
