@@ -158,17 +158,3 @@ def test_old_record_naming_taskwatch_paths_still_loads_and_resolves_in_the_folde
     env.seed({"out.txt": "ok\n", "brief.md": GOOD_FILES["brief.md"]})
     assert env.run("check") == 0
     assert env.get().checks[-1]["problems"] == ()
-
-
-def test_write_rules_allow_the_job_records_outside_the_workspace(tmp_path, monkeypatch):
-    env = Env(tmp_path, monkeypatch)
-    env.scenario([work_turn()])
-    assert env.run("work") == 0
-    prompt = env.prompts()[0]
-    assert "outside the workspace (except this job's progress, checklist and brief files" in prompt
-    workflow = (env.folder() / "WORKFLOW.md").read_text(encoding="utf-8")
-    assert "Work only in the workspace" in workflow
-    assert "Exception: the progress, checklist and brief files named below" in workflow
-    assert (
-        "outside the workspace (except this job's progress, checklist and brief files" in workflow
-    )

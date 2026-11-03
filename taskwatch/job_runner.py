@@ -291,20 +291,47 @@ take no further action:
 The user can then approve; the job resumes from its recorded stage."""
 
 
+def _worker_paths(ctx: Ctx) -> tuple[Path, ...]:
+    if ctx.job.review_target is not None:
+        return ()
+    return tuple(
+        ctx.folder / name
+        for name in (
+            ctx.job.progress,
+            ctx.job.checklist,
+            "brief.md",
+            job_findings.FINDINGS_FILE,
+            job_findings.NOTE_FILE,
+        )
+    ) + tuple(
+        job_text.unit_file(ctx.folder, unit["id"], name)
+        for unit in ctx.job.public_text
+        for name in UNIT_FILES
+    )
+
+
 def _approval_text(ctx: Ctx) -> str:
     job = ctx.job
-    # The job records sit in the job folder, so the write rule must name them as allowed.
-    exception = (
-        ""
-        if job.review_target is not None
-        else " (except this job's progress, checklist and brief files, named in the workflow)"
-    )
-    return _APPROVAL_RULES.format(
+    paths = _worker_paths(ctx)
+    exception = " (except the exact worker-owned files listed below)" if paths else ""
+    text = _APPROVAL_RULES.format(
         source=job.approval_source,
         scope=job.approval_scope,
         command=_wait_command(ctx),
         exception=exception,
     )
+    if paths:
+        text += "\n\nWritable worker-owned files (outside the workspace):\n"
+        text += "\n".join(f"- `{path}`" for path in paths)
+        text += (
+            "\n\nCreate only the parent directories needed for these named files."
+            "\nNo directory deletion or writes to any other job-folder file are authorized."
+            "\nKeep all listed files outside the workspace; never copy them into it."
+            "\nWrite findings when repairing review findings, and root-cause evidence for"
+            " repeated rules; neither is required for an untouched initial result."
+            "\nDeclared public-text files are local preparation only, not publication authority."
+        )
+    return text
 
 
 def _kind_text(job: JobState) -> str:
@@ -344,7 +371,7 @@ def _workflow(ctx: Ctx) -> str:
     return f"""# Workflow for job {job.id} ({job.review})
 
 Work only in the workspace: {ctx.workspace}
-Exception: the progress, checklist and brief files named below, which are in the job folder.
+Only the exact worker-owned files listed under Approval may be written outside it.
 
 ## Start
 1. Read the intent: {job.intent}
@@ -363,7 +390,7 @@ Work inputs:
   Set `passes` to true only when the evidence for that item exists.
 - Write the decision brief `{ctx.folder / "brief.md"}` for the owner, as the brief contract
   below says. The check fails without it. State every choice you made, even a small one.
-- The progress, checklist and brief files are outside the workspace; never copy them into it.
+- Keep every worker-owned file listed under Approval outside the workspace; never copy it in.
 - Code jobs: commit everything in the workspace. The checks accept only a clean, committed
   result.
 - While working, run only the tests that cover the files you changed. Run the whole check once,

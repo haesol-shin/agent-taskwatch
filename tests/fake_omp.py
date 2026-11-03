@@ -32,6 +32,7 @@ unless open_session carries `provider` and `modelId` together. Scenario switches
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -200,6 +201,10 @@ def prompt(cmd: dict) -> None:
         os._exit(3)
     time.sleep(turn.get("sleep", 0))
     for rel, text in turn.get("writes", {}).items():
+        if turn.get("require_write_grants") and not Path(rel).resolve().is_relative_to(Path.cwd()):
+            grants = re.findall(r"^- `([^`]+)`$", cmd["message"], re.MULTILINE)
+            if Path(rel).resolve() not in {Path(p).resolve() for p in grants}:
+                raise PermissionError(f"no named write grant: {rel}")
         path = Path(rel)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")

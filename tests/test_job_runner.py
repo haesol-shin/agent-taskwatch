@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -250,6 +251,56 @@ def test_pipeline_from_work_to_deliver_pending(env):
     work_prompt, review_prompt = env.prompts()
     assert "work-0.txt" in work_prompt and "review-0.txt" not in work_prompt
     assert "review-0.txt" in review_prompt and "work-0.txt" not in review_prompt
+
+
+def granted_paths(text: str) -> set[Path]:
+    return {Path(p).resolve() for p in re.findall(r"^- `([^`]+)`$", text, re.MULTILINE)}
+
+
+@pytest.mark.parametrize("public_text", [False, True])
+def test_worker_file_grants_match_in_work_fix_and_resume(tmp_path, monkeypatch, public_text):
+    repo = make_repo(tmp_path, "repo")
+    env = Env(
+        tmp_path,
+        monkeypatch,
+        review="code",
+        target=repo,
+        progress="records/progress.md",
+        checklist="records/checklist.json",
+        **({"public_text": [{"id": "change", "base": "main"}]} if public_text else {}),
+    )
+    expected = {
+        env.folder() / name
+        for name in (
+            "records/progress.md",
+            "records/checklist.json",
+            "brief.md",
+            "findings.json",
+            "root-cause.md",
+        )
+    }
+    if public_text:
+        expected |= {env.folder() / "pr/change" / name for name in ("title.txt", "body.md")}
+    env.scenario([{"die_after_content": True}, {}, {}])
+    assert env.run("work") == 1
+    assert env.run("work", session_dir=env.get().session_dir) == 0
+    assert env.run("fix") == 0
+    workflow = (env.folder() / "WORKFLOW.md").read_text()
+    for text in [workflow, *env.prompts()]:
+        assert granted_paths(text) == expected
+        assert granted_paths(text.split("## Approval", 1)[1]) == expected
+    assert all(text.startswith(env.job.prompt) for text in env.prompts())
+
+
+def test_review_only_approval_has_no_worker_file_grants(tmp_path, monkeypatch):
+    from tests.test_review_only import Review
+
+    review = Review(tmp_path, monkeypatch)
+    review.scenario([{"reply": f"{PASS}\nNo findings."}])
+    assert review.run() == 0
+    assert review.get().stage == "deliver_pending"
+    (message,) = review.prompts()
+    assert granted_paths(message) == set()
 
 
 def test_stale_attempt_runs_nothing(env):
