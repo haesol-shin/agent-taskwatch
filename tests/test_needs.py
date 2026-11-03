@@ -495,13 +495,20 @@ def test_design_completion_requires_valid_choices_without_picks(ledger: Ledger, 
     assert len(calls) == (1 if damage is None else 0)
 
 
-def committed_completion(ledger: Ledger, pointer: str) -> tuple[str, Path]:
+def committed_completion(
+    ledger: Ledger, pointer: str, links: dict[str, str] | None = None
+) -> tuple[str, Path]:
     repo = make_repo(ledger.tmp)
     work = ledger.tmp / "result-work"
     git(repo, "worktree", "add", "-b", "result", str(work))
     (work / "new_result.py").write_text("first = 1\nsecond = 2\n", encoding="utf-8")
     (work / "out.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
     git(work, "add", "new_result.py", "out.txt")
+    for name, target in (links or {}).items():
+        link = work / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        git(work, "add", name)
     git(work, "commit", "-m", "Add synthetic result")
     sha = git(work, "rev-parse", "HEAD")
     ident = ledger.add(
@@ -585,3 +592,47 @@ def test_code_completion_without_pointers_still_requires_a_readable_result_commi
     ledger.set(ident, fingerprint="0" * 40)
     code, report = ledger.list(cursor=cursor, wait=True)
     assert code == 0 and ident in report
+
+
+@pytest.mark.parametrize("cleaned", [False, True])
+@pytest.mark.parametrize(
+    ("target", "extra", "expected"),
+    [
+        ("new_result.py", {}, 3),
+        ("nested/target.py", {"nested/target.py": "../new_result.py"}, 3),
+        ("nested/new_result.py", {"nested": "."}, 3),
+        ("../outside.py", {}, 0),
+        ("/outside.py", {}, 0),
+        ("missing.py", {}, 0),
+        ("loop.py", {"loop.py": "linked.py"}, 0),
+    ],
+)
+def test_completion_symlink_pointers(ledger, cleaned, target, extra, expected):
+    from taskwatch.brief import problems
+
+    cursor = ledger.size()
+    ident, _ = committed_completion(ledger, "linked.py:2", {"linked.py": target, **extra})
+    job = ledger.get(ident)
+    folder = ledger.jobs.folder(job)
+    if expected == 3:
+        assert problems(folder / "brief.md", (Path(job.workspace), folder)) == []
+    else:
+        (folder / "linked.py").write_text("first\nsecond\n", encoding="utf-8")
+    if cleaned:
+        ledger.set(ident, **settle(job, dict(os.environ), {job.target}))
+    now = [0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    code, text = needs(
+        ledger.root,
+        cursor=cursor,
+        wait=True,
+        timeout=2,
+        interval=1,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    assert code == expected
+    assert ("cursor:" not in text) if expected == 3 else (ident in text)

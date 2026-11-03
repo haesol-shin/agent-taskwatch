@@ -29,6 +29,42 @@ def resolve(rel: str, roots: tuple[Path, ...]) -> Path | None:
     return None
 
 
+def _commit_content(repo: Path, sha: str, name: PurePosixPath) -> bytes | None:
+    """Resolve checkout-style links without consulting the mutable working tree."""
+    pending = list(name.parts)
+    resolved: list[str] = []
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part == "..":
+            if not resolved:
+                raise ValueError("symlink target leaves the repository")
+            resolved.pop()
+            continue
+        path = "/".join((*resolved, part))
+        entry = _git_ok(repo, ["ls-tree", "-z", sha, "--", path])
+        if not entry:
+            if hops:
+                raise ValueError("symlink target is missing")
+            return None
+        mode, kind, oid = entry.split(b"\t", 1)[0].split()
+        if mode == b"120000":
+            hops += 1
+            if hops > 40:
+                raise ValueError("symlink hop limit exceeded")
+            target = PurePosixPath(_git_ok(repo, ["cat-file", "blob", oid.decode()]).decode())
+            if target.is_absolute():
+                raise ValueError("symlink target leaves the repository")
+            pending = [*target.parts, *pending]
+        elif kind == b"tree" and pending:
+            resolved.append(part)
+        elif kind == b"blob" and not pending:
+            return _git_ok(repo, ["cat-file", "blob", oid.decode()])
+        else:
+            raise ValueError("pointer does not name a file")
+    raise ValueError("pointer does not name a file")
+
+
 def pointer_problem(
     rel: str,
     first: int,
@@ -45,11 +81,8 @@ def pointer_problem(
             name = PurePosixPath(rel)
             if name.is_absolute() or ".." in name.parts:
                 return [f"pointer names no file: {rel}"]
-            entry = _git_ok(repo, ["ls-tree", "-z", sha, "--", name.as_posix()])
-            if entry:
-                if entry.split(b"\t", 1)[0].split()[1] != b"blob":
-                    return [f"pointer names no file: {rel}"]
-                content = _git_ok(repo, ["cat-file", "blob", f"{sha}:{name.as_posix()}"])
+            content = _commit_content(repo, sha, name)
+            if content is not None:
                 return _range_problem(
                     rel, first, last, len(content.decode("utf-8", errors="replace").splitlines())
                 )
