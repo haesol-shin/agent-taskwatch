@@ -10,16 +10,10 @@ Nothing here calls a model.
 """
 
 import json
-import os
 import re
-import signal
-import subprocess
-import threading
-import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-
-from .rate_limit import RateLimit, print_rate_limit, scrub
+from typing import BinaryIO
 
 SCHEMA_NAME = "review-verdict.schema.json"
 WRAPPER_KEYS = (
@@ -36,116 +30,91 @@ _FENCE = re.compile(r"^```[A-Za-z0-9_-]*\s*\n(.*?)\n```\s*$", re.DOTALL)
 _DEPTH = 6
 MAX_ERRORS = 5
 KEEP_CHARS = 20000
-STDERR_CHARS = 4000
+# Whole JSON documents and individual JSONL candidates have the same explicit bound.
+MAX_REPLY_BYTES = 4 * 1024 * 1024
+
+
+def excerpt(path: Path, size: int = KEEP_CHARS) -> str:
+    try:
+        with path.open("rb") as stream:
+            return stream.read(size).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _file_verdict(path: Path) -> dict | None:
+    with path.open("rb") as stream:
+        data = stream.read(MAX_REPLY_BYTES + 1)
+        if len(data) <= MAX_REPLY_BYTES:
+            return _find(data.decode("utf-8", "replace"))
+        stream.seek(0)
+        found = None
+        for candidate in _reply_candidates(stream):
+            if (verdict := _find_text(candidate.decode("utf-8", "replace"), 0)) is not None:
+                found = verdict
+        return found
+
+
+def _reply_candidates(stream: BinaryIO) -> Iterator[bytes]:
+    """Frame multiline documents before JSONL discovery, without retaining an entire stream."""
+    candidate = bytearray()
+    depth = 0
+    quoted = escaped = fenced = False
+    while line := stream.readline(MAX_REPLY_BYTES + 1):
+        if len(candidate) + len(line) > MAX_REPLY_BYTES:
+            raise ReplyError("review reply candidate exceeds the 4 MiB limit")
+        stripped = line.strip()
+        if not candidate:
+            fenced = stripped.startswith(b"```")
+            if not fenced and not stripped.startswith((b"{", b"[")):
+                continue
+        candidate.extend(line)
+        if fenced:
+            if stripped != b"```" or len(candidate) == len(line):
+                continue
+        else:
+            depth, quoted, escaped = _json_balance(line, depth, quoted, escaped)
+            if depth > 0 or quoted:
+                continue
+        yield bytes(candidate)
+        candidate.clear()
+        depth = 0
+        quoted = escaped = fenced = False
+    if candidate:
+        yield bytes(candidate)
+
+
+def _json_balance(data: bytes, depth: int, quoted: bool, escaped: bool) -> tuple[int, bool, bool]:
+    for byte in data:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == 92:
+                escaped = True
+            elif byte == 34:
+                quoted = False
+        elif byte == 34:
+            quoted = True
+        elif byte in (123, 91):
+            depth += 1
+        elif byte in (125, 93):
+            depth -= 1
+    return depth, quoted, escaped
+
+
+def verdict_files(replies: Sequence[tuple[str, Path]], schema: Mapping) -> str:
+    for where, path in replies:
+        if not path.is_file():
+            continue
+        found = _file_verdict(path)
+        if found is not None:
+            return verdict_body([(where, json.dumps(found))], schema)
+    places = ", ".join(where for where, _ in replies)
+    raise ReplyError(f"no verdict JSON was found in the {places} of the review command")
 
 
 class ReplyError(ValueError):
     """The review command ran, but its reply holds no acceptable verdict."""
-
-
-class RunError(Exception):
-    """The review command could not run to the end: exit code, timeout.
-
-    `rate_limit` is set when a failed command's standard error holds an explicit HTTP 429."""
-
-    def __init__(self, message: str = "", rate_limit: RateLimit | None = None) -> None:
-        super().__init__(message)
-        self.rate_limit = rate_limit
-
-
-# --- run -----------------------------------------------------------------------------------
-
-
-def _kill(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        proc.kill()
-
-
-def _feed(proc: subprocess.Popen, text: str) -> None:
-    try:
-        assert proc.stdin is not None
-        proc.stdin.write(text.encode("utf-8"))
-        proc.stdin.close()
-    except (BrokenPipeError, OSError, ValueError):
-        pass  # the command did not read its input; its exit code says what happened
-
-
-def run(
-    argv: Sequence[str],
-    cwd: Path,
-    env: Mapping[str, str],
-    message: str,
-    *,
-    timeout: float,
-    every: float,
-    tick: Callable[[], None],
-    abort: threading.Event,
-    stderr_path: Path,
-) -> str:
-    """Run the command with `message` on stdin; return its stdout.
-
-    `tick` is called every `every` seconds while it lives. An `abort` flag kills the process
-    group and returns the output so far; the caller decides what that means. A nonzero exit
-    code or a timeout raises RunError.
-    """
-    stderr_path.parent.mkdir(parents=True, exist_ok=True)
-    with stderr_path.open("wb") as stderr:
-        proc = subprocess.Popen(
-            list(argv),
-            cwd=cwd,
-            env=dict(env),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            start_new_session=True,
-        )
-        chunks: list[bytes] = []
-        assert proc.stdout is not None
-        reader = threading.Thread(target=lambda: chunks.append(proc.stdout.read()), daemon=True)
-        writer = threading.Thread(target=_feed, args=(proc, message), daemon=True)
-        reader.start()
-        writer.start()
-        deadline = time.monotonic() + timeout
-        last = time.monotonic()
-        try:
-            while proc.poll() is None:
-                if abort.is_set():
-                    _kill(proc)
-                    break
-                now = time.monotonic()
-                if now >= deadline:
-                    _kill(proc)
-                    proc.wait()
-                    raise RunError(f"the review command did not finish within {timeout:g} seconds")
-                if now - last >= every:
-                    tick()
-                    last = now
-                time.sleep(0.05)
-        finally:
-            if proc.poll() is None:
-                _kill(proc)
-            proc.wait()
-            reader.join(5)
-    out = b"".join(chunks).decode("utf-8", "replace")
-    if proc.returncode != 0 and not abort.is_set():
-        detail = _tail(stderr_path)
-        limit = print_rate_limit(_tail(stderr_path, STDERR_CHARS))
-        raise RunError(
-            f"the review command exited with code {proc.returncode}: "
-            f"{scrub(detail) if limit else detail}",
-            limit,
-        )
-    return out
-
-
-def _tail(path: Path, size: int = 400) -> str:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        return ""
-    return text[-size:]
 
 
 # --- find ----------------------------------------------------------------------------------

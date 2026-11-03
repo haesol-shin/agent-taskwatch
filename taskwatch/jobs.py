@@ -134,6 +134,8 @@ class JobState:
     texts: Mapping[str, Mapping] = field(default_factory=dict)
     land: bool = False
     land_state: Mapping = field(default_factory=dict)
+    # Attempts already present when upgrading pre-print records remain RPC.
+    legacy_worker_attempt: int = 0
 
     def __post_init__(self) -> None:
         for item in fields(self):
@@ -160,6 +162,8 @@ class JobConfig:
     review_mode: str = "rpc"  # "print": the review command runs once per review, not over RPC
     max_reviews: int = DEFAULT_MAX_REVIEWS  # reviews per cycle, the first included
     install_command: tuple[str, ...] | None = None
+    worker_mode: str = "rpc"
+    worker_command: tuple[str, ...] | None = None
 
 
 COMMIT_RULES = ("bullet_one_line",)
@@ -216,6 +220,8 @@ def load_job_config(root: Path) -> JobConfig:
         "language",
         "review_mode",
         "max_reviews",
+        "worker_mode",
+        "worker_command",
         "install_command",
     } != {
         "version",
@@ -237,6 +243,13 @@ def load_job_config(root: Path) -> JobConfig:
     _strings(obj["omp_command"], "omp_command", nonempty=True)
     if "review_command" in obj:
         _strings(obj["review_command"], "review_command", nonempty=True)
+    if "worker_command" in obj:
+        _strings(obj["worker_command"], "worker_command", nonempty=True)
+    worker_mode = obj.get("worker_mode", "rpc")
+    if worker_mode not in ("rpc", "print"):
+        raise ValueError("worker_mode must be one of: rpc, print")
+    if worker_mode == "print" and "worker_command" not in obj:
+        raise ValueError("worker_mode print needs worker_command")
     env = validate_env(obj["env"]) if "env" in obj else {}
     prefix = obj.get("branch_prefix", DEFAULT_BRANCH_PREFIX)
     if not isinstance(prefix, str) or not _PREFIX.fullmatch(prefix):
@@ -274,6 +287,8 @@ def load_job_config(root: Path) -> JobConfig:
         review_mode,
         max_reviews,
         install,
+        worker_mode,
+        tuple(obj["worker_command"]) if "worker_command" in obj else None,
     )
 
 
@@ -677,7 +692,9 @@ def _upgrade_record(job: dict) -> dict:
 def decode_job(data: dict) -> JobState:
     """A validated record as a JobState; an older record is migrated, never rewritten."""
     _validate_record(data)
-    return JobState(**upgrade(data, DEFAULT_MAX_REVIEWS))
+    upgraded = dict(upgrade(data, DEFAULT_MAX_REVIEWS))
+    upgraded.setdefault("legacy_worker_attempt", data["attempt"])
+    return JobState(**upgraded)
 
 
 def _validate_record(job: dict) -> None:
@@ -688,6 +705,9 @@ def _validate_record(job: dict) -> None:
     for key in ("attempt", "recoveries"):
         if type(job.get(key)) is not int or job[key] < 0:
             raise RecordError(f"jobs.jsonl: invalid {key}")
+    legacy = job.get("legacy_worker_attempt", job["attempt"])
+    if type(legacy) is not int or not 0 <= legacy <= job["attempt"]:
+        raise RecordError("jobs.jsonl: invalid legacy_worker_attempt")
     review_only = job.get("review_target") is not None
     # A review-only job has no work contract; its checklist and progress stay empty.
     texts = (
