@@ -18,10 +18,10 @@ from pathlib import Path
 
 from .job_delivery import deliver_job, notify_wait
 from .job_env import job_environment
-from .job_workspace import settle
+from .job_workspace import WorkspaceError, repository_key, settle
 from .jobs import MAX_RECOVERIES, JobState, progress_fingerprint
 
-SLOT_STAGES = frozenset({"work", "check", "review", "fix"})
+SLOT_STAGES = frozenset({"work", "check", "review", "fix", "land"})
 DONE_STAGES = frozenset({"deliver_pending", "done"})
 DEAD = frozenset({"inactive", "missing"})
 LIVE_STATES = frozenset({"active", "activating", "reloading", "deactivating"})
@@ -391,7 +391,41 @@ class _Scan:
         }
         return len(held), targets
 
+    def _reserve_land(self, job: JobState) -> JobState | None:
+        try:
+            env = job_environment(self.config.env)
+            key = repository_key(job.target, env)
+            holders = (
+                other
+                for other in self.all.values()
+                if other.id != job.id
+                and other.unit
+                and (
+                    other.stage == "land"
+                    or other.resume_stage == "land"
+                    or other.land_state.get("repository_key")
+                )
+            )
+            blocked = any(
+                (other.land_state.get("repository_key") or repository_key(other.target, env)) == key
+                for other in holders
+            )
+        except (WorkspaceError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            self._park(replace(job, resume_stage="land"), "land_repository_unknown", str(exc))
+            return None
+        if blocked:
+            # Launch paths run only after the old unit is proven dead, so none is left to free.
+            if job.wait_reason != "repository":
+                self._save(replace(job, unit="", wait_reason="repository"))
+            return None
+        return replace(job, land_state={**job.land_state, "repository_key": key})
+
     def _launch(self, job: JobState, stage: str) -> None:
+        if stage == "land":
+            reserved = self._reserve_land(job)
+            if reserved is None:
+                return
+            job = reserved
         try:
             self.jobs.verify_inputs(job)
         except _INPUT_ERRORS as exc:

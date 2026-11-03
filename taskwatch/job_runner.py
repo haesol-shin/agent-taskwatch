@@ -57,7 +57,7 @@ from .kinds import declares_choices, kind_label
 from .rate_limit import RateLimit
 from .review_docs import docs_dir, profile_names
 
-STEPS = frozenset({"work", "fix", "check", "review"})
+STEPS = frozenset({"work", "fix", "check", "review", "land"})
 SOURCE_TABLE = "source-table.md"
 EVIDENCE_EVERY = 15.0
 SETTLE_POLL = 2.0
@@ -128,6 +128,10 @@ def run_job(jobs: Jobs, config: JobConfig, job_id: str, attempt: int) -> int:
     except (ValueError, OSError) as exc:
         return _stop(jobs, job, "inputs_invalid", f"copied input is unusable: {exc}")
     try:
+        if job.stage == "land":
+            from .job_land import run_land
+
+            return run_land(Ctx(jobs, config, job, jobs.folder(job), Path(job.workspace)))
         ctx = _context(jobs, config, job)
         step = {"check": _check_step, "review": _review_step}.get(job.stage, _agent_step)
         return step(ctx)
@@ -244,8 +248,8 @@ def _stop(jobs: Jobs, job: JobState, reason: str, message: str) -> int:
 
 def _context(jobs: Jobs, config: JobConfig, job: JobState) -> Ctx:
     folder = jobs.folder(job)
-    workspace, described = _workspace(job, folder, config, job_environment(config.env))
-    ctx = Ctx(jobs, config, replace(job, workspace=str(workspace)), folder, workspace)
+    workspace, described = _workspace(job, folder, config, job_environment(config.env), jobs)
+    ctx = Ctx(jobs, config, replace(job, workspace=str(workspace), **described), folder, workspace)
     hashes = _prepare(ctx)
     recorded = job.guideline_hashes
     if recorded is not None and recorded != hashes:
@@ -255,7 +259,7 @@ def _context(jobs: Jobs, config: JobConfig, job: JobState) -> Ctx:
 
 
 def _workspace(
-    job: JobState, folder: Path, config: JobConfig, env: Mapping[str, str]
+    job: JobState, folder: Path, config: JobConfig, env: Mapping[str, str], jobs: Jobs | None = None
 ) -> tuple[Path, dict]:
     """The step's folder, and the record fields a newly created work folder adds."""
     if job.review_target is not None:
@@ -272,7 +276,12 @@ def _workspace(
     if path.exists() and any(path.iterdir()):
         raise StepError("the job worktree folder exists but is not a worktree")
     try:
-        return path, job_workspace.create(job, path, config, env)
+        if jobs is not None:
+            prepared = job_workspace.prepare(job, env, jobs)
+            if not _cas(jobs, job, {job.stage}, lambda current: prepared):
+                raise StaleAttempt
+            job = replace(job, **prepared)
+        return path, job_workspace.create(job, path, config, env, jobs=jobs)
     except (job_workspace.WorkspaceError, subprocess.TimeoutExpired) as exc:
         raise StepError(str(exc) or type(exc).__name__) from exc
 
@@ -1538,6 +1547,7 @@ def _judge(
         "delta_ratio": scope.ratio if scope else None,
         **({"rereview": scope.record()} if scope else {}),
         **snapshot,
+        **({"accepted_check": job.checks[-1]} if job.checks else {}),
     }
     try:
         if reply_problem:
@@ -1592,7 +1602,8 @@ def _review_route(job: JobState, record: dict, digest: str = "") -> dict:
         "events": events,
     }
     if record["ok"] or record["final"]:
-        done = {"stage": "deliver_pending", "resume_stage": "deliver_pending", "error": ""}
+        stage = "land" if job.land and _builds_commits(job) else "deliver_pending"
+        done = {"stage": stage, "resume_stage": stage, "error": ""}
         return {**changes, **done}
     message = "; ".join(record["problems"])
     exhausted = job.reviews_used >= job.max_reviews

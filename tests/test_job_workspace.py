@@ -424,3 +424,148 @@ def _config_with(root, rules, language=None, explicit=False):
         config["language"] = language
     (folder / "jobs-config.json").write_text(json.dumps(config), encoding="utf-8")
     return load_job_config(root)
+
+
+def test_repository_key_unifies_aliases_and_linked_worktrees(tmp_path, remote):
+    alias = tmp_path / "alias"
+    alias.symlink_to(remote.target, target_is_directory=True)
+    linked = tmp_path / "linked"
+    git(remote.target, "worktree", "add", "--detach", str(linked), "HEAD")
+    expected = str((remote.target / ".git").resolve())
+    assert job_workspace.repository_key(str(remote.target), ENV) == expected
+    assert job_workspace.repository_key(str(alias), ENV) == expected
+    assert job_workspace.repository_key(str(linked), ENV) == expected
+    assert job_workspace.repository_key(str(remote.other), ENV) != expected
+
+
+def _landed_predecessor(tmp_path, remote, **changes):
+    job = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="predecessor",
+        land=True,
+        public_text=[{"id": "result", "base": "HEAD"}],
+    )
+    sha = remote.publish("landed.txt", "approved tree\n")
+    git(remote.target, "fetch", "origin", "main")
+    state = {
+        "S": sha,
+        "T": git(remote.target, "rev-parse", f"{sha}^{{tree}}"),
+        "tree_verified": True,
+        "install": {"status": "succeeded"},
+        **changes,
+    }
+    job = replace(job, stage="done", branch="taskwatch/predecessor", land_state=state)
+    jobs = Jobs(tmp_path / "home")
+    jobs.save(job, 2000)
+    return jobs, job
+
+
+@pytest.mark.parametrize("status", ["succeeded", "disabled"])
+def test_receipt_base_uses_landed_sha_after_branch_cleanup(tmp_path, remote, status):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote, install={"status": status})
+    sha = predecessor.land_state["S"]
+    git(remote.target, "branch", predecessor.branch, "HEAD")
+    git(remote.target, "branch", "-d", predecessor.branch)
+    remote.publish("later.txt", "later unrelated main\n")
+    git(remote.target, "fetch", "origin", "main")
+    successor = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="successor",
+        base="@predecessor",
+        predecessors=["predecessor"],
+    )
+    path = tmp_path / "successor-worktree"
+    changes = job_workspace.create(successor, path, JobConfig(), ENV, jobs)
+    assert changes["base"] == sha and changes["base_note"] == ""
+    assert successor.base_predecessor == predecessor.id
+    assert git(path, "rev-parse", "HEAD") == sha
+    assert (path / "landed.txt").read_text() == "approved tree\n"
+    assert not (path / "later.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"S": ""},
+        {"S": "a" * 40},
+        {"T": "b" * 40},
+        {"tree_verified": False},
+        {"install": {"status": "not_started"}},
+        {"install": {"status": "started"}},
+        {"install": {"status": "failed"}},
+        {"install": {"status": "unknown"}},
+    ],
+)
+def test_receipt_base_refuses_unverified_or_uninstalled_landing(tmp_path, remote, change):
+    jobs, _ = _landed_predecessor(tmp_path, remote, **change)
+    successor = code_job(tmp_path, remote.target, receipt_key="successor", base="@predecessor")
+    with pytest.raises(job_workspace.WorkspaceError, match="predecessor"):
+        job_workspace.create(successor, tmp_path / "successor-worktree", JobConfig(), ENV, jobs)
+    assert not (tmp_path / "successor-worktree").exists()
+
+
+def test_landed_predecessor_requires_readiness_and_same_repository(tmp_path, remote):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote)
+    successor = code_job(tmp_path, remote.target, receipt_key="successor", base="@predecessor")
+    jobs.save(replace(predecessor, stage="user_wait"), 2001)
+    with pytest.raises(job_workspace.WorkspaceError, match="completed"):
+        job_workspace.create(successor, tmp_path / "successor-worktree", JobConfig(), ENV, jobs)
+    jobs.save(predecessor, 2002)
+    foreign = replace(successor, target=str(remote.other))
+    with pytest.raises(job_workspace.WorkspaceError, match="different repository"):
+        job_workspace.create(foreign, tmp_path / "successor-worktree", JobConfig(), ENV, jobs)
+
+
+@pytest.mark.parametrize("created", [False, True])
+def test_interrupted_predecessor_worktree_setup_preserves_base_on_retry(
+    tmp_path, remote, monkeypatch, created
+):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote)
+    sha = predecessor.land_state["S"]
+    git(remote.target, "branch", predecessor.branch, "HEAD")
+    jobs.save(replace(predecessor, stage="work"), 2001)
+    successor = code_job(tmp_path, remote.target, receipt_key="successor", base="@predecessor")
+    assert successor.base == predecessor.branch
+    successor = replace(successor, stage="work", attempt=1)
+    jobs.save(successor, 2002)
+    jobs.save(predecessor, 2003)
+    folder = jobs.folder(successor)
+    original = job_workspace.create
+
+    def interrupted(job, path, config, env, jobs=None):
+        saved = jobs.load()[job.id]
+        assert saved.base == sha and saved.workspace_state == "prepared"
+        if created:
+            original(job, path, config, env, jobs)
+        raise RuntimeError("interrupted setup")
+
+    monkeypatch.setattr(job_workspace, "create", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted setup"):
+        job_runner._workspace(successor, folder, JobConfig(), ENV, jobs)
+    saved = jobs.load()[successor.id]
+    assert saved.base == sha
+    # Neither a moving branch nor later predecessor metadata may change the saved base.
+    later = remote.publish("later.txt", "later unrelated result\n")
+    git(remote.target, "fetch", "origin", "main")
+    git(remote.target, "branch", "-f", predecessor.branch, later)
+    jobs.save(replace(predecessor, stage="user_wait"), 2004)
+    monkeypatch.setattr(job_workspace, "create", original)
+    path, changes = job_runner._workspace(saved, folder, JobConfig(), ENV, jobs)
+    assert git(path, "rev-parse", "HEAD") == sha
+    assert jobs.load()[successor.id].base == sha
+    assert changes["workspace_state"] == "active"
+    assert (path / "landed.txt").read_text() == "approved tree\n"
+    assert not (path / "later.txt").exists()
+
+
+def test_nonlanding_receipt_base_keeps_existing_branch_behavior(tmp_path, remote):
+    jobs = Jobs(tmp_path / "home")
+    predecessor = code_job(tmp_path, remote.target, receipt_key="predecessor")
+    branch = f"taskwatch/{predecessor.id[:8]}"
+    git(remote.target, "branch", branch, "HEAD")
+    successor = code_job(tmp_path, remote.target, receipt_key="successor", base="@predecessor")
+    path = tmp_path / "successor-worktree"
+    changes = job_workspace.create(successor, path, JobConfig(), ENV, jobs)
+    assert changes["base"] == git(remote.target, "rev-parse", branch)

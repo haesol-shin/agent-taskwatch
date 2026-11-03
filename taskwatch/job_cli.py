@@ -234,7 +234,7 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
         if command == "cancel":
             job = replace(job, stage="cancelled", wait_reason=args.reason, retry_not_before=0.0)
         elif command == "wait":
-            if job.stage not in {"work", "check", "review", "fix", "queued"}:
+            if job.stage not in {"work", "check", "review", "fix", "land", "queued"}:
                 raise ValueError("only an unfinished job can wait for approval")
             resume = job.resume_stage if job.stage == "queued" else job.stage
             job = replace(job, resume_stage=resume, stage="approval_wait", wait_reason=args.reason)
@@ -255,19 +255,24 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
             _check_root_cause(jobs, job)
             # A resume opens a new review cycle at the saved stage and keeps every record. It
             # never skips a rate-limit deadline: the scanner still waits for `retry_not_before`.
+            landing = job.resume_stage == "land"
             job = replace(
                 job,
                 stage="deliver_pending" if job.resume_stage == "deliver_pending" else "queued",
                 wait_reason="",
                 error="",
                 recoveries=0,
-                reviews_used=0,
-                review_cycle_start=len(job.reviews),
-                review_inflight=0,
+                # Landing neither spends nor renews review budget; its stops are not review stops.
+                reviews_used=job.reviews_used if landing else 0,
+                review_cycle_start=job.review_cycle_start if landing else len(job.reviews),
+                review_inflight=job.review_inflight if landing else 0,
             )
-        job = replace(
-            job, events=(*job.events, {"type": command, "at": now, "reason": args.reason})
-        )
+        entry = sum(e.get("type") in {"resume", "approve"} for e in job.events) + 1
+        event = {"type": command, "at": now, "reason": args.reason}
+        if command in {"resume", "approve"}:
+            # A monotonic owner entry is distinct even when two commands share a timestamp.
+            event["entry"] = entry
+        job = replace(job, events=(*job.events, event))
         jobs.save(job, now)
         return job.to_json()
 
@@ -301,6 +306,7 @@ def _init(root: Path, unit_dir: Path | None) -> dict:
     data.pop("bullet_one_line")
     data.pop("language")
     data.pop("review_mode")
+    data.pop("install_command")
     if not config.exists():
         _create_new(config, (json.dumps(data, indent=2) + "\n").encode(), 0o600)
     load_job_config(root)

@@ -21,6 +21,7 @@ from taskwatch.jobs import (
     JobState,
     progress_fingerprint,
 )
+from tests.git_fixture import git, make_repo
 from tests.spec_fixture import VALID_SPEC
 
 REAL_WAKE = Systemd.wake
@@ -1105,3 +1106,81 @@ def test_a_failing_wake_keeps_the_exit_code_and_warns(board: Board, monkeypatch,
     board.set(job_id, stage="user_wait", resume_stage="work")
     assert _run_cli(board, "resume", job_id, "--reason", "retry") == 0
     assert "warning: wake failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("alias_kind", ["worktree", "symlink"])
+def test_landing_serializes_common_repository_but_not_independent_work(
+    tmp_path: Path, alias_kind: str
+) -> None:
+    board = Board(tmp_path, slots=3)
+    repo = make_repo(tmp_path)
+    linked = tmp_path / "linked"
+    if alias_kind == "worktree":
+        git(repo, "worktree", "add", "-b", "linked", str(linked))
+    else:
+        linked.symlink_to(repo, target_is_directory=True)
+    first = board.add(target=str(repo))
+    second = board.add(target=str(linked))
+    work = board.add(target=str(repo))
+    for identifier in (first, second):
+        board.set(identifier, stage="land")
+
+    assert board.scan() == [first, work]
+    assert board.get(first).land_state["repository_key"] == str((repo / ".git").resolve())
+    assert board.get(second).wait_reason == "repository"
+    board.set(first, stage="user_wait", resume_stage="land", wait_reason="land_install_failed")
+    board.service.stop_ok = False
+    board.service.states[board.get(first).unit] = "unknown"
+    assert board.scan() == []
+    assert board.get(first).unit
+    assert board.get(second).stage == "land"
+
+    board.service.stop_ok = True
+    assert board.scan() == [second]
+    assert board.get(first).unit == ""
+
+
+def test_landing_gap_and_dead_service_recover_without_new_owner_entry(tmp_path: Path) -> None:
+    board = Board(tmp_path)
+    repo = make_repo(tmp_path)
+    identifier = board.add(target=str(repo))
+    assert board.scan() == [identifier]
+    board.finish_step(identifier, "land")
+    assert board.scan() == [identifier]
+    first = board.get(identifier)
+    assert first.stage == "land"
+    board.kill(identifier)
+    assert board.scan() == [identifier]
+    recovered = board.get(identifier)
+    assert recovered.attempt == first.attempt + 1
+    assert recovered.land_state == first.land_state
+    assert not [e for e in recovered.events if e.get("type") in {"resume", "approve"}]
+
+
+def test_owner_land_resume_entries_are_distinct_and_preserve_evidence(
+    board: Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identifier = board.add()
+    evidence = {"type": "user_wait", "reason": "land_install_failed", "at": 1.0}
+    board.set(
+        identifier,
+        stage="user_wait",
+        resume_stage="land",
+        wait_reason="land_install_failed",
+        events=(evidence,),
+        land_state={"S": "a" * 40, "install": {"status": "unknown"}},
+    )
+    monkeypatch.setattr("taskwatch.job_cli.time.time", lambda: 2000.0)
+    monkeypatch.setattr(Systemd, "wake", lambda self: None)
+    args = ["--root", str(board.jobs.state.root), "resume", identifier, "--reason", "retry hook"]
+    assert cli_main(args) == 0
+    first = board.get(identifier)
+    board.set(identifier, stage="user_wait", wait_reason="land_install_failed")
+    assert cli_main(args) == 0
+    second = board.get(identifier)
+    entries = [e for e in second.events if e.get("type") == "resume"]
+    assert [e["entry"] for e in entries] == [1, 2]
+    assert entries[0]["at"] == entries[1]["at"]
+    assert second.events[0] == evidence
+    assert second.land_state == first.land_state
+    assert second.resume_stage == "land"

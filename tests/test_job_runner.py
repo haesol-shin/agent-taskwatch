@@ -731,6 +731,21 @@ def test_code_job_uses_worktree_and_committed_fingerprint(tmp_path, monkeypatch)
     subprocess.run(["git", "-C", str(repo), "worktree", "list"], check=True, capture_output=True)
 
 
+def test_stale_attempt_cannot_create_worktree_before_base_intent_is_saved(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path, "repo")
+    env = Env(tmp_path, monkeypatch, review="code", target=repo)
+    stale = replace(env.get(), stage="work", attempt=1)
+    current = replace(stale, attempt=2)
+    env.jobs.save(current, 2000)
+    with pytest.raises(job_runner.StaleAttempt):
+        job_runner._workspace(
+            stale, env.jobs.folder(stale), env.config, job_runner.job_environment({}), env.jobs
+        )
+    assert not (env.jobs.folder(stale) / "worktree").exists()
+    assert env.get().base == ""
+    assert env.get().workspace_state == ""
+
+
 def test_missing_input_hash_match_stops_job(env):
     Path(next(iter(env.get().input_hashes))).write_text("tampered", encoding="utf-8")
     assert env.run("work") == 1

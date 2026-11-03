@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import string
 import subprocess
 import time
 import uuid
@@ -25,6 +26,7 @@ STAGES = frozenset(
         "check",
         "review",
         "fix",
+        "land",
         "approval_wait",
         "deliver_pending",
         "done",
@@ -121,6 +123,7 @@ class JobState:
     base: str = ""
     base_note: str = ""
     branch: str = ""
+    base_predecessor: str = ""
     workspace_state: str = ""
     branch_state: str = ""
     # Code jobs. New submissions declare one complete-result publication unit:
@@ -129,6 +132,8 @@ class JobState:
     public_text: tuple[Mapping, ...] = ()
     # Per unit: the shas of base, head and tree and the text fingerprint the last check saw.
     texts: Mapping[str, Mapping] = field(default_factory=dict)
+    land: bool = False
+    land_state: Mapping = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for item in fields(self):
@@ -154,6 +159,7 @@ class JobConfig:
     language: str | None = None  # None: the card is written in the language of the intent
     review_mode: str = "rpc"  # "print": the review command runs once per review, not over RPC
     max_reviews: int = DEFAULT_MAX_REVIEWS  # reviews per cycle, the first included
+    install_command: tuple[str, ...] | None = None
 
 
 COMMIT_RULES = ("bullet_one_line",)
@@ -177,6 +183,28 @@ def _max_reviews(value: object) -> int:
     return value
 
 
+def _install_command(value: object) -> tuple[str, ...] | None:
+    """Validate host argv templates without interpreting shell syntax."""
+    if value is None:
+        return None
+    _strings(value, "install_command", nonempty=True)
+    if Path(value[0]).name in {"sh", "bash", "dash", "zsh", "fish", "csh", "ksh"}:
+        raise ValueError("install_command must invoke an executable directly, not a shell")
+    placeholders = []
+    try:
+        for argument in value:
+            for _, name, spec, conversion in string.Formatter().parse(argument):
+                if name is not None:
+                    if name not in {"sha", "target"} or spec or conversion:
+                        raise ValueError("install_command accepts only {sha} and {target}")
+                    placeholders.append(name)
+    except ValueError as exc:
+        raise ValueError(f"invalid install_command template: {exc}") from exc
+    if "sha" not in placeholders:
+        raise ValueError("install_command requires a full {sha} placeholder")
+    return tuple(value)
+
+
 def load_job_config(root: Path) -> JobConfig:
     path = root / "taskwatch" / "jobs-config.json"
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -188,6 +216,7 @@ def load_job_config(root: Path) -> JobConfig:
         "language",
         "review_mode",
         "max_reviews",
+        "install_command",
     } != {
         "version",
         "slots",
@@ -224,6 +253,7 @@ def load_job_config(root: Path) -> JobConfig:
         raise ValueError(f"language must be one of: {', '.join(LANGUAGES)}")
     review_mode = _review_mode(obj)
     max_reviews = _max_reviews(obj["max_reviews"]) if "max_reviews" in obj else DEFAULT_MAX_REVIEWS
+    install = _install_command(obj.get("install_command"))
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -243,6 +273,7 @@ def load_job_config(root: Path) -> JobConfig:
         language,
         review_mode,
         max_reviews,
+        install,
     )
 
 
@@ -352,6 +383,7 @@ _OPTIONAL_FIELDS = {
     "base",
     "max_reviews",
     "public_text",
+    "land",
 }
 UNIT_FILES = ("title.txt", "body.md", "commit.txt")
 _UNIT_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
@@ -409,6 +441,16 @@ def _spec_template(spec: str) -> None:
         raise ValueError(f"the spec does not follow docs/spec-template.md: {'; '.join(problems)}")
 
 
+def _land_field(data: dict, review_only: bool) -> None:
+    data.setdefault("land", False)
+    if type(data["land"]) is not bool:
+        raise ValueError("land must be boolean")
+    if data["land"] and (
+        data["review"] != "code" or review_only or len(data.get("public_text", [])) != 1
+    ):
+        raise ValueError("land requires a result-building code job with one public_text unit")
+
+
 def _submission(payload: dict) -> dict:
     # A review target replaces the work contract: there is no work stage to describe.
     review_only = isinstance(payload, dict) and "review_target" in payload
@@ -438,6 +480,7 @@ def _submission(payload: dict) -> dict:
         _base_field(data, review_only)
     if "public_text" in data:
         _public_text_field(data, review_only)
+    _land_field(data, review_only)
     data.setdefault("predecessors", [])
     _strings(data["predecessors"], "predecessors")
     _controls(data)
@@ -483,8 +526,7 @@ def _host_config(root: Path) -> JobConfig:
 
 
 def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix: str) -> None:
-    """Resolve receipt keys in `predecessors` to job ids and `@<receipt key>` in `base` to a
-    branch name, so a chain can be submitted before its jobs have ids."""
+    """Resolve receipt references, preferring a verified landed base over its retained branch."""
     by_receipt = {job.receipt_key: job for job in existing.values()}
     predecessors = []
     missing = []
@@ -507,6 +549,19 @@ def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix
         if pred.review != "code" or pred.review_target is not None:
             raise ValueError(f"base {base} is not a code job that builds a branch")
         data["base"] = pred.branch or f"{prefix}{pred.id[:8]}"
+        data["base_predecessor"] = pred.id
+        if pred.land:
+            from .job_env import job_environment
+            from .job_workspace import WorkspaceError, verified_predecessor_base
+
+            try:
+                landed = verified_predecessor_base(data["target"], pred, job_environment({}))
+            except WorkspaceError:
+                # Unready predecessors remain deferred until workspace creation.
+                pass
+            else:
+                if landed:
+                    data["base"] = landed
 
 
 def _ref(value: object, label: str) -> str:
@@ -660,6 +715,12 @@ def _validate_record(job: dict) -> None:
     if job.get("review_target") is not None:
         _validate_review_target(job)
     _validate_manifest(job)
+    _validate_attempts(job)
+    _validate_public_text(job)
+    _validate_land(job)
+
+
+def _validate_attempts(job: dict) -> None:
     for key in ("deliveries", "notices"):
         attempts = job.get(key, [])
         if not isinstance(attempts, list) or any(
@@ -667,7 +728,18 @@ def _validate_record(job: dict) -> None:
             for row in attempts
         ):
             raise RecordError(f"jobs.jsonl: invalid {key} attempts")
-    _validate_public_text(job)
+
+
+def _validate_land(job: dict) -> None:
+    if type(job.get("land", False)) is not bool:
+        raise RecordError("jobs.jsonl: invalid land")
+    if not isinstance(job.get("land_state", {}), dict):
+        raise RecordError("jobs.jsonl: invalid land_state")
+    predecessor = job.get("base_predecessor", "")
+    if not isinstance(predecessor, str) or (
+        predecessor and re.fullmatch(r"[0-9a-f]{32}", predecessor) is None
+    ):
+        raise RecordError("jobs.jsonl: invalid base_predecessor")
 
 
 def _validate_public_text(job: dict) -> None:

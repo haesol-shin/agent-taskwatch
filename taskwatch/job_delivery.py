@@ -26,11 +26,8 @@ def _accepted(job: JobState, review: dict) -> bool:
     return bool(review.get("ok") and review.get("verdict") == "PASS")
 
 
-def deliver_job(jobs: Jobs, config: JobConfig, job: JobState, now: float) -> JobState:
-    """Called under the state lock, after the old runner service has stopped."""
-    if job.deliveries and job.deliveries[-1]["status"] == "started":
-        record = {**job.deliveries[-1], "status": "unknown", "error": "delivery interrupted"}
-        return _finish(jobs, job, record, now)
+def acceptance_current(jobs: Jobs, config: JobConfig, job: JobState) -> bool:
+    """Shared delivery/landing freshness policy, including checked snapshot identity."""
     review = job.reviews[-1] if job.reviews else {}
     try:
         current = (
@@ -52,10 +49,45 @@ def deliver_job(jobs: Jobs, config: JobConfig, job: JobState, now: float) -> Job
             )
             == review.get("basis")
         )
-    except (ValueError, OSError):
-        current = False
-    if not current:
-        job = replace(job, **_requeue(job))
+        if job.land or "accepted_check" in review:
+            check = job.checks[-1] if job.checks else {}
+            current = (
+                current
+                and check == review.get("accepted_check")
+                and bool(check.get("ok"))
+                and check.get("exit_code") == 0
+                and check.get("fingerprint") == review.get("fingerprint")
+                and check.get("basis") == review.get("basis")
+                and hashlib.sha256(Path(check["log"]).read_bytes()).hexdigest()
+                == check.get("log_sha256")
+            )
+        if review.get("texts"):
+            from .job_text import snapshot_digest
+
+            current = current and snapshot_digest(Path(review["snapshot"])) == review.get(
+                "snapshot_sha256"
+            )
+        return bool(current)
+    except (ValueError, OSError, KeyError, TypeError):
+        return False
+
+
+def deliver_job(jobs: Jobs, config: JobConfig, job: JobState, now: float) -> JobState:
+    """Called under the state lock, after the old runner service has stopped."""
+    if job.deliveries and job.deliveries[-1]["status"] == "started":
+        record = {**job.deliveries[-1], "status": "unknown", "error": "delivery interrupted"}
+        return _finish(jobs, job, record, now)
+    if not acceptance_current(jobs, config, job):
+        if job.land_state.get("S"):
+            job = replace(
+                job,
+                stage="user_wait",
+                resume_stage="land",
+                wait_reason="land_review_stale",
+                error="accepted evidence changed after merge",
+            )
+        else:
+            job = replace(job, **_requeue(job))
         jobs.save(job, now)
         return job
     # Inherit this lock into the sender so even a killed scanner cannot overlap an orphan send.

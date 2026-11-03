@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 
 from taskwatch.job_cli import main
-from taskwatch.jobs import Jobs, load_job_config
+from taskwatch.jobs import Jobs, decode_job, load_job_config
 from taskwatch.state import RecordError
+from tests.git_fixture import git, make_repo
 from tests.spec_fixture import VALID_SPEC
 
 
@@ -312,11 +313,76 @@ def test_submit_resolves_receipt_keys_in_predecessors_and_base(tmp_path):
     )
     assert second.predecessors == (first.id,)
     assert second.base == f"taskwatch/{first.id[:8]}"
+    assert second.base_predecessor == first.id
     assert third.predecessors == (first.id, second.id)
     assert third.base == f"taskwatch/{second.id[:8]}"
     reloaded = jobs.load()
     assert reloaded[second.id].predecessors == (first.id,)
     assert reloaded[second.id].base == f"taskwatch/{first.id[:8]}"
+    assert reloaded[second.id].base_predecessor == first.id
+
+
+@pytest.mark.parametrize("stage", ["deliver_pending", "done"])
+def test_receipt_submission_compares_public_text_with_landed_commit_not_retained_branch(
+    tmp_path, stage
+):
+    repo = make_repo(tmp_path)
+    jobs = Jobs(tmp_path / "root")
+    predecessor = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "predecessor",
+            target=str(repo),
+            land=True,
+            public_text=[{"id": "result", "base": "HEAD"}],
+        )
+    )
+    parent = git(repo, "rev-parse", "HEAD")
+    (repo / "out.txt").write_text("approved result\n", encoding="utf-8")
+    git(repo, "commit", "-am", "approved result")
+    reviewed = git(repo, "rev-parse", "HEAD")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    landed = git(repo, "commit-tree", tree, "-p", parent, "-m", "landed result")
+    branch = "taskwatch/predecessor"
+    git(repo, "branch", branch, reviewed)
+    jobs.save(
+        replace(
+            predecessor,
+            stage=stage,
+            branch=branch,
+            land_state={
+                "S": landed,
+                "T": tree,
+                "tree_verified": True,
+                "install": {"status": "disabled"},
+            },
+        ),
+        2000,
+    )
+    successor = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "successor",
+            target=str(repo),
+            base="@predecessor",
+            public_text=[{"id": "result", "base": landed}],
+        )
+    )
+    assert reviewed != landed
+    assert git(repo, "rev-parse", branch) == reviewed
+    assert successor.base == landed
+    assert successor.base_predecessor == predecessor.id
+    assert successor.public_text[0]["base"] == landed
+    with pytest.raises(ValueError, match="effective job base"):
+        jobs.submit(
+            _code_payload(
+                tmp_path,
+                "partial-successor",
+                target=str(repo),
+                base="@predecessor",
+                public_text=[{"id": "result", "base": reviewed}],
+            )
+        )
 
 
 def test_submit_receipt_base_uses_configured_branch_prefix_and_rejects_unknown_tokens(tmp_path):
@@ -442,3 +508,109 @@ def test_approval_waits_keep_the_review_cycle(tmp_path):
     assert main(["--root", root, "approve", job.id, "--reason", "ok"]) == 0
     current = jobs.load()[job.id]
     assert (current.stage, current.reviews_used, current.review_cycle_start) == ("queued", 2, 1)
+
+
+def test_landing_defaults_history_and_frozen_state(tmp_path):
+    job = Jobs(tmp_path / "root").submit(payload(tmp_path))
+    assert job.land is False and dict(job.land_state) == {} and job.base_predecessor == ""
+    data = job.to_json()
+    for key in ("land", "land_state", "base_predecessor"):
+        del data[key]
+    assert decode_job(data).land is False
+    saved = replace(job, land_state={"install": {"status": "disabled"}, "runs": [1]})
+    with pytest.raises(TypeError):
+        saved.land_state["install"]["status"] = "succeeded"
+    assert saved.land_state["runs"] == (1,)
+    assert saved.to_json()["land_state"] == {"install": {"status": "disabled"}, "runs": [1]}
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "true", [], {}])
+def test_landing_rejects_nonboolean_submission(tmp_path, value):
+    with pytest.raises(ValueError, match="land must be boolean"):
+        Jobs(tmp_path / "root").submit({**payload(tmp_path), "land": value})
+
+
+def test_landing_requires_building_code_and_publication(tmp_path):
+    jobs = Jobs(tmp_path / "root")
+    for data in (
+        {**payload(tmp_path), "land": True},
+        _code_payload(tmp_path, "code", land=True),
+        {
+            **_code_payload(tmp_path, "review", land=True),
+            "review_target": {"files": ["intent.md"]},
+        },
+    ):
+        if "review_target" in data:
+            for key in ("outputs", "check_command", "checklist", "progress"):
+                del data[key]
+        with pytest.raises(ValueError, match="land requires"):
+            jobs.submit(data)
+
+
+def test_landing_accepts_caller_assertion_without_checked_marker(tmp_path):
+    repo = make_repo(tmp_path, "publication")
+    data = _code_payload(
+        tmp_path,
+        "land",
+        target=str(repo),
+        land=True,
+        approval_scope="Approved scope assertion without special keywords",
+        public_text=[{"id": "result", "base": "HEAD"}],
+    )
+    job = Jobs(tmp_path / "root").submit(data)
+    assert job.land and job.public_text[0]["base"] == git(repo, "rev-parse", "HEAD")
+    assert not job.texts and not job.land_state
+    with pytest.raises(ValueError, match="unknown fields"):
+        Jobs(tmp_path / "other").submit({**data, "land_state": {"S": "a" * 40}})
+
+
+@pytest.mark.parametrize("key", ["approval_scope", "approval_source"])
+def test_landing_requires_nonempty_approval_records(tmp_path, key):
+    data = _code_payload(tmp_path, "land", land=True)
+    data[key] = " "
+    with pytest.raises(ValueError, match=key):
+        Jobs(tmp_path / "root").submit(data)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        [],
+        "wrapper {sha}",
+        ["wrapper"],
+        ["wrapper", "{sha:.8}"],
+        ["wrapper", "{sha!r}"],
+        ["wrapper", "{sha[0]}"],
+        ["wrapper", "{other}"],
+        ["wrapper", "{{sha}}"],
+        ["sh", "-c", "wrapper {sha}"],
+    ],
+)
+def test_host_install_command_rejects_unpinned_or_interpreted_templates(tmp_path, command):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["install_command"] = command
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="install_command"):
+        load_job_config(root)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        None,
+        ["wrapper", "{sha}", "{target}"],
+        ["installer", "git+https://forge.invalid/owner/repo.git@{sha}"],
+    ],
+)
+def test_host_install_command_is_optional_argv(tmp_path, command):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert load_job_config(root).install_command is None
+    config["install_command"] = command
+    path.write_text(json.dumps(config), encoding="utf-8")
+    assert load_job_config(root).install_command == (tuple(command) if command else None)

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import brief, choices, job_findings
+from .activity import land_facts
 from .brief import count_findings, decision_count
 from .job_cursor import decode, encode
 from .job_store import Store, projection, read_index, read_snapshot, validate_event
@@ -468,6 +469,8 @@ def _lines(root: Path, rows: dict[str, dict], item: _Item) -> list[str]:
         return [
             f"job {job.id} {kind} user_wait {_line(job.wait_reason)}  {_stuck(job)}",
             f"  goal: {_goal(job)}",
+            *[f"  land: {fact}" for fact in land_facts(job)],
+            *([f"  error: {_line(job.error)}"] if job.error and job.land_state else []),
             *_deadline(job),
             f"  then: {cmd} resume {job.id} --reason <source> | cancel {job.id} --reason <text>",
         ]

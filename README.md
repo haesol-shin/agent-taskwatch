@@ -7,7 +7,7 @@ A job runner for approved agent work. It schedules each job, runs it through omp
 - It does not import or patch Hermes Agent. Hermes can submit jobs and check what waits through the `taskwatch` command, as any caller can.
 - It does not approve work. Every job carries an approval record that the caller asserts; the runner cannot authenticate the conversation it came from.
 - It does not isolate what the runner's tools can read or write. Those tools have the user's permissions, and `approval_scope` is a recorded boundary, not operating-system isolation.
-- It does not merge or apply results.
+- It does not merge or install results by default. Explicit `land: true` on an eligible approved code job enables the deterministic [landing transaction](docs/configuration.md#automatic-landing), including an optional host-owned pinned install hook.
 - Every check is plain code and never calls a model. Work and fixes use omp; an independent review uses omp, or with `review_mode: "print"` Codex, Claude Code, Gemini CLI or any command that prints a JSON verdict.
 
 ## How a job runs
@@ -15,12 +15,13 @@ A job runner for approved agent work. It schedules each job, runs it through omp
 A job is a JSON document with a prompt, an intent file, a spec file, required outputs, a check command, a checklist, and the review profile (`code`, `design`, or `source`). A review-only job names a `review_target` instead and skips work and check.
 
 1. **Submit.** `submit` returns after the job and its copied inputs are durable. The receipt key deduplicates retries.
-2. **Work.** `scan` reserves a free parallel slot and starts a transient user systemd service that runs omp in the job workspace. The job keeps its slot across work, check, review, and fixes.
+2. **Work.** `scan` reserves a free parallel slot and starts a transient user systemd service that runs omp in the job workspace. The job keeps its slot across work, check, review, fixes and opt-in landing.
 3. **Check.** The runner runs the job's `check_command` and records its exit code and output. Required outputs, progress, and a nonempty passing checklist must also exist. A model's PASS claim does not replace these.
 4. **Review.** A separate omp session reviews the current result against the intent and spec, using the guidelines in [docs/review](docs/review/README.md). It returns one verdict line. A FAIL or a blocking finding starts a fix while a later review remains: a cycle runs at most `max_reviews` reviews (1 to 3, default 3), the first included, and then the job stops for user judgment. See [Recovery and decisions](docs/configuration.md#recovery-and-decisions).
-5. **Delivery.** A job that passes check and review stops at `deliver_pending`. The next `scan` runs the configured `deliver_command`. Only a recorded success makes the job `done`, and it is never sent again. Any other outcome stops at `user_wait` with `delivery_unknown`; the user can `resume` for one new send or `cancel`.
+5. **Land, when enabled.** Default-off `land: true` routes an accepted eligible code result through reviewed publication, exact-head CI, pinned squash, final-tree verification and an optional frozen host install hook. The caller asserts publication/merge/install authority; PASS does not grant it. Stops retain transaction identity for explicit resume or cancellation; see [Automatic landing](docs/configuration.md#automatic-landing).
+6. **Delivery.** A nonlanding job that passes check and review, or a successfully landed job, reaches `deliver_pending`. The next `scan` runs the configured `deliver_command`. Only a recorded success makes the job `done`, and it is never sent again. Any other outcome stops at `user_wait` with `delivery_unknown`; the user can `resume` for one new send or `cancel`.
 
-Jobs that share a target folder cannot overlap; code jobs each have their own worktree and can. Approval and user-judgment waits release their slots after the service has stopped. Dead runs, stalls, and reboot interruptions are recovered after the old service is known to have stopped; three failed recoveries in a row stop for user judgment. A terminal HTTP 429 waits for its evidenced retry time without using a recovery or a review ([Rate limits](docs/configuration.md#rate-limits)).
+Jobs that share a target folder cannot overlap; code jobs each have their own worktree and can, except landing serializes the canonical git common directory through installation. Approval and user-judgment waits release slots only after service death is confirmed; ambiguous old services and inherited orphan locks keep landing reservations. Dead runs, stalls, and reboot interruptions are recovered after the old service is known to have stopped; three failed recoveries in a row stop for user judgment. A terminal HTTP 429 waits for its evidenced retry time without using a recovery or a review ([Rate limits](docs/configuration.md#rate-limits)).
 
 Details: [checks](docs/checks.md) and [configuration](docs/configuration.md).
 
@@ -36,7 +37,7 @@ A `code` job works in `state/jobs/<id>/worktree` on its own branch, started from
 
 ## Install
 
-Requires Linux with user systemd, Python 3.11 or later, git, and an omp executable. There are no runtime dependencies. macOS and Windows are not supported.
+Requires Linux with user systemd, Python 3.11 or later, git, and an omp executable. There are no runtime dependencies. macOS and Windows are not supported. Opt-in landing additionally requires authenticated `gh` access to a supported GitHub repository; nonlanding jobs need neither `gh` nor an install hook.
 
 From a checkout, run `uv sync --locked`, then use `uv run taskwatch`. The examples below assume the virtual environment is active.
 
@@ -72,7 +73,7 @@ taskwatch --root <root> resume <job> --reason <text> # open a new recovery and r
 
 - A delivery success means the command reported acceptance, not that the person read the message.
 - A delivery whose outcome is unknown is never resent automatically.
-- The runner does not reconcile external outcomes.
+- Landing reconciles its persisted exact push/PR/merge identities, not arbitrary worker actions. Head pinning cannot atomically pin the external merge base; final-tree verification detects a race after merge but cannot undo it. Failed or unknown installs never automatically replay; host wrappers and caller approval assertions remain trust boundaries. See [Automatic landing](docs/configuration.md#automatic-landing).
 - Work, fix, and review quality depend on omp and its model; the checks cover only what code can verify.
 
 ## More
