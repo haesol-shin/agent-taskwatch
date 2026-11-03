@@ -135,7 +135,7 @@ class Transaction:
             raise LandStop("land_review_stale", "accepted evidence changed after publication")
         from .job_runner import _apply
 
-        _apply(self.ctx, lambda j: _requeue(j))
+        _apply(self.ctx, lambda j: {**_requeue(j), "land_state": {}})
         raise FreshnessRequeued
 
     def initialize(self):
@@ -318,6 +318,8 @@ class Transaction:
             if time.time() >= self.state["ci_deadline"]:
                 raise LandStop("land_ci_failed", "CI observation deadline expired")
             evidence = self.observe_ci()
+            if time.time() >= self.state["ci_deadline"]:
+                raise LandStop("land_ci_failed", "CI observation deadline expired during query")
             if evidence.state == "success":
                 self.save(ci_green=digest([asdict(e) for e in evidence.evidence]))
                 return
@@ -417,8 +419,16 @@ class Transaction:
 
     def install(self):
         hook = self.state["install"]
+        from .jobs import load_job_config
+
+        try:
+            current_config = load_job_config(self.ctx.jobs.state.root)
+        except (OSError, ValueError) as exc:
+            raise LandStop(
+                "land_hook_changed", "current install configuration is unreadable"
+            ) from exc
         configured = (
-            list(self.ctx.config.install_command) if self.ctx.config.install_command else None
+            list(current_config.install_command) if current_config.install_command else None
         )
         if digest(configured) != hook["command_hash"]:
             raise LandStop("land_hook_changed", "restore frozen install configuration or cancel")
@@ -494,8 +504,16 @@ def install_argv(command, sha, target, repo):
         elif part.startswith("https://") and "/archive/" in part:
             url = urlsplit(part)
             pieces = url.path.strip("/").split("/")
-            if "{sha}" not in part or len(pieces) < 4:
-                raise LandStop("land_hook_changed", "archive URL requires pinned SHA")
+            if (
+                len(pieces) != 4
+                or pieces[2] != "archive"
+                or pieces[3] not in {"{sha}.tar.gz", "{sha}.zip", "{sha}"}
+                or url.query
+                or url.fragment
+                or url.username
+                or url.password
+            ):
+                raise LandStop("land_hook_changed", "archive revision path requires pinned SHA")
             identity = (url.hostname, pieces[0], pieces[1].removesuffix(".git"))
         else:
             continue

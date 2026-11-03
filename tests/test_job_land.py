@@ -15,11 +15,13 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from taskwatch import job_land
 from taskwatch.job_cli import main as cli_main
-from taskwatch.job_runner import run_job
+from taskwatch.job_runner import Ctx, run_job
 from taskwatch.job_scan import scan_jobs
 from taskwatch.jobs import Jobs, JobState, load_job_config
 from tests.git_fixture import git, make_repo
@@ -1366,3 +1368,97 @@ def test_successor_starts_from_the_landed_squash_after_the_branch_is_cleaned(mak
     second.finish()
     assert second.land()["B"] == squash and second.land()["pr"]["number"] == 18
     assert first.writes().count("pr merge") == 2
+
+
+# --- guards against changes while an external observation is in flight -----------------------
+
+
+def test_install_reloads_host_config_instead_of_using_the_runner_startup_copy(make):
+    lab = make()
+    startup = load_job_config(lab.root)
+    command = list(startup.install_command)
+    frozen = {
+        "status": "not_started",
+        "command": command,
+        "command_hash": job_land.digest(command),
+    }
+    job = lab.put("land", land_state={"S": "a" * 40, "install": frozen})
+    ctx = Ctx(lab.jobs, startup, job, lab.folder(), lab.tree)
+    transaction = job_land.Transaction(ctx, -1)
+    # Model a host edit during CI: the runner's startup config still contains the old hook.
+    lab.configure(install_command=None)
+
+    with pytest.raises(job_land.LandStop) as stopped:
+        transaction.install()
+
+    assert stopped.value.reason == "land_hook_changed"
+    assert lab.hook_calls() == []
+    assert lab.land()["install"]["status"] == "not_started"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://github.com/sample/project/archive/main.zip?pin={sha}",
+        "https://github.com/sample/project/archive/main.tar.gz#{sha}",
+        "https://github.com/sample/project/archive/main/{sha}.zip",
+        "https://github.com/sample/project/archive/{sha}.zip?download=1",
+    ],
+)
+def test_archive_source_must_pin_the_revision_path_not_incidental_url_text(source):
+    repo = SimpleNamespace(host="github.com", owner="sample", name="project")
+    valid = "https://github.com/sample/project/archive/{sha}.zip"
+    assert job_land.install_argv(("installer", valid), "a" * 40, "/target", repo) == [
+        "installer",
+        f"https://github.com/sample/project/archive/{'a' * 40}.zip",
+    ]
+    with pytest.raises(job_land.LandStop) as stopped:
+        job_land.install_argv(("installer", source), "a" * 40, "/target", repo)
+    assert stopped.value.reason == "land_hook_changed"
+
+
+def test_stale_acceptance_before_push_clears_the_prepared_transaction_with_the_requeue(make):
+    lab = make()
+    lab.accept()
+    old = {"phase": "head", "R": "a" * 40, "T": "b" * 40, "H": "c" * 40}
+    job = lab.put("land", land_state=old)
+    ctx = Ctx(lab.jobs, lab.config, job, lab.folder(), lab.tree)
+    transaction = job_land.Transaction(ctx, -1)
+    lab.write_text("body.md", "changed before the push\n")
+
+    with pytest.raises(job_land.FreshnessRequeued):
+        transaction.freshness()
+
+    current = lab.get()
+    assert current.stage == "check"
+    assert dict(current.land_state) == {}
+    assert current.recoveries == job.recoveries + 1
+    cleaned_forge(lab)
+
+
+@pytest.mark.parametrize("observed", ["success", "failed"])
+def test_ci_query_finishing_after_deadline_cannot_accept_green_or_spend_a_rerun(
+    monkeypatch, observed
+):
+    clock = [105.0]
+    transaction = object.__new__(job_land.Transaction)
+    transaction.state = {"ci_started_at": 100.0, "ci_deadline": 110.0}
+    transaction.current = lambda: SimpleNamespace(events=())
+    saved = []
+    reruns = []
+    transaction.save = lambda **changes: saved.append(changes)
+    transaction.rerun = lambda evidence: reruns.append(evidence)
+
+    def observation():
+        clock[0] = 111.0
+        return SimpleNamespace(state=observed, evidence=())
+
+    transaction.observe_ci = observation
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+
+    with pytest.raises(job_land.LandStop) as stopped:
+        transaction.ci()
+
+    assert stopped.value.reason == "land_ci_failed"
+    assert saved == [] and reruns == []
+    assert transaction.state["ci_deadline"] == 110.0
