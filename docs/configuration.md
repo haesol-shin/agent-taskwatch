@@ -224,6 +224,25 @@ shell; name a shell explicitly only when the approved check needs one.
 The work must create that check script if it is not already in its workspace.
 The checklist follows the existing nonempty `items` list of boolean `passes`.
 
+For jobs with a work contract, generated workflow and work, fix and resume messages
+grant writes outside the workspace only to these exact job-folder files:
+the configured `progress` and `checklist` paths, `brief.md`, `findings.json`,
+`root-cause.md`, and `pr/<id>/title.txt` and `pr/<id>/body.md` for declared
+`public_text` units only. Instructions enumerate the actual job-specific file paths,
+including nested configured record paths, not a writable folder or wildcard.
+Only parent directories needed for these named files may be created; directory
+deletion and writes to other job-folder files are not authorized.
+All these worker-owned files stay outside the workspace and must never be copied
+into the committed result. Findings are written when repairing review findings;
+root-cause evidence is needed for repeated rules. Neither is mandatory for an
+untouched initial result.
+
+The exception does not include the original prompt, copied inputs, `WORKFLOW.md`,
+reviews, snapshots, logs, sessions or global state. Review-only jobs receive no
+worker-owned file exception. Preparing declared public text grants no authority
+to publish it. Any action outside the recorded scope and named file exceptions
+still requires the existing wait-before-action approval procedure.
+
 `inputs`, `predecessors`, `expected_wait_seconds`, and `approval_required` are
 optional. Every other example field is required. Each entry of `predecessors` is
 an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored

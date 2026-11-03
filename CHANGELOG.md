@@ -4,6 +4,9 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 
 ## [Unreleased]
 
+### Fixed
+- Worker instructions grant precise job-folder writes for findings, repeated-rule evidence and declared public-text files consistently across work, fix and resume, without authorizing the whole folder or publication (see [configuration](docs/configuration.md)).
+
 ### Added
 - Example Hermes skill `examples/hermes/skills/taskwatch/SKILL.md` for splitting a request (`docs/review/design.md`), submitting receipt-key chains (`docs/configuration.md#chains-and-gates`), arming `needs --wait --from <cursor>`, approving gates after `taskwatch brief <predecessor>`, and relaying the delivery card unchanged (`docs/configuration.md`, "What needs the owner").
 - `taskwatch show [<job>]` adds a derived `activity` key (`<stage> <m>m; last progress <m>m ago: <last non-empty progress line>`, cut to one line of at most 120 characters, or without the trailing `: <line>` when the progress file has no non-empty line yet) for jobs in `work`, `fix`, `check` and `review`, and `null` for stopped or finished jobs (`taskwatch/activity.py`; `docs/configuration.md`, "What needs the owner").

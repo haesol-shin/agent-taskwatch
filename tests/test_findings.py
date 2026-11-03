@@ -195,6 +195,37 @@ def test_a_not_fixed_reason_reaches_the_next_reviewer(unit_env):
     assert "r1.F1 (P1) not_fixed: premise is false" in prompt
 
 
+def test_permission_aware_worker_repairs_findings_and_repeated_rule(unit_env):
+    env = unit_env
+    failed_review(env, line("F1", rule="K-7"))
+    folder = env.folder()
+    for round_no in (1, 2):
+        entries = json.dumps([{"id": f"r{round_no}.F1", "status": "fixed"}])
+        writes = {
+            str(folder / "findings.json"): entries,
+            str(folder / "pr/pr/title.txt"): "fix(x): correct evidence\n",
+            str(folder / "pr/pr/body.md"): f"Corrected evidence, round {round_no}.\n",
+        }
+        if round_no == 2:
+            writes[str(folder / "root-cause.md")] = NOTE
+        env.scenario([{"writes": writes, "require_write_grants": True}])
+        assert env.run("fix") == 0
+        assert env.get().stage == "check"
+        assert env.problems() == []
+        assert env.get().stage == "review"
+        assert not env.get().wait_reason
+        if round_no == 1:
+            env.scenario([{"reply": "\n".join([FAIL, body(line("F1", rule="K-7"))])}])
+            assert env.run("review") == 0
+            assert env.get().stage == "fix"
+    assert env.get().checks[-1]["noted"] == {"K-7": "a spec heading"}
+    assert git(env.tree, "status", "--porcelain") == ""
+    assert git(env.tree, "diff", "--name-only", env.get().base, "HEAD") == "out.txt"
+    assert (folder / "findings.json").is_file()
+    assert (folder / "root-cause.md").read_text() == NOTE
+    assert not (env.tree / "pr").exists()
+
+
 # --- repeats and notes ---------------------------------------------------------------------
 
 
