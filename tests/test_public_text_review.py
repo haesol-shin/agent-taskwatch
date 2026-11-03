@@ -13,8 +13,7 @@ from taskwatch.job_cli import main
 from taskwatch.job_delivery import _message
 from taskwatch.job_env import job_environment
 from taskwatch.job_runner import run_job
-from tests.git_fixture import git, make_repo
-from tests.test_job_runner import Env
+from tests.git_fixture import git
 from tests.test_public_text import UnitEnv
 from tests.verdicts import CODE_PASS
 
@@ -49,18 +48,29 @@ def text_command(env: UnitEnv, tmp_path: Path, *extra: str) -> int:
 # --- fingerprint ---------------------------------------------------------------------------
 
 
-def test_text_fingerprint_follows_title_body_and_commit_messages():
-    base = text_fingerprint("feat: a", "body", ["feat: a\n\nwhy"])
-    assert text_fingerprint("feat: b", "body", ["feat: a\n\nwhy"]) != base
-    assert text_fingerprint("feat: a", "body2", ["feat: a\n\nwhy"]) != base
-    assert text_fingerprint("feat: a", "body", ["feat: c\n\nwhy"]) != base
-    assert text_fingerprint("feat: a", "body", ["feat: a\n\nwhy", "fix: z"]) != base
+def test_text_fingerprint_follows_every_reviewed_input():
+    inputs = ["feat: a\n", "body", ["feat: a\n\nwhy"], "- Preserve reviewed bytes\n"]
+    base = text_fingerprint(*inputs)
+    for index, changed in enumerate(
+        ["feat: b\n", "body2", ["feat: c\n\nwhy"], "- Reject unreviewed bytes\n"]
+    ):
+        variant = inputs.copy()
+        variant[index] = changed
+        assert text_fingerprint(*variant) != base
+    assert text_fingerprint(*inputs[:3], inputs[3] + "\n") != base
 
 
 def test_snapshot_messages_keep_commit_order_past_99_commits(tmp_path):
     messages = [f"feat: change {n}" for n in range(1, 111)]
     unit = job_text.UnitText(
-        id="u", base="b", head="h", tree="t", title="t", body="b", messages=tuple(messages)
+        id="u",
+        base="b",
+        head="h",
+        tree="t",
+        title="t",
+        body="b",
+        commit="- Preserve order\n",
+        messages=tuple(messages),
     )
     for name, text in job_text._files({"u": unit}).items():
         path = tmp_path / name
@@ -71,14 +81,11 @@ def test_snapshot_messages_keep_commit_order_past_99_commits(tmp_path):
 
 
 def test_the_evidence_line_is_not_part_of_the_fingerprint():
-    plain = text_fingerprint("t", "body\n", ["m"])
+    plain = text_fingerprint("t", "body\n", ["m"], "squash")
     line = "Review evidence: round 1 PASS, code abc1234, text 12345678"
-    assert text_fingerprint("t", f"body\n\n{line}\n", ["m"]) == plain
-    assert text_fingerprint("t", f"body\n\n{line}\n", ["m"]) == text_fingerprint(
-        "t", "body\n\nReview evidence: round 9 PASS, code fffffff, text 00000000\n", ["m"]
-    )
-    # Any other added line still counts.
-    assert text_fingerprint("t", "body\n\nExtra\n", ["m"]) != plain
+    assert text_fingerprint("t", f"body\n\n{line}\n", ["m"], "squash") == plain
+    assert text_fingerprint("t", "body\n\nExtra\n", ["m"], "squash") != plain
+    assert text_fingerprint("t", "body\n", ["m"], f"squash\n{line}") != plain
 
 
 # --- stale text and re-review --------------------------------------------------------------
@@ -168,37 +175,16 @@ def test_a_changed_head_still_invalidates_the_review_after_the_ref_moved(tmp_pat
     assert env.get().stage == "check" and env.get().texts == {}
 
 
-def test_future_head_bases_resolve_once_the_commits_exist(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path, "repo")
-    units = [
-        {"id": "pr", "base": "main", "head": "HEAD~1"},
-        {"id": "pr2", "base": "HEAD~1", "head": "HEAD"},
-    ]
-    env = Env(tmp_path, monkeypatch, review="code", target=repo, public_text=units)
-    assert [u["base"] for u in env.get().public_text][1] == "HEAD~1"
-    assert env.run("check") == 0  # creates the work folder
-    tree = env.folder() / "worktree"
-    for name in ("one", "two"):
-        (tree / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
-        git(tree, "add", f"{name}.txt")
-        git(tree, "commit", "-m", f"feat(x): {name}\n\nWhy {name}.")
-    for unit in ("pr", "pr2"):
-        (env.folder() / "pr" / unit).mkdir(parents=True, exist_ok=True)
-        for name in ("title.txt", "body.md"):
-            (env.folder() / "pr" / unit / name).write_text("text\n", encoding="utf-8")
-    states = job_text.states(job_text.collect(env.get(), tree, env.folder(), job_environment({})))
-    assert states["pr2"]["base"] == git(tree, "rev-parse", "HEAD~1") == states["pr"]["head"]
-
-
-def test_the_reviewer_message_names_the_snapshot_and_the_unit_range(unit_env):
-    unit_env.scenario([REPLY])
-    unit_env.commit("feat(x): add\n\nWhy.")
-    assert unit_env.problems() == []
-    assert unit_env.run("review") == 0
-    prompt = unit_env.prompts()[-1]
-    state = unit_env.get().texts["pr"]
-    assert "Public text snapshot (read only)" in prompt
-    assert f"git diff {state['base']} {state['head']}" in prompt
+def test_a_subset_head_cannot_pass_the_check(unit_env):
+    unit_env.commit("feat(x): first\n\nWhy one.")
+    first = git(unit_env.tree, "rev-parse", "HEAD")
+    git(unit_env.tree, "commit", "--allow-empty", "-m", "fix(x): second\n\nWhy two.")
+    unit = {**unit_env.get().public_text[0], "head": first}
+    assert unit_env.run("check", public_text=(unit,)) == 0
+    job = unit_env.get()
+    assert job.stage == "fix"
+    assert any("complete job base and result HEAD" in p for p in job.checks[-1]["problems"])
+    assert job.texts == {}
 
 
 def test_the_snapshot_is_read_only_and_its_hash_is_recorded(unit_env):
@@ -207,38 +193,72 @@ def test_the_snapshot_is_read_only_and_its_hash_is_recorded(unit_env):
     root = Path(record["snapshot"])
     assert (root / "pr" / "body.md").read_text() == "body\n"
     assert (root / "pr" / "commits" / "01.txt").read_text().startswith("feat(x): add")
+    assert (root / "pr" / "commit.txt").read_text() == "- Preserve the complete result\n"
+    assert record["texts"]["pr"]["text_contract"] == 2
     assert stat.S_IMODE((root / "pr" / "body.md").stat().st_mode) == 0o444
     assert not os.access(root / "pr", os.W_OK) or os.geteuid() == 0
     assert record["snapshot_sha256"] == job_text.snapshot_digest(root)
 
 
-def test_two_units_are_judged_against_their_own_range_and_go_stale_alone(tmp_path, monkeypatch):
-    env = UnitEnv(tmp_path, monkeypatch)
-    env.commit("feat(x): first\n\nWhy one.")
-    first = git(env.tree, "rev-parse", "HEAD")
-    (env.tree / "two.txt").write_text("2\n", encoding="utf-8")
-    git(env.tree, "add", "two.txt")
-    git(env.tree, "commit", "-m", "feat(x): second\n\nWhy two.")
-    units = (
-        {"id": "pr", "base": "main", "head": first},
-        {"id": "pr2", "base": first, "head": "HEAD"},
+def test_a_commit_body_edit_invalidates_review_and_copy(unit_env, tmp_path):
+    reviewed(unit_env, turns=2)
+    unit_env.write_text("commit.txt", "- Reject unreviewed publication\n")
+    assert text_command(unit_env, tmp_path) == 2
+    assert not (tmp_path / "out").exists()
+    assert unit_env.run("review") == 0
+    assert unit_env.get().stage == "check"
+    assert unit_env.problems() == []
+    assert unit_env.run("review") == 0
+    assert text_command(unit_env, tmp_path) == 0
+    assert (tmp_path / "out" / "commit.txt").read_text() == "- Reject unreviewed publication\n"
+
+
+def test_historical_multi_unit_evidence_stays_readable_without_promotion(
+    unit_env, tmp_path, capsys
+):
+    reviewed(unit_env)
+    record = dict(unit_env.get().reviews[-1])
+    snapshot = Path(record["snapshot"])
+    (snapshot / "pr").chmod(0o755)
+    (snapshot / "pr" / "commit.txt").unlink()
+    state = dict(record["texts"]["pr"])
+    state.pop("text_contract")
+    state["fingerprint"] = text_fingerprint(
+        "feat(x): add\n", "body\n", job_text.snapshot_messages(snapshot / "pr"), None
     )
-    (env.folder() / "pr" / "pr2").mkdir()
-    for name in ("title.txt", "body.md"):
-        (env.folder() / "pr" / "pr2" / name).write_text("text\n", encoding="utf-8")
-    env.scenario([REPLY])
-    assert env.run("check", public_text=units) == 0
-    job = env.get()
-    assert job.stage == "review" and job.texts["pr"]["head"] == first
-    assert job.texts["pr2"]["base"] == first
-    assert env.run("review") == 0
-    prompt = env.prompts()[-1]
-    assert f"git diff {first} {job.texts['pr2']['head']}" in prompt
-    env_vars = job_environment({})
-    before = job_text.states(job_text.collect(env.get(), env.tree, env.folder(), env_vars))
-    (env.folder() / "pr" / "pr2" / "body.md").write_text("edited\n", encoding="utf-8")
-    after = job_text.states(job_text.collect(env.get(), env.tree, env.folder(), env_vars))
-    assert before["pr"] == after["pr"] and before["pr2"] != after["pr2"]
+    record.update(texts={"pr": state}, snapshot_sha256=job_text.snapshot_digest(snapshot))
+    units = (*unit_env.get().public_text, {"id": "old", "base": state["head"], "head": "HEAD"})
+    unit_env.put("deliver_pending", public_text=units, texts={"pr": state}, reviews=(record,))
+    loaded = unit_env.jobs.load()[unit_env.job.id]
+    assert len(loaded.public_text) == 2
+    # Historical fingerprints and snapshots used universal-newline reads.
+    for name, value in (("title.txt", b"feat(x): add\r\n"), ("body.md", b"body\r\n")):
+        (unit_env.folder() / "pr/pr" / name).write_bytes(value)
+    unit_env.write_text("commit.txt", "- This live file was never reviewed\n")
+    assert text_command(unit_env, tmp_path, "--pr", "pr") == 0
+    assert "Historical text:" in capsys.readouterr().out
+    assert not (tmp_path / "out" / "commit.txt").exists()
+    with pytest.raises(ValueError, match="historical"):
+        job_text.collect(loaded, unit_env.tree, unit_env.folder(), job_environment({}))
+
+
+def test_historical_copy_refuses_a_stale_squash_file(unit_env, tmp_path):
+    reviewed(unit_env)
+    record = dict(unit_env.get().reviews[-1])
+    state = dict(record["texts"]["pr"])
+    state.pop("text_contract")
+    state["fingerprint"] = text_fingerprint(
+        "feat(x): add\n",
+        "body\n",
+        job_text.snapshot_messages(Path(record["snapshot"]) / "pr"),
+        None,
+    )
+    record["texts"] = {"pr": state}
+    unit_env.put("deliver_pending", texts={"pr": state}, reviews=(record,))
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "commit.txt").write_text("stale\n")
+    assert text_command(unit_env, tmp_path) == 1
+    assert not (tmp_path / "out" / "title.txt").exists()
 
 
 # --- taskwatch text ------------------------------------------------------------------------
@@ -253,7 +273,8 @@ def test_text_writes_the_reviewed_copy_with_one_evidence_line(unit_env, tmp_path
     reviewed(unit_env)
     assert text_command(unit_env, tmp_path) == 0
     out = capsys.readouterr().out.split()
-    assert out == [str(tmp_path / "out" / "title.txt"), str(tmp_path / "out" / "body.md")]
+    assert out == [str(tmp_path / "out" / name) for name in ("title.txt", "body.md", "commit.txt")]
+    assert (tmp_path / "out" / "commit.txt").read_text() == "- Preserve the complete result\n"
     assert (tmp_path / "out" / "title.txt").read_text() == "feat(x): add\n"
     state = unit_env.get().texts["pr"]
     body = (tmp_path / "out" / "body.md").read_text()
@@ -391,3 +412,21 @@ def test_no_text_change_means_no_only_text_changed_claim(unit_env):
     assert run_job(unit_env.jobs, unit_env.config, unit_env.job.id, unit_env.attempt) == 0
     prompt = unit_env.prompts()[-1]
     assert "only text changed" not in prompt and "Text changed since" not in prompt
+
+
+def test_a_partial_base_cannot_pass_the_check(unit_env):
+    unit_env.commit("feat(x): first\n\nWhy one.")
+    first = git(unit_env.tree, "rev-parse", "HEAD")
+    git(unit_env.tree, "commit", "--allow-empty", "-m", "fix(x): second\n\nWhy two.")
+    unit = {**unit_env.get().public_text[0], "base": first}
+    assert unit_env.run("check", public_text=(unit,)) == 0
+    job = unit_env.get()
+    assert job.stage == "fix" and job.texts == {}
+    assert any("complete job base and result HEAD" in p for p in job.checks[-1]["problems"])
+
+
+def test_a_blank_pr_body_cannot_be_reviewed(unit_env):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    unit_env.write_text("body.md", " \n")
+    assert any("nonblank" in p for p in unit_env.problems())
+    assert unit_env.get().stage == "fix"

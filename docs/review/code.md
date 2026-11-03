@@ -48,15 +48,15 @@ Use this file with the common guidelines when the deliverable is a code change.
 
 ## Public text
 
-Use these rules when the assignment names public text: the commit messages, title and body of one or more pull request units.
+Use these rules when the assignment names public text: the step commit messages, pull request title and body, and mandatory body-only squash text of the job's complete-result publication unit. [Configuration](../configuration.md#public-text) owns the unit boundary and three-file contract; [Checks](../checks.md#public-text-evidence) owns generated evidence and historical status.
 
-**K-15.** Check every statement in a unit's commit messages, title and body about the change against that unit's diff, not against the whole branch. A result the text reports as produced by the unit, such as a test count or a manual run, must hold at the unit's head, or the text must say what ran instead. A statement the unit's diff does not support is `evidence`: P1 when a reader would decide on it, P2 otherwise.
+**K-15.** Check every statement in the step commit messages, pull request title and body, and squash body against the complete job diff from its effective base to result HEAD. A result the text reports as produced by the job, such as a test count or a manual run, must hold at that head, or the text must say what ran instead. A statement the diff does not support is `evidence`: P1 when a reader would decide on it, P2 otherwise.
 
 **K-16.** A statement about what is not in the diff, a draft, or history is a finding, unless the change needs it for a merge decision.
 
-**K-17.** The runner checks the commit subject shape and length, the blank line after it, line length and trailers before the review. Do not judge them. Every other text rule of the repository stays with you, as part of the repository conventions rule of the common guidelines.
+**K-17.** The runner checks the step and proposed squash message subject shape and length, blank line, line length and trailers before the review. Do not judge them. Every other text rule of the repository stays with you, as part of the repository conventions rule of the common guidelines; review the mandatory squash body for its explanation of the problem or reason for the change.
 
-**K-18.** The body states the known limits of the change, and a missing limit is P2. It carries the evidence the repository's contributing rules ask for, and missing evidence is P3.
+**K-18.** The pull request body states the known limits of the change, and a missing limit is P2. It carries the evidence the repository's contributing rules ask for, and missing evidence is P3. Evidence belongs in that body, not in the squash body as a substitute for explaining why the change is needed.
 
 ## Scope and write targets
 

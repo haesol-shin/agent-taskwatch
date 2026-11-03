@@ -12,7 +12,7 @@ When the result fingerprint and the basis (intent, spec, guidelines) equal those
 
 The checklist is a JSON file with a nonempty `items` list. Each item has a boolean `passes`. A `false` item, a missing file, invalid JSON, or an empty list blocks progress.
 
-The commit message of every commit in a pull request unit (`public_text`) is checked: the title is `type(scope): summary` or `type: summary` and at most 72 characters, one blank line follows it, no body line is over 72 characters, and no line is a trailer such as `Co-authored-by:`. With `commit_rules.bullet_one_line` on in [jobs-config.json](configuration.md#commit-rules), a body bullet (a line that starts with `- ` or `* `) also fails when an indented text line follows it: `line N continues the bullet on line M`. The switch is off by default; a nested bullet and a blank line after a bullet are not continuations.
+The commit message of every step commit in the publication range is checked: the title is `type(scope): summary` or `type: summary` and at most 72 characters, one blank line follows it, no body line is over 72 characters, and no line is a trailer such as `Co-authored-by:`. The proposed squash message uses `title.txt` as its subject and the mandatory body-only `commit.txt` as its body, and passes the same rules. With `commit_rules.bullet_one_line` on in [jobs-config.json](configuration.md#commit-rules), a body bullet (a line that starts with `- ` or `* `) also fails when an indented text line follows it: `line N continues the bullet on line M`. The switch is off by default; a nested bullet and a blank line after a bullet are not continuations.
 
 Work and review sessions must settle and report no pending asynchronous work through public RPC state before the runner advances. Child transcripts and manifests are not acceptance evidence.
 
@@ -38,7 +38,35 @@ The review session is separate from the work session. Re-review includes prior f
 
 Each finding in the output has a heading `### F<n>` and one JSON line with `finding`, `severity` (P0 to P3), `category`, `rule` (a guideline rule id, `text/<rule>`, or `other`), `location` and an optional `summary` (one line, at most 160 characters). The runner validates only those lines: ids are unique and match the headings, and a `PASS` carries no P0 or P1. The worker's record of each finding and the checks on repeated rules are in [Finding records and repeated rules](#finding-records-and-repeated-rules).
 
-For a job with `public_text`, the review reads a read-only snapshot of each unit's title, body and commit messages, and the record keeps its hash and one text fingerprint per unit. A changed title, body or commit message makes an earlier PASS stop counting and starts a new review round; when the tree is the same the reviewer is told that only text changed and is shown the text diff. The one `Review evidence:` line is not part of the fingerprint. `taskwatch text <job> --out <dir>` writes the reviewed title and body, plus that line, and exits 2 when the text or the snapshot changed since the review, 3 when no review has passed.
+### Public text evidence
+
+[Configuration](configuration.md#public-text) owns the submission shape, complete-result range and exact worker grants; this section owns the generated evidence and copy contract.
+
+The check requires nonblank `title.txt`, `body.md` and body-only `commit.txt`; the title must be one subject line, and the title and squash body must be UTF-8. The squash body explains the problem or reason for the change rather than replacing it with a commit list, review process or test log.
+
+Each new checked or reviewed publication state carries generated integer `text_contract: 2`, resolved base and head, the head tree and its text fingerprint.
+
+The text fingerprint binds the title, pull request body, squash body and ordered step commit messages; the single generated `Review evidence:` line in the pull request body is excluded.
+
+The review reads a read-only snapshot containing the three texts and the step commit messages, and the record retains the snapshot digest and publication state.
+
+A changed title, pull request body, squash body or step commit message invalidates an earlier PASS; when the code is unchanged, the next round receives the text diff as a text-only review.
+
+`taskwatch text <job> [--pr <id>] --out <dir>` validates the accepted snapshot digest and current text fingerprint, then copies the reviewed `title.txt`, `body.md` and `commit.txt` from that snapshot.
+
+The copied pull request body gains one `Review evidence:` line; the squash body is copied without that line.
+
+The command exits 2 if the live text or accepted snapshot changed and 3 if no text review has passed.
+
+Historical records without `text_contract: 2` remain readable using their original newline-normalized fingerprint and title/body snapshot; they are explicitly nonlandable because they prove neither a reviewed squash body nor complete-result landing coverage.
+
+A historical reviewed copy succeeds only as historical evidence, writes `title.txt` and `body.md` only, and prints `Historical text: title/body only; no reviewed squash body or landing coverage`.
+
+It never synthesizes `commit.txt` and refuses an output folder that already contains that file.
+
+Adding a live squash body cannot upgrade old checked or reviewed evidence to contract 2; submit a new job for the complete contract.
+
+Neither the new marker nor a successful copy implements or authorizes publication or landing.
 
 ### Finding records and repeated rules
 

@@ -89,37 +89,119 @@ def test_a_moved_ref_does_not_change_the_stored_external_base(tmp_path):
     assert Jobs(tmp_path / "root").load()[job.id].public_text[0]["base"] == first
 
 
-def test_each_external_base_keeps_its_own_commit(tmp_path):
-    repo = make_repo(tmp_path, "repo")
-    (repo / "two.txt").write_text("2\n", encoding="utf-8")
-    git(repo, "add", "two.txt")
-    git(repo, "commit", "-m", "two")
-    units = [
-        {"id": "a", "base": "main~1", "head": "step-a"},
-        {"id": "b", "base": "main", "head": "HEAD"},
-    ]
-    data = {**payload(tmp_path), "review": "code", "target": str(repo), "public_text": units}
-    Path(data["spec"]).write_text(VALID_SPEC, encoding="utf-8")
-    bases = [u["base"] for u in Jobs(tmp_path / "root").submit(data, 10).public_text]
-    assert bases == [git(repo, "rev-parse", "main~1"), git(repo, "rev-parse", "main")]
+@pytest.mark.parametrize(
+    "units",
+    [
+        [
+            {"id": "a", "base": "main~1", "head": "step-a"},
+            {"id": "b", "base": "main", "head": "HEAD"},
+        ],
+        [
+            {"id": "a", "base": "main", "head": "step-a"},
+            {"id": "b", "base": "step-a", "head": "HEAD"},
+        ],
+        [
+            {"id": "a", "base": "main", "head": "HEAD~1"},
+            {"id": "b", "base": "HEAD~1", "head": "HEAD"},
+        ],
+    ],
+)
+def test_submit_refuses_multiple_units_and_instructs_split_into_jobs(tmp_path, units):
+    jobs = Jobs(tmp_path / "root")
+    with pytest.raises(ValueError, match="exactly one unit; split.*into jobs"):
+        jobs.submit(code_payload(tmp_path, units), 10)
+    assert jobs.load() == {}
 
 
-def test_submit_accepts_a_stacked_base_that_is_another_units_head(tmp_path):
-    units = [
-        {"id": "a", "base": "main", "head": "step-a"},
-        {"id": "b", "base": "step-a", "head": "HEAD"},
-    ]
-    stored = Jobs(tmp_path / "root").submit(code_payload(tmp_path, units), 10).public_text
-    assert [u["base"] for u in stored] == [git(tmp_path / "repo", "rev-parse", "main"), "step-a"]
+def test_submit_pins_a_base_even_when_it_also_names_the_unit_head(tmp_path):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "HEAD", "head": "HEAD"}])
+    job = Jobs(tmp_path / "root").submit(data, 10)
+    assert job.public_text[0]["base"] == git(tmp_path / "repo", "rev-parse", "HEAD")
 
 
-def test_a_future_head_reference_stays_symbolic(tmp_path):
-    units = [
-        {"id": "a", "base": "main", "head": "HEAD~1"},
-        {"id": "b", "base": "HEAD~1", "head": "HEAD"},
-    ]
-    stored = Jobs(tmp_path / "root").submit(code_payload(tmp_path, units), 10).public_text
-    assert [u["base"] for u in stored] == [git(tmp_path / "repo", "rev-parse", "main"), "HEAD~1"]
+def test_submit_preserves_workspace_default_base_selection(tmp_path):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "main"}])
+    job = Jobs(tmp_path / "root").submit(data, 10)
+    assert job.base == ""
+
+
+def test_submit_accepts_an_explicit_base_resolving_to_the_same_commit(tmp_path):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "main"}])
+    job = Jobs(tmp_path / "root").submit({**data, "base": "HEAD"}, 10)
+    assert job.base == "HEAD"
+    assert job.public_text[0]["base"] == git(tmp_path / "repo", "rev-parse", "HEAD")
+
+
+def test_submit_refuses_a_unit_base_that_omits_part_of_the_explicit_job_range(tmp_path):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "main"}])
+    repo = tmp_path / "repo"
+    git(repo, "commit", "--allow-empty", "-m", "advance")
+    jobs = Jobs(tmp_path / "root")
+    with pytest.raises(ValueError, match="public_text base must equal the effective job base"):
+        jobs.submit({**data, "base": "HEAD~1"}, 10)
+    assert jobs.load() == {}
+
+
+@pytest.mark.parametrize("branch_exists", [False, True])
+def test_public_text_preserves_predecessor_receipt_base_resolution(tmp_path, branch_exists):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "main"}])
+    jobs = Jobs(tmp_path / "root")
+    predecessor = jobs.submit({**data, "receipt_key": "predecessor"}, 10)
+    branch = f"taskwatch/{predecessor.id[:8]}"
+    if branch_exists:
+        git(tmp_path / "repo", "branch", branch)
+    successor = jobs.submit(
+        {
+            **data,
+            "receipt_key": "successor",
+            "base": "@predecessor",
+            "predecessors": ["predecessor"],
+        },
+        11,
+    )
+    assert successor.base == branch
+    assert successor.predecessors == (predecessor.id,)
+    assert successor.public_text[0]["base"] == git(tmp_path / "repo", "rev-parse", "main")
+
+
+def test_historical_multiple_units_and_two_file_text_evidence_remain_readable(tmp_path):
+    jobs = Jobs(tmp_path / "root")
+    job = jobs.submit(code_payload(tmp_path, [{"id": "pr", "base": "main"}]), 10)
+    base = job.public_text[0]["base"]
+    units = (
+        {"id": "first", "base": base, "head": "step-a"},
+        {"id": "second", "base": "step-a", "head": "HEAD"},
+    )
+    texts = {
+        unit["id"]: {
+            "base": base,
+            "head": base,
+            "tree": "0" * 40,
+            "text_fingerprint": "1" * 64,
+            "title": "fix: preserve historical evidence",
+            "body": "Historical title and body only.\n",
+        }
+        for unit in units
+    }
+    historical = replace(job, public_text=units, texts=texts)
+    jobs.save(historical, 11)
+    loaded = Jobs(tmp_path / "root").load()[job.id]
+    assert loaded.public_text == historical.public_text
+    assert loaded.texts == historical.texts
+
+
+def test_a_code_job_without_public_text_remains_a_nonpublisher(tmp_path):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "main"}])
+    del data["public_text"]
+    job = Jobs(tmp_path / "root").submit(data, 10)
+    assert job.public_text == ()
+
+
+@pytest.mark.parametrize("field", ["text_contract", "public_text_version"])
+def test_submit_does_not_accept_a_public_text_version_key(tmp_path, field):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "main"}])
+    with pytest.raises(ValueError, match="unknown fields"):
+        Jobs(tmp_path / "root").submit({**data, field: 2}, 10)
 
 
 @pytest.mark.parametrize(
@@ -132,6 +214,9 @@ def test_a_future_head_reference_stays_symbolic(tmp_path):
         [{"id": "a", "base": "main", "head": "other"}, {"id": "b", "base": "HEAD~1"}],
         [{"id": "pr"}],
         [],
+        {"id": "pr", "base": "main"},
+        [{"id": "pr", "base": "main", "text_contract": 2}],
+        [{"id": "pr", "base": "main", "version": 2}],
     ],
 )
 def test_submit_refuses_bad_units(tmp_path, units):
@@ -204,6 +289,7 @@ class UnitEnv(Env):
         (self.folder() / "pr" / "pr").mkdir(parents=True, exist_ok=True)
         self.write_text("title.txt", "feat(x): add\n")
         self.write_text("body.md", "body\n")
+        self.write_text("commit.txt", "- Preserve the complete result\n")
 
     def write_text(self, name: str, text: str) -> None:
         (self.folder() / "pr" / "pr" / name).write_text(text, encoding="utf-8")
@@ -216,6 +302,45 @@ class UnitEnv(Env):
     def problems(self) -> list[str]:
         assert self.run("check") == 0
         return list(self.get().checks[-1]["problems"])
+
+
+@pytest.mark.parametrize("body", ["", "x" * 73, "Co-authored-by: A <a@example.invalid>"])
+def test_invalid_squash_body_cannot_reach_review(unit_env, body):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    unit_env.write_text("commit.txt", body)
+    assert any("squash message" in p for p in unit_env.problems())
+    assert unit_env.get().stage == "fix" and unit_env.get().reviews == ()
+
+
+def test_squash_bullet_rules_use_host_configuration_without_rewriting(unit_env):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    body = "- Explain the reason\n  on a second line\n"
+    unit_env.write_text("commit.txt", body)
+    assert unit_env.problems() == []
+    unit_env.config = replace(unit_env.config, bullet_one_line=True)
+    assert any("squash message" in p and "continues" in p for p in unit_env.problems())
+    assert (unit_env.folder() / "pr/pr/commit.txt").read_text() == body
+
+
+def test_missing_squash_body_is_a_required_file_problem(unit_env):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    (unit_env.folder() / "pr/pr/commit.txt").unlink()
+    assert unit_env.problems() == ["required file is missing: pr/pr/commit.txt"]
+
+
+def test_a_multiline_title_cannot_become_a_squash_subject(unit_env):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    unit_env.write_text("title.txt", "feat(x): add\n\nHidden body\n")
+    assert any("exactly one subject line" in p for p in unit_env.problems())
+    assert unit_env.get().stage == "fix"
+
+
+@pytest.mark.parametrize("name", ["title.txt", "commit.txt"])
+def test_non_utf8_publication_text_routes_to_worker_fix(unit_env, name):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    (unit_env.folder() / "pr/pr" / name).write_bytes(b"\xff\n")
+    assert any("UTF-8" in p for p in unit_env.problems())
+    assert unit_env.get().stage == "fix"
 
 
 @pytest.fixture

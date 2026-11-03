@@ -10,7 +10,7 @@ Use `taskwatch` for approved background jobs (`review`: `source`, `design`, or `
 
 ## 1. Split and prepare
 
-- Split a multi-unit or multi-job request and write the `## Units` table by [`docs/review/design.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/review/design.md#splitting-a-plan) and [`docs/spec-template.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/spec-template.md).
+- Split a multi-unit or multi-job request and write the `## Units` table by [`docs/review/design.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/review/design.md#splitting-a-plan) and [`docs/spec-template.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/spec-template.md); each independently reviewable and mergeable pull request is a separate job.
 - Check `<root>/taskwatch/defaults.json` for standing owner choices ([`docs/configuration.md#owner-defaults`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#owner-defaults) and [`docs/kinds/design.md#choicesjson`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/kinds/design.md#choicesjson)).
 
 ## 2. Submit
@@ -18,8 +18,9 @@ Use `taskwatch` for approved background jobs (`review`: `source`, `design`, or `
 Follow [`docs/configuration.md#chains-and-gates`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#chains-and-gates):
 
 1. Read the current `cursor` with `taskwatch --root <root> needs` before or right after submitting.
-2. Submit ordered units in one pass with `taskwatch --root <root> submit <job.json>`, giving each unit `receipt_key: "<approval-source>:<n>"`, `predecessors` with the earlier unit's receipt key (or id), and `base: "@<predecessor-receipt-key>"` for stacked `code` units.
-3. Set `approval_required: true` on any unit that waits for an owner decision on its predecessor's result.
+2. Submit ordered jobs in one pass with `taskwatch --root <root> submit <job.json>`, giving each job `receipt_key: "<approval-source>:<n>"`, `predecessors` with the earlier job's receipt key (or id), and `base: "@<predecessor-receipt-key>"` for stacked `code` jobs.
+3. Set `approval_required: true` on any job that waits for an owner decision on its predecessor's result.
+4. For publication text, follow [`docs/configuration.md#public-text`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#public-text) for the one complete-result item and three required texts, including its body-only squash text; [`docs/checks.md#public-text-evidence`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/checks.md#public-text-evidence) owns generated evidence, reviewed copies and historical nonlandable status.
 
 ## 3. Arm `needs --wait`
 

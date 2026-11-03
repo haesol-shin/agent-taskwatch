@@ -48,10 +48,12 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--run-command", action="store_true", help="Also run the job's check command"
     )
-    text = commands.add_parser("text", help="Write the reviewed title and body of a pull request")
+    text = commands.add_parser("text", help="Write the reviewed publication texts")
     text.add_argument("job")
     text.add_argument("--pr", help="Unit id; optional when the job has one unit")
-    text.add_argument("--out", type=Path, required=True, help="Folder for title.txt and body.md")
+    text.add_argument(
+        "--out", type=Path, required=True, help="Folder for title.txt, body.md and commit.txt"
+    )
     for name in ("cancel", "wait", "approve", "resume"):
         action = commands.add_parser(name)
         action.add_argument("job")

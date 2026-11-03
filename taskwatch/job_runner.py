@@ -632,9 +632,12 @@ def _text_lines(job: JobState, review_root: Path) -> list[str]:
         state = job.texts.get(unit["id"], {})
         base, head = state.get("base", unit["base"]), state.get("head", unit["head"])
         lines.append(
-            f"Unit {unit['id']}: title, body and commit messages are under "
+            f"Unit {unit['id']} (text_contract=2): review title.txt, body.md, commit.txt "
+            f"(final squash body), and the separate step messages under commits/ in "
             f"{review_root / job_text.SNAPSHOT / unit['id']}; "
             f"judge each claim against `git diff {base} {head}` and `git log {base}..{head}`."
+            " Validate the title plus one blank line plus commit.txt as the squash message; "
+            "the squash body must never be inferred from the step messages."
         )
     return lines
 
@@ -1019,6 +1022,31 @@ def _text_problems(
     return problems
 
 
+def _squash_problems(ctx: Ctx) -> list[str]:
+    problems = []
+    for unit in ctx.job.public_text:
+        try:
+            title, commit = (
+                job_text.unit_file(ctx.folder, unit["id"], name).read_text(encoding="utf-8")
+                for name in ("title.txt", "commit.txt")
+            )
+        except OSError:
+            continue  # Missing files already have an exact path problem.
+        except UnicodeError:
+            problems.append(f"public text {unit['id']}: title.txt and commit.txt must be UTF-8")
+            continue
+        rules = message_problems(
+            title.rstrip("\n") + "\n\n" + commit,
+            bullet_one_line=ctx.config.bullet_one_line,
+        )
+        if len(title.rstrip("\n").splitlines()) != 1:
+            rules.append("title.txt must contain exactly one subject line")
+        if not commit.strip():
+            rules.append("commit.txt must contain the final squash body")
+        problems += [f"public text {unit['id']}: squash message: {p}" for p in rules]
+    return problems
+
+
 def _file_problems(jobs: Jobs, job: JobState, workspace: Path, folder: Path) -> list[str]:
     problems = []
     for base, rel in [*((workspace, item) for item in job.outputs), (folder, job.progress)]:
@@ -1148,6 +1176,7 @@ def _shape(ctx: Ctx, problems: list[str]) -> tuple[str, str, dict, dict]:
     job = ctx.job
     problems += _file_problems(ctx.jobs, job, ctx.workspace, ctx.folder)
     problems += _text_problems(job, ctx.workspace, ctx.env, ctx.config.bullet_one_line)
+    problems += _squash_problems(ctx)
     texts = _public_texts(ctx, problems)
     fingerprint = basis = ""
     try:
