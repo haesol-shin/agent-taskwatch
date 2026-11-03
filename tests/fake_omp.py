@@ -16,7 +16,17 @@ A turn runs when a prompt arrives (the Nth prompt over all processes takes turn 
   status: prompt_result status (default completed)
   sleep: seconds to wait before finishing the turn
   notice: emit a session-persistence error notice; oversize: emit a frame over the limit
+  error: prompt_result error object, for example a quota failure with status "failed"
   (scenario) exit_code: exit code after stdin closes
+
+Models. Each process launches on one model: `--model provider/id` on its command line, or
+`--model @role` resolved now through roles.json in FAKE_OMP_STATE (a test rewrites that file
+to change what the role means), else scenario `default_model` ("synthetic/default"). Every
+session line records the model that served it, and a resumed session restores its saved model
+unless open_session carries `provider` and `modelId` together. Scenario switches:
+  startup_state: "missing" | "malformed"   get_state reports no usable model
+  open: "ignore" | "reject" | "cancel" | "hang"
+        ignore the model override, answer model-not-found, answer cancelled, never answer
 """
 
 import base64
@@ -34,6 +44,7 @@ STATE.mkdir(parents=True, exist_ok=True)
 FRAME_LIMIT = 1 << 20
 
 protocol = 1
+model = ""
 chunks = 0
 session_file: Path | None = None
 settled = True
@@ -100,8 +111,35 @@ def respond(cmd: dict, data=None, ok: bool = True, error: str = "") -> None:
     emit(frame)
 
 
+def launch_model() -> str:
+    argv = sys.argv[1:]
+    spec = SCENARIO.get("default_model", "synthetic/default")
+    if "--model" in argv:
+        spec = argv[argv.index("--model") + 1]
+        if spec.startswith("@"):
+            spec = json.loads((STATE / "roles.json").read_text(encoding="utf-8"))[spec]
+    return spec
+
+
+def saved_model(path: Path) -> str:
+    for line in reversed(path.read_text(encoding="utf-8").splitlines()):
+        entry = json.loads(line)
+        if "model_change" in entry or "model" in entry:
+            return entry.get("model_change") or entry["model"]
+    return ""
+
+
 def open_session(cmd: dict) -> None:
-    global session_file
+    global session_file, model
+    mode = SCENARIO.get("open", "")
+    if mode == "hang":
+        time.sleep(30)
+    if mode == "reject":
+        respond(cmd, ok=False, error="Model not found: unknown/model")
+        return
+    if mode == "cancel":
+        respond(cmd, {"cancelled": True})
+        return
     directory = Path(cmd["sessionDir"])
     directory.mkdir(parents=True, exist_ok=True)
     # Like the public contract: only the newest nonempty session is resumable.
@@ -109,6 +147,17 @@ def open_session(cmd: dict) -> None:
     resumed = bool(existing)
     session_file = existing[-1] if existing else directory / "s1.jsonl"
     session_file.touch()
+    override = None
+    if mode != "ignore" and cmd.get("provider") and cmd.get("modelId"):
+        override = f"{cmd['provider']}/{cmd['modelId']}"
+    if resumed:
+        saved = saved_model(session_file) or model
+        model = override or saved
+        if model != saved:
+            with session_file.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"model_change": model}) + "\n")
+    else:
+        model = override or model
     respond(
         cmd,
         {
@@ -120,10 +169,20 @@ def open_session(cmd: dict) -> None:
     )
 
 
+def model_state() -> dict:
+    mode = SCENARIO.get("startup_state")
+    if mode == "missing":
+        return {}
+    provider, _, ident = model.partition("/")
+    if mode == "malformed":
+        return {"model": {"provider": "", "id": 7}}
+    return {"model": {"provider": provider, "id": ident}}
+
+
 def record_prompt(message: str) -> None:
     if session_file is not None:
         with session_file.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"prompt": message}) + "\n")
+            handle.write(json.dumps({"prompt": message, "model": model}) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -164,6 +223,7 @@ def prompt(cmd: dict) -> None:
             "id": cmd["id"],
             "agentInvoked": True,
             "status": turn.get("status", "completed"),
+            **({"error": turn["error"]} if "error" in turn else {}),
             "sessionSettled": not (turn.get("no_settle") or followup),
         }
     )
@@ -188,7 +248,7 @@ def handle(cmd: dict) -> None:
     elif kind == "open_session":
         open_session(cmd)
     elif kind == "get_state":
-        respond(cmd, {"isSettled": settled, "hasPendingAsyncWork": pending})
+        respond(cmd, {"isSettled": settled, "hasPendingAsyncWork": pending, **model_state()})
     elif kind == "prompt":
         # A real session keeps serving commands while a turn runs.
         thread = threading.Thread(target=prompt, args=(cmd,))
@@ -203,6 +263,8 @@ def handle(cmd: dict) -> None:
 
 
 def main() -> None:
+    global model
+    model = launch_model()
     log({"argv": sys.argv[1:], "cwd": os.getcwd()})
     emit(
         {

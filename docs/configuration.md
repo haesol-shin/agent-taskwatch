@@ -44,6 +44,21 @@ reads the agent definition and those guidelines when the review starts:
                    "--guidelines", "{guidelines}", "--review", "{review}"]
 ```
 
+### Model selection
+
+Each RPC process that taskwatch launches (work, fix, and a review in the default `rpc` mode) chooses its model from its own command, and taskwatch binds the job conversation to that model. After the protocol handshake it reads the launched model from `get_state` (`model.provider`, `model.id`), then opens the conversation with `open_session` carrying `sessionDir` and that `provider` and `modelId`, and sends the prompt only after the open succeeded and `get_state` shows the same model. The saved model of a resumed conversation therefore never answers a prompt; the conversation file, its earlier messages and its directory stay as they were. A resume after a usage-limit failure follows the same rule as any other new process, and the existing recovery and resume policy still decides when one is launched.
+
+taskwatch does not read omp's configuration or route between providers. A command that selects a role gets omp's current role order at every launch:
+
+```json
+"omp_command": ["omp", "--model", "@task"],
+"review_command": ["omp", "--model", "@slow"]
+```
+
+`review_command` may instead be the [reviewer launcher](review-launch.md) whose agent definition selects `@slow`. An explicit model (`--model <provider>/<id>`) or a launcher-owned model option keeps its meaning, and a bare `omp` keeps omp's ordinary startup default. A role lists candidates in order and omp takes the first available one, so a first candidate whose quota is used up is still chosen: edit the role order, and the next launch uses it. Print-mode reviewers get no RPC behavior from this.
+
+The step fails before any prompt, with the transcript untouched, when `get_state` reports no model, when `open_session` is rejected (for example `Model not found`), cancelled or times out, or when the model read back differs from the requested one. It never falls back to the saved model or to a new empty conversation. The omp command must support the public RPC `open_session` model override (`provider` and `modelId` together); it is a documented runtime prerequisite, not a transport version, so protocol v2 alone does not prove it. An older omp has to be upgraded by its operator. The upstream references are [RPC](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md) (Model, `get_state`, `open_session`), [models](https://github.com/can1357/oh-my-pi/blob/main/docs/models.md) (role aliases) and the [CLI reference](https://github.com/can1357/oh-my-pi/blob/main/docs/cli-reference.md) (model selection).
+
 ### Reviewer other than omp
 
 Set `"review_mode": "print"` to review with a tool that is not omp (Codex, Claude Code, Gemini CLI, or any program). It needs `review_command` and adds no argument to it. The default is `"rpc"`; a host that sets nothing sees no change. Work and fix still run on `omp_command`.
@@ -241,9 +256,11 @@ explicit approval records cannot enforce those permissions.
 Code jobs that build a result accept an optional `public_text` list for the pull
 requests the job produces. Each unit is `{"id": "pr1", "base": "<ref>", "head": "HEAD"}`;
 `head` defaults to `HEAD`, and `id` is lowercase letters, digits and hyphens. For a
-stacked series the `base` of a unit is the `head` of the one before. A `base` must
-resolve in `target` at submit unless it is another unit's `head`; refs are resolved
-again in the work folder at every check. The worker writes `pr/<id>/title.txt` and
+stacked series the `base` of a unit is the `head` of the one before. A `base` that
+is not another unit's `head` must resolve in `target` at submit, and the record keeps its
+full commit SHA, so moving that ref later changes neither the reviewed range nor the review's
+staleness. A `base` that is another unit's `head` stays as written, including a head that does
+not exist yet such as `HEAD~1`, and resolves in the work folder at every check, like `head`. The worker writes `pr/<id>/title.txt` and
 `pr/<id>/body.md` in the job folder, never in the work folder. The check fails when a
 file is missing, a unit has no commits, or a commit message breaks the common rules:
 title is `type(scope): summary` or `type: summary` and at most 72 characters, one blank

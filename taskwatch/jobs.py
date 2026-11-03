@@ -503,11 +503,13 @@ def _public_text_field(data: dict, review_only: bool) -> None:
         )
     if len({unit["id"] for unit in normal}) != len(normal):
         raise ValueError("public_text ids must be unique")
-    # A head may name a commit the job has not made yet, so only a base is resolved now.
+    # A head may name a commit the job has not made yet, so only an external base is resolved
+    # now, and pinned: a later move of that ref must not change the reviewed range. A base that
+    # is another unit's head stays symbolic.
     heads = {unit["head"] for unit in normal}
     for unit in normal:
         if unit["base"] not in heads:
-            _resolve_commit(Path(data["target"]), unit["base"], "public_text base")
+            unit["base"] = _resolve_commit(Path(data["target"]), unit["base"], "public_text base")
     data["public_text"] = normal
 
 

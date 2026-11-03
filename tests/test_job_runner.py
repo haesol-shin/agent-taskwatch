@@ -713,3 +713,184 @@ def test_design_messages_name_defaults_file_and_short_hash(tmp_path, monkeypatch
         job_runner._review_message(ctx, (), False, tmp_path / "rr"),
     ):
         assert f"Owner defaults: {expected_path} (sha256 {short})" in text
+
+
+# --- the launch selects the model ------------------------------------------------------------
+
+QUOTA = {"status": "failed", "error": {"message": "429 usage limit reached"}}
+
+
+def set_roles(env, **roles: str) -> None:
+    """What each role means for the next launch; the fake omp reads this file when it starts."""
+    env.state.mkdir(parents=True, exist_ok=True)
+    (env.state / "roles.json").write_text(json.dumps(roles), encoding="utf-8")
+
+
+def on_model(env, *selection: str) -> None:
+    env.config = replace(env.config, omp_command=(*env.config.omp_command, *selection))
+
+
+def launches(env) -> list[list[dict]]:
+    """The commands each fake process received, in order, one list per launch."""
+    runs: list[list[dict]] = []
+    for entry in env.log():
+        if "argv" in entry:
+            runs.append([])
+        else:
+            runs[-1].append(entry)
+    return runs
+
+
+def lines(path: str) -> list[dict]:
+    return [json.loads(x) for x in Path(path).read_text(encoding="utf-8").splitlines()]
+
+
+def test_first_open_binds_the_startup_model_before_the_prompt(env):
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    (run,) = launches(env)
+    kinds = [entry["type"] for entry in run]
+    assert kinds[:5] == ["negotiate_protocol", "get_state", "open_session", "get_state", "prompt"]
+    opened = run[2]
+    assert (opened["provider"], opened["modelId"]) == ("synthetic", "default")
+    assert opened["sessionDir"] == str(env.folder() / "sessions" / "work")
+    assert lines(env.get().session_path)[0]["model"] == "synthetic/default"
+
+
+def test_resume_after_a_quota_failure_uses_the_new_launch_model_and_keeps_the_conversation(env):
+    set_roles(env, **{"@task": "alpha/one"})
+    on_model(env, "--model", "@task")
+    env.scenario([QUOTA, work_turn()])
+    assert env.run("work") == 1
+    failed = env.get()
+    assert failed.stage == "work" and "429" in failed.error
+    before = Path(failed.session_path).read_bytes()
+    assert lines(failed.session_path)[0]["model"] == "alpha/one"
+
+    set_roles(env, **{"@task": "beta/two"})  # the configured role order changed
+    assert env.run("work", session_dir=failed.session_dir) == 0
+    job = env.get()
+    assert job.stage == "check" and job.session_path == failed.session_path
+    first, second = launches(env)
+    assert [(e["provider"], e["modelId"]) for e in (first[2], second[2])] == [
+        ("alpha", "one"),
+        ("beta", "two"),
+    ]
+    assert [e["type"] for e in second][:5] == [
+        "negotiate_protocol",
+        "get_state",
+        "open_session",
+        "get_state",
+        "prompt",
+    ]
+    after = Path(job.session_path).read_bytes()
+    assert after.startswith(before)  # the same file, earlier messages untouched
+    served = lines(job.session_path)
+    assert served[0]["prompt"] == env.prompts()[0] and served[0]["model"] == "alpha/one"
+    assert served[1] == {"model_change": "beta/two"}
+    assert served[2]["prompt"] == env.prompts()[1] and served[2]["model"] == "beta/two"
+    assert "interrupted" in env.prompts()[1]
+    assert [x["resumed"] for x in job.events if x["type"] == "session_open"] == [False, True]
+
+
+def test_a_resume_that_keeps_the_same_launch_model_adds_no_model_change(env):
+    on_model(env, "--model", "gamma/three")
+    env.scenario([{"die_after_content": True}, work_turn()])
+    assert env.run("work") == 1
+    assert env.run("work") == 0
+    served = lines(env.get().session_path)
+    assert [x.get("model") for x in served] == ["gamma/three", "gamma/three"]
+    assert all("model_change" not in x for x in served)
+
+
+def test_an_explicit_model_command_is_bound_as_given(env):
+    set_roles(env, **{"@task": "alpha/one"})
+    on_model(env, "--model", "delta/four")
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    opened = launches(env)[0][2]
+    assert (opened["provider"], opened["modelId"]) == ("delta", "four")
+
+
+def test_a_wrapper_command_reports_the_model_it_launched_with(env, tmp_path):
+    set_roles(env, **{"@task": "alpha/one"})
+    wrapper = tmp_path / "wrapper.py"
+    wrapper.write_text(
+        "import os, sys\n"
+        f"os.execv(sys.executable, [sys.executable, {str(FAKE)!r}, '--model', '@task',"
+        " *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    env.config = replace(env.config, omp_command=(sys.executable, str(wrapper)))
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    assert launches(env)[0][2]["modelId"] == "one"
+    assert env.log()[0]["argv"] == ["--model", "@task", "--mode", "rpc", "--no-ui"]
+
+
+def test_work_fix_and_review_each_bind_their_own_launch_model(env):
+    set_roles(env, **{"@task": "alpha/one", "@slow": "beta/two"})
+    on_model(env, "--model", "@task")
+    reviewer = (*env.config.omp_command[:-2], "--model", "@slow")
+    env.config = replace(env.config, review_command=reviewer)
+    env.scenario([work_turn(), {"reply": f"{FAIL}\nP1: revise"}, work_turn()])
+    assert env.run("work") == 0
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    assert env.get().stage == "fix"
+    set_roles(env, **{"@task": "gamma/three", "@slow": "beta/two"})
+    assert env.run("fix") == 0
+    runs = launches(env)
+    assert [[e["type"] for e in run].index("open_session") for run in runs] == [2, 2, 2]
+    for run in runs:
+        kinds = [e["type"] for e in run]
+        assert kinds.index("get_state") < kinds.index("open_session") < kinds.index("prompt")
+    assert [(run[2]["provider"], run[2]["modelId"]) for run in runs] == [
+        ("alpha", "one"),
+        ("beta", "two"),
+        ("gamma", "three"),
+    ]
+    work = lines(env.get().session_path)
+    assert [x.get("model") or x.get("model_change") for x in work] == [
+        "alpha/one",
+        "gamma/three",
+        "gamma/three",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("extra", "problem"),
+    [
+        ({"startup_state": "missing"}, "get_state reported no model"),
+        ({"startup_state": "malformed"}, "get_state reported no model"),
+        ({"open": "reject"}, "Model not found"),
+        ({"open": "cancel"}, "cancelled"),
+        ({"open": "hang"}, "timed out"),
+        ({"open": "ignore"}, "bound alpha/one, not beta/two"),
+    ],
+)
+def test_a_failed_model_binding_stops_before_any_prompt_and_keeps_the_transcript(
+    env, extra, problem
+):
+    env.config = replace(env.config, rpc_timeout=1)
+    set_roles(env, **{"@task": "alpha/one"})
+    on_model(env, "--model", "@task")
+    env.scenario([QUOTA])
+    assert env.run("work") == 1
+    failed = env.get()
+    before = Path(failed.session_path).read_bytes()
+    events = [e["type"] for e in failed.events]
+
+    set_roles(env, **{"@task": "beta/two"})
+    env.scenario([work_turn()], **extra)
+    assert env.run("work") == 1
+    job = env.get()
+    assert job.stage == "work" and problem in job.error
+    if extra.get("open") == "reject":
+        assert "open_session" in job.error and "provider and modelId" in job.error
+    assert len(env.prompts()) == 1  # only the first attempt's prompt
+    assert Path(failed.session_path).read_bytes() == before
+    assert [e["type"] for e in job.events if e["type"] in {"step_exit", "session_open"}] == [
+        e for e in events if e in {"step_exit", "session_open"}
+    ]
+    assert job.ended_at == 0

@@ -787,7 +787,9 @@ def _converse(
             env=ctx.env,
         ) as client:
             client.start(timeout)
-            opened = client.open_session(session_dir, timeout)
+            # This launch's selection decides the model; the saved one must not.
+            provider, model_id = client.startup_model(timeout)
+            opened = client.open_session(session_dir, timeout, provider=provider, model_id=model_id)
             resumed = opened.get("resumed") is True
             path = opened.get("sessionFile")
             _apply(

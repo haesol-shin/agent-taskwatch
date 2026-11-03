@@ -13,7 +13,8 @@ from taskwatch.job_cli import main
 from taskwatch.job_delivery import _message
 from taskwatch.job_env import job_environment
 from taskwatch.job_runner import run_job
-from tests.git_fixture import git
+from tests.git_fixture import git, make_repo
+from tests.test_job_runner import Env
 from tests.test_public_text import UnitEnv
 from tests.verdicts import CODE_PASS
 
@@ -129,6 +130,64 @@ def test_the_evidence_line_alone_does_not_make_the_review_stale(unit_env):
     unit_env.write_text("body.md", "body\n\nReview evidence: round 1 PASS, code x, text y\n")
     assert unit_env.run("review") == 0
     assert unit_env.get().stage == "deliver_pending" and len(unit_env.get().reviews) == 2
+
+
+def advance(repo: Path, ref: str) -> None:
+    """Move only `ref` to a new commit in the target repository."""
+    new = git(repo, "commit-tree", "main^{tree}", "-p", ref, "-m", "advance")
+    git(repo, "branch", "-f", ref, new)
+
+
+def test_a_moved_external_ref_alone_does_not_make_the_review_stale(tmp_path, monkeypatch):
+    env = UnitEnv(tmp_path, monkeypatch, base="moving")
+    main(["--root", str(tmp_path / "root"), "init"])
+    repo = tmp_path / "repo"
+    pinned = git(repo, "rev-parse", "moving")
+    reviewed(env, turns=2)
+    variables = job_environment({})
+    before = job_text.states(job_text.collect(env.get(), env.tree, env.folder(), variables))
+    advance(repo, "moving")
+    assert git(repo, "rev-parse", "moving") != pinned
+    after = job_text.states(job_text.collect(env.get(), env.tree, env.folder(), variables))
+    assert after == before and before["pr"]["base"] == pinned
+    assert env.get().public_text[0]["base"] == pinned
+    assert env.run("review") == 0
+    job = env.get()
+    assert job.stage == "deliver_pending" and job.texts["pr"]["base"] == pinned
+
+
+def test_a_changed_head_still_invalidates_the_review_after_the_ref_moved(tmp_path, monkeypatch):
+    env = UnitEnv(tmp_path, monkeypatch, base="moving")
+    main(["--root", str(tmp_path / "root"), "init"])
+    reviewed(env, turns=2)
+    advance(tmp_path / "repo", "moving")
+    (env.tree / "more.txt").write_text("more\n", encoding="utf-8")
+    git(env.tree, "add", "more.txt")
+    git(env.tree, "commit", "-m", "fix(x): more\n\nA reason.")
+    assert env.run("review") == 0
+    assert env.get().stage == "check" and env.get().texts == {}
+
+
+def test_future_head_bases_resolve_once_the_commits_exist(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path, "repo")
+    units = [
+        {"id": "pr", "base": "main", "head": "HEAD~1"},
+        {"id": "pr2", "base": "HEAD~1", "head": "HEAD"},
+    ]
+    env = Env(tmp_path, monkeypatch, review="code", target=repo, public_text=units)
+    assert [u["base"] for u in env.get().public_text][1] == "HEAD~1"
+    assert env.run("check") == 0  # creates the work folder
+    tree = env.folder() / "worktree"
+    for name in ("one", "two"):
+        (tree / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+        git(tree, "add", f"{name}.txt")
+        git(tree, "commit", "-m", f"feat(x): {name}\n\nWhy {name}.")
+    for unit in ("pr", "pr2"):
+        (env.folder() / "pr" / unit).mkdir(parents=True, exist_ok=True)
+        for name in ("title.txt", "body.md"):
+            (env.folder() / "pr" / unit / name).write_text("text\n", encoding="utf-8")
+    states = job_text.states(job_text.collect(env.get(), tree, env.folder(), job_environment({})))
+    assert states["pr2"]["base"] == git(tree, "rev-parse", "HEAD~1") == states["pr"]["head"]
 
 
 def test_the_reviewer_message_names_the_snapshot_and_the_unit_range(unit_env):

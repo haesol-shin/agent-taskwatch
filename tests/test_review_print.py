@@ -21,7 +21,7 @@ from taskwatch.executor import (
 from taskwatch.jobs import load_job_config
 from taskwatch.review_docs import docs_dir
 from tests.test_job_delivery import write_config
-from tests.test_job_runner import Env
+from tests.test_job_runner import Env, work_turn
 
 SCHEMA = json.loads((docs_dir("launch") / review_print.SCHEMA_NAME).read_text(encoding="utf-8"))
 ANSWER = {
@@ -157,6 +157,17 @@ def test_a_fake_reviewer_takes_a_job_to_deliver_pending(env):
     assert f"Verdict schema: {env.folder() / review_print.SCHEMA_NAME}" in sent
     assert "no follow-up in this mode" in sent
     assert json.loads((env.folder() / review_print.SCHEMA_NAME).read_text()) == SCHEMA
+
+
+def test_print_review_sends_no_rpc_binding_commands(env):
+    use(env, answer())
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    assert env.get().stage == "deliver_pending"
+    types = [entry.get("type") for entry in env.log()]
+    assert types.count("open_session") == 1  # the work session only
 
 
 def test_the_last_message_file_is_read_before_stdout(env):
