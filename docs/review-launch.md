@@ -53,7 +53,7 @@ taskwatch starts the command and reads what it prints; it does not sit between t
 
 - It cannot restrict the tools of the other command. The reviewer is read-only only as far as the flags you gave the tool (`--sandbox read-only`, `--permission-mode plan`, `--approval-mode plan`) hold. Nothing here enforces `tools` or `spawns` as the launcher does for omp.
 - The review guidelines are named in the message as files; the tool must be able to read them. There is no `--append-system-prompt`, so a tool that cannot read the job folder reviews without the rules.
-- There is no session: no same-session repair of a malformed reply and no resume after an interruption. A reply that does not match the schema costs a round, and an interrupted review starts again.
+- There is no session: no same-session repair of a malformed reply and no resume after an interruption. A reply that does not match the schema uses its review attempt and the review runs again, and an interrupted review starts again on a new attempt.
 - The evidence refresh every 15 seconds proves only that the process lives. A tool that hangs is stopped after `rpc_timeout` seconds.
 - The model, effort and sub-agents are the tool's own settings, not taskwatch's.
 

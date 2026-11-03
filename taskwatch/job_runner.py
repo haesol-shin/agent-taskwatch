@@ -46,7 +46,6 @@ from .job_env import job_environment
 from .job_rpc import RpcAborted, RpcClient, RpcError
 from .jobs import (
     LANGUAGE_NAMES,
-    MAX_FIX_ROUNDS,
     MAX_RECOVERIES,
     UNIT_FILES,
     JobConfig,
@@ -55,6 +54,7 @@ from .jobs import (
     progress_fingerprint,
 )
 from .kinds import kind_label
+from .rate_limit import RateLimit
 from .review_docs import docs_dir, profile_names
 
 STEPS = frozenset({"work", "fix", "check", "review"})
@@ -77,8 +77,6 @@ _EVENT_FIELDS = (
     "isTerminal",
     "yielded",
 )
-# The one verdict problem a review-only job accepts: a FAIL is its result, not a retry.
-_FAIL_PROBLEM = "the reviewer did not pass the result"
 
 
 def _now() -> float:
@@ -86,7 +84,13 @@ def _now() -> float:
 
 
 class StepError(Exception):
-    """The step failed in a way the scan can resume. The message is recorded."""
+    """The step failed in a way the scan can resume. The message is recorded.
+
+    `rate_limit` is set when the step ended on a terminal HTTP 429."""
+
+    def __init__(self, message: str = "", rate_limit: RateLimit | None = None) -> None:
+        super().__init__(message)
+        self.rate_limit = rate_limit
 
 
 class InputsChanged(StepError):
@@ -117,7 +121,7 @@ class Ctx:
 def run_job(jobs: Jobs, config: JobConfig, job_id: str, attempt: int) -> int:
     """0: step done and outcome recorded. 1: failure recorded. 2: stale attempt, nothing written."""
     job = jobs.load().get(job_id)
-    if job is None or job.attempt != attempt or job.stage not in STEPS:
+    if job is None or job.attempt != attempt or not _attempt_open(job):
         return 2
     try:
         jobs.verify_inputs(job)
@@ -132,13 +136,30 @@ def run_job(jobs: Jobs, config: JobConfig, job_id: str, attempt: int) -> int:
     except InputsChanged as exc:
         return _stop(jobs, job, "inputs_invalid", str(exc))
     except (RpcError, StepError, OSError, ValueError, subprocess.SubprocessError) as exc:
-        return _fail(jobs, job, str(exc) or type(exc).__name__)
+        message = str(exc) or type(exc).__name__
+        limit = getattr(exc, "rate_limit", None)
+        if limit is not None:
+            return _rate_limited(jobs, job, message, limit)
+        return _fail(jobs, job, message)
+
+
+def _attempt_open(job: JobState) -> bool:
+    return (
+        job.stage in STEPS
+        and job.ended_at == 0
+        and (job.stage != "review" or job.review_inflight == job.attempt)
+    )
 
 
 def _cas(jobs: Jobs, job: JobState, stages, build: Callable[[JobState], dict]) -> bool:
     with jobs.state.lock():
         current = jobs.load().get(job.id)
-        if current is None or current.attempt != job.attempt or current.stage not in stages:
+        if (
+            current is None
+            or current.attempt != job.attempt
+            or current.stage not in stages
+            or not _attempt_open(current)
+        ):
             return False
         jobs.save(replace(current, **build(current)), _now())
         return True
@@ -158,9 +179,48 @@ def _fail(jobs: Jobs, job: JobState, message: str) -> int:
         jobs,
         job,
         {job.stage},
-        lambda j: {"error": message, "events": _event(j, type="step_failed", error=message)},
+        lambda j: {
+            "error": message,
+            "events": _event(j, type="step_failed", error=message),
+            **({"review_inflight": 0} if j.stage == "review" else {}),
+        },
     )
     return 1 if done else 2
+
+
+def _rate_limited(jobs: Jobs, job: JobState, message: str, limit: RateLimit) -> int:
+    """A terminal HTTP 429 ends the step without spending a recovery or a review.
+
+    The review this attempt reserved and never completed is refunded, nobody else's. A known
+    deadline keeps the saved stage for the scanner to retry once it has passed; none stops for
+    the owner. The process ends here; nothing sleeps until the deadline."""
+
+    def build(current: JobState) -> dict:
+        now = _now()
+        events = _event(
+            current, type="rate_limited", stage=current.stage, retry_not_before=limit.retry_at
+        )
+        changes = {
+            "error": message,
+            "ended_at": now,
+            "resume_stage": current.stage,
+            "events": events,
+            **_refund(current),
+        }
+        if limit.retry_at is not None:
+            return {**changes, "retry_not_before": limit.retry_at}
+        # No usable hint: nothing says when to retry, so the owner decides.
+        events.append({"at": now, "type": "user_wait", "reason": "rate_limit"})
+        return {**changes, "stage": "user_wait", "wait_reason": "rate_limit"}
+
+    return 1 if _cas(jobs, job, {job.stage}, build) else 2
+
+
+def _refund(job: JobState) -> dict:
+    """Return the reservation of this attempt if its review never completed."""
+    if job.stage == "review" and job.review_inflight == job.attempt:
+        return {"reviews_used": job.reviews_used - 1, "review_inflight": 0}
+    return {}
 
 
 def _stop(jobs: Jobs, job: JobState, reason: str, message: str) -> int:
@@ -393,6 +453,9 @@ Work inputs:
 - Keep every worker-owned file listed under Approval outside the workspace; never copy it in.
 - Code jobs: commit everything in the workspace. The checks accept only a clean, committed
   result.
+- When a review sends you back to fix findings, record each one in
+  `{ctx.folder / job_findings.FINDINGS_FILE}` before you finish, as the fix message shows.
+  A rule that repeats also needs a section in `{ctx.folder / job_findings.NOTE_FILE}`.
 - While working, run only the tests that cover the files you changed. Run the whole check once,
   with the `--run-command` option of the command in the End section, just before you end.
 {card_language}- If you delegate to subagents, wait until each one finished.
@@ -469,6 +532,7 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
     if ctx.stage == "fix":
         lines += ["", "This is a fix round. Fix exactly what follows, then finish."]
         lines.append(_fix_reason(job))
+        lines += _record_lines(ctx)
     if resumed:
         lines += [
             "",
@@ -476,6 +540,32 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
             "and do not redo completed work.",
         ]
     return head + "\n".join(lines)
+
+
+def _record_lines(ctx: Ctx) -> list[str]:
+    """How to record the findings of the last failed review, so the next check can verify them."""
+    job = ctx.job
+    review = job_findings.last_failed(job.reviews)
+    if review is None or job.review_target is not None:
+        return []
+    ids = ", ".join(job_findings.finding_id(review, f) for f in review["findings"])
+    path = ctx.folder / job_findings.FINDINGS_FILE
+    lines = [
+        "",
+        f"Record the findings of round {review['round']} ({ids}) in {path}, a JSON list with one",
+        "entry per finding. The next check rejects a missing, malformed or unverified entry:",
+        '[{"id": "r1.F1", "status": "fixed", "commit": "<full 40-character SHA>"},',
+        ' {"id": "r1.F2", "status": "not_fixed", "reason": "<nonblank explanation>"}]',
+        "not_fixed explains; it does not dismiss the finding, and the reviewer still decides.",
+    ]
+    if job.review == "code":
+        anchor = job_findings.reviewed_head(review)
+        lines.append(
+            "For a code result, `commit` is the full SHA of the commit that fixes the finding: "
+            f"made after the reviewed commit {anchor or '(not recorded)'} and contained in HEAD. "
+            "A fix of public text only names the current HEAD."
+        )
+    return lines
 
 
 def _latest(job: JobState) -> dict | None:
@@ -594,14 +684,22 @@ def _prior_lines(
 ) -> list[str]:
     job = ctx.job
     last = prior[-1]
-    if job.review_target is not None:
-        # Nothing was fixed between rounds: the last answer could not be accepted.
+    if job.review_target is not None or not job_findings.accepted(last):
+        # Nothing was fixed between these rounds: the last answer could not be accepted.
         problems = "; ".join(last["problems"]) or "none recorded"
-        return [
+        lines = [
             "",
             f"This is round {len(prior) + 1}. The last answer was not accepted: {problems}.",
             "Review the whole target again and answer in full.",
         ]
+        previous = job_findings.last_failed(prior)
+        if previous is not None:
+            lines += [
+                *_finding_notes(ctx, previous),
+                "Findings of the last substantive failed review:",
+                previous["body"],
+            ]
+        return lines
     if scope is not None:
         lines = ["", *review_delta.message_lines(scope, len(prior) + 1, job.checks)]
     else:
@@ -771,7 +869,7 @@ def _print_reply(ctx: Ctx, message: str, review_root: Path) -> tuple[str, str]:
             stderr_path=ctx.folder / "logs" / f"review-a{ctx.job.attempt}.stderr",
         )
     except review_print.RunError as exc:
-        raise StepError(str(exc)) from exc
+        raise StepError(str(exc), exc.rate_limit) from exc
     finally:
         recorder.done.set()
     if recorder.abort.is_set():
@@ -1020,21 +1118,24 @@ def _public_texts(ctx: Ctx, problems: list[str]) -> dict[str, dict]:
 
 
 def _finding_problems(ctx: Ctx, fingerprint: str, texts: dict) -> tuple[list[str], dict]:
-    """After a review that did not pass: the worker's record of each finding, and repeats."""
+    """Before a re-review: the worker's record of each finding of the last failed review, which
+    holds across a resume, and repeated rules."""
     job = ctx.job
-    review = job.reviews[-1] if job.reviews else None
-    if job.review_target is not None or not review or review["ok"] or not review.get("findings"):
+    review = job_findings.last_failed(job.reviews)
+    if job.review_target is not None or review is None:
         return [], {}
-    problems = job_findings.worker_problems(ctx.folder, review, fingerprint, texts)
+    repo = ctx.workspace if job.review == "code" else None
+    problems = job_findings.worker_problems(ctx.folder, review, fingerprint, texts, repo, ctx.env)
+    earlier = [r for r in job.reviews if r["seq"] < review["seq"]]
     rows = ctx.jobs.state.read_records(job_findings.INDEX)
-    repeated = job_findings.repeated_rules(job, job.reviews[:-1], review, rows)
+    repeated = job_findings.repeated_rules(job, earlier, review, rows)
     problems += job_findings.note_problems(ctx.folder, repeated)
     # The note a rule had before this review was written; the rule broke it again.
     before = [c for c in job.checks if c["seq"] < review["seq"]]
-    earlier = before[-1].get("noted", {}) if before else {}
+    noted = before[-1].get("noted", {}) if before else {}
     return problems, {
         "noted": job_findings.named_preventions(ctx.folder, repeated),
-        "recurred": {rule: earlier[rule] for rule in repeated if rule in earlier},
+        "recurred": {rule: noted[rule] for rule in repeated if rule in noted},
     }
 
 
@@ -1150,17 +1251,6 @@ def _check_route(job: JobState, problems: list[str]) -> dict:
     if not problems:
         return {**ended, "stage": "review", "resume_stage": "review", "recoveries": 0, "error": ""}
     message = "; ".join(problems)
-    if job.fix_rounds > 0:
-        # A fix that follows a review is a review fix round, so a failing check spends one.
-        if job.fix_rounds < MAX_FIX_ROUNDS:
-            return {
-                **ended,
-                "stage": "fix",
-                "resume_stage": "fix",
-                "fix_rounds": job.fix_rounds + 1,
-                "error": message,
-            }
-        return {**ended, "stage": "user_wait", "wait_reason": "review_exhausted", "error": message}
     if job.recoveries < MAX_RECOVERIES:
         return {
             **ended,
@@ -1227,6 +1317,8 @@ def _rereview_scope(ctx: Ctx, base: str) -> review_delta.Scope | None:
     prior = [r for r in job.reviews if isinstance(r, Mapping)]
     if not prior or job.review != "code" or job.review_target is not None:
         return None
+    if not job_findings.accepted(prior[-1]):
+        return None  # the last answer was not accepted and nothing changed since
     return review_delta.decide(
         ctx.workspace,
         ctx.env,
@@ -1244,7 +1336,7 @@ def _review_step(ctx: Ctx) -> int:
     if ctx.job.review_target is not None:
         ctx = _pin_subject(ctx)
     elif _result_stale(ctx):
-        _apply(ctx, lambda j: _requeue(j))
+        _apply(ctx, lambda j: _requeue(j, ran=False))
         return 0
     job = ctx.job
     base = _review_base(ctx)
@@ -1277,7 +1369,8 @@ def _review_step(ctx: Ctx) -> int:
         return 0
     minutes = round((time.monotonic() - started) / 60, 1)
     record = _judge(ctx, text, snapshot, reply_problem, scope, minutes, base)
-    _apply(ctx, lambda j: _review_route(j, record))
+    digest = job_findings.note_digest(ctx.folder)
+    _apply(ctx, lambda j: _review_route(j, record, digest))
     job_findings.sync_index(ctx.jobs.state, ctx.jobs.load()[job.id], ctx.folder, _now())
     return 0
 
@@ -1312,8 +1405,10 @@ def _evidence_problems(ctx: Ctx, snapshot: Mapping) -> list[str]:
     return _file_problems(ctx.jobs, job, ctx.workspace, ctx.folder)
 
 
-def _requeue(job: JobState) -> dict:
-    """Send a result whose evidence went stale back to the step that produces the evidence."""
+def _requeue(job: JobState, events: list | None = None, ran: bool = True) -> dict:
+    """Send a result whose evidence went stale back to the step that produces the evidence.
+
+    `ran` is False when the review never started, so its reservation is returned."""
     first = "review" if job.review_target is not None else "check"
     changes = {
         "stage": first,
@@ -1322,8 +1417,11 @@ def _requeue(job: JobState) -> dict:
         "basis": "",
         "texts": {},
         "ended_at": _now(),
-        "events": _event(job, type="review_stale"),
+        "events": events if events is not None else _event(job, type="review_stale"),
+        "review_inflight": 0,
     }
+    if not ran:
+        changes.update(_refund(job))
     if job.recoveries >= MAX_RECOVERIES:
         return {**changes, "stage": "user_wait", "wait_reason": "result_unstable"}
     return {**changes, "recoveries": job.recoveries + 1}
@@ -1389,6 +1487,9 @@ def _judge(
     record = {
         "seq": seq,
         "at": _now(),
+        "stale": False,
+        # The commit a code review judged: the anchor a later fix commit must follow.
+        "reviewed_head": job.fingerprint if _builds_commits(job) else "",
         "round": len(job.reviews) + 1,
         "verdict": "",
         "blocking": True,
@@ -1416,46 +1517,99 @@ def _judge(
             _read_reply(job, body, record)
     except ValueError as exc:
         record["problems"].append(str(exc))
+    if record["problems"]:
+        record.update(verdict="", findings=[])
     prior = [r for r in job.reviews if isinstance(r, Mapping)]
     record["new_findings"] = review_delta.new_findings(prior, record["findings"])
     try:
         if _fingerprint(job, ctx.workspace, ctx.env) != job.fingerprint:
             record["problems"].append("the result changed during the review")
+            record["stale"] = True
         record["outputs_fingerprint"] = files_fingerprint(ctx.workspace, job.outputs)
         if _basis(job, ctx.folder) != job.basis:
             record["problems"].append("the review basis changed during the review")
+            record["stale"] = True
     except (ValueError, OSError) as exc:
         record["problems"].append(f"the result cannot be fingerprinted: {exc}")
+        record["stale"] = True
     if record["verdict"] == "FAIL":
-        record["problems"].append(_FAIL_PROBLEM)
+        record["problems"].append(job_findings.FAIL_PROBLEM)
     record["ok"] = not record["problems"] and record["verdict"] == "PASS" and not record["blocking"]
     # A review-only job has nothing to fix: a parsed verdict on an unchanged target is its result.
     record["final"] = (
         job.review_target is not None
         and record["verdict"] != ""
-        and all(problem == _FAIL_PROBLEM for problem in record["problems"])
+        and all(problem == job_findings.FAIL_PROBLEM for problem in record["problems"])
     )
     return record
 
 
-def _review_route(job: JobState, record: dict) -> dict:
+def _builds_commits(job: JobState) -> bool:
+    return job.review == "code" and job.review_target is None
+
+
+def _review_route(job: JobState, record: dict, digest: str = "") -> dict:
+    """The outcome of a completed review attempt.
+
+    A review is rerun directly while the cycle has one left, and a fix follows only a read
+    FAIL: a malformed or infrastructure answer never starts a model fix. The same rule in two
+    consecutive substantive rounds stops for a root-cause note before anything else runs."""
+    now = _now()
+    events = _event(job, type="review", ok=record["ok"], verdict=record["verdict"])
     changes = {
         "reviews": [*job.reviews, record],
-        "ended_at": _now(),
-        "events": _event(job, type="review", ok=record["ok"], verdict=record["verdict"]),
+        "review_inflight": 0,
+        "ended_at": now,
+        "events": events,
     }
     if record["ok"] or record["final"]:
         done = {"stage": "deliver_pending", "resume_stage": "deliver_pending", "error": ""}
         return {**changes, **done}
     message = "; ".join(record["problems"])
-    retry = "review" if job.review_target is not None else "fix"
-    if job.fix_rounds < MAX_FIX_ROUNDS:
-        # Reserved here, before the retry runs: a failed attempt still used its round.
+    exhausted = job.reviews_used >= job.max_reviews
+    cycle = [*job.reviews, record][job.review_cycle_start :]
+    rules, rounds = job_findings.consecutive_rules(cycle)
+    if rules:
+        events.append(
+            {
+                "at": now,
+                "type": "user_wait",
+                "reason": "root_cause_required",
+                "rules": rules,
+                "rounds": rounds,
+                "note_digest": digest,
+                "exhausted": exhausted,
+            }
+        )
+        text = (
+            f"root cause required: {', '.join(rules)} broke in review rounds {rounds[0]} and "
+            f"{rounds[1]}. Write a section per rule in {job_findings.NOTE_FILE} (Cause:, "
+            "Missed by:, Prevention:) that explains this recurrence, then resume."
+        )
+        if exhausted:
+            text += " The review limit is also reached."
         return {
             **changes,
-            "stage": retry,
+            "stage": "user_wait",
+            "wait_reason": "root_cause_required",
+            "resume_stage": "fix",
+            "error": text,
+        }
+    if job_findings.accepted(record):
+        retry = "fix"
+    elif record["stale"] and job.review_target is None:
+        retry = "check"
+    else:
+        retry = "review"
+    if exhausted:
+        return {
+            **changes,
+            "stage": "user_wait",
+            "wait_reason": "review_exhausted",
             "resume_stage": retry,
-            "fix_rounds": job.fix_rounds + 1,
             "error": message,
         }
-    return {**changes, "stage": "user_wait", "wait_reason": "review_exhausted", "error": message}
+    if retry == "check":
+        events.append({"at": now, "type": "review_stale"})
+        return {**changes, **_requeue(job, events), "error": message}
+    return {**changes, "stage": retry, "resume_stage": retry, "error": message}

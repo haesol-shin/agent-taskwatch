@@ -16,6 +16,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+from .rate_limit import RateLimit, prompt_rate_limit, scrub
+
 DEFAULT_FRAME_BYTES = 1 << 20
 DEFAULT_REASSEMBLED_BYTES = 64 << 20
 OPEN_SESSION_NEEDS = (
@@ -25,7 +27,13 @@ OPEN_SESSION_NEEDS = (
 
 
 class RpcError(Exception):
-    """The RPC conversation failed. The step did not complete."""
+    """The RPC conversation failed. The step did not complete.
+
+    `rate_limit` is set only for a terminal model HTTP 429 of a finished prompt."""
+
+    def __init__(self, message: str = "", rate_limit: RateLimit | None = None) -> None:
+        super().__init__(message)
+        self.rate_limit = rate_limit
 
 
 class RpcRejected(RpcError):
@@ -456,7 +464,14 @@ def _left(deadline: float) -> float:
 def _accept_result(result: dict) -> None:
     if result.get("agentInvoked") is not True:
         raise RpcError("prompt_result says no agent ran")
-    if result.get("status") != "completed":
+    status = result.get("status")
+    if status != "completed":
         error = result.get("error")
         detail = error.get("message") if isinstance(error, dict) else ""
-        raise RpcError(f"prompt ended {result.get('status')}: {detail}")
+        # Only the terminal error of this prompt is read, never conversation or tool text.
+        limit = None
+        if status in {"error", "failed"} and isinstance(detail, str):
+            limit = prompt_rate_limit(detail)
+        if limit is not None:
+            raise RpcError(scrub(f"prompt ended {status}: {detail}"), limit)
+        raise RpcError(f"prompt ended {status}: {detail}")

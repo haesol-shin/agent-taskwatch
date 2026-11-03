@@ -13,6 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from .job_env import validate_env
+from .job_legacy import upgrade
 from .job_store import Store, read_snapshot
 from .state import RecordError, State, _create_new, _make_dirs
 
@@ -33,7 +34,9 @@ STAGES = frozenset(
 REVIEWS = frozenset({"code", "design", "source"})
 # Records written before the field was renamed used `kind` with four values.
 _OLD_KINDS = {"code": "code", "design": "design", "document": "source", "research": "source"}
-MAX_FIX_ROUNDS = 3
+MIN_REVIEWS = 1
+MAX_REVIEWS = 3
+DEFAULT_MAX_REVIEWS = 3
 MAX_RECOVERIES = 3
 
 DEFAULT_BRANCH_PREFIX = "taskwatch/"
@@ -91,7 +94,15 @@ class JobState:
     evidence_at: float = 0.0
     stall_suspected: bool = False
     recoveries: int = 0
-    fix_rounds: int = 0
+    # Review budget. `reviews_used` counts the attempts of the current cycle, the first review
+    # included; each is reserved before it starts. `review_cycle_start` indexes `reviews`, and
+    # `review_inflight` is the attempt holding a reservation whose review has not completed.
+    max_reviews: int = DEFAULT_MAX_REVIEWS
+    reviews_used: int = 0
+    review_cycle_start: int = 0
+    review_inflight: int = 0
+    # A terminal HTTP 429 parks the saved stage until this epoch second; 0 is no deadline.
+    retry_not_before: float = 0.0
     resume_stage: str = "work"
     events: tuple[Mapping, ...] = ()
     checks: tuple[Mapping, ...] = ()
@@ -140,6 +151,7 @@ class JobConfig:
     bullet_one_line: bool = False
     language: str | None = None  # None: the card is written in the language of the intent
     review_mode: str = "rpc"  # "print": the review command runs once per review, not over RPC
+    max_reviews: int = DEFAULT_MAX_REVIEWS  # reviews per cycle, the first included
 
 
 COMMIT_RULES = ("bullet_one_line",)
@@ -157,6 +169,12 @@ def _review_mode(obj: dict) -> str:
     return mode
 
 
+def _max_reviews(value: object) -> int:
+    if type(value) is not int or not MIN_REVIEWS <= value <= MAX_REVIEWS:
+        raise ValueError(f"max_reviews must be an integer from {MIN_REVIEWS} to {MAX_REVIEWS}")
+    return value
+
+
 def load_job_config(root: Path) -> JobConfig:
     path = root / "taskwatch" / "jobs-config.json"
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -167,6 +185,7 @@ def load_job_config(root: Path) -> JobConfig:
         "commit_rules",
         "language",
         "review_mode",
+        "max_reviews",
     } != {
         "version",
         "slots",
@@ -202,6 +221,7 @@ def load_job_config(root: Path) -> JobConfig:
     if "language" in obj and language not in LANGUAGES:
         raise ValueError(f"language must be one of: {', '.join(LANGUAGES)}")
     review_mode = _review_mode(obj)
+    max_reviews = _max_reviews(obj["max_reviews"]) if "max_reviews" in obj else DEFAULT_MAX_REVIEWS
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -220,6 +240,7 @@ def load_job_config(root: Path) -> JobConfig:
         rules.get("bullet_one_line", False),
         language,
         review_mode,
+        max_reviews,
     )
 
 
@@ -240,7 +261,7 @@ class Jobs:
         with self.state.lock():
             index = self._store.prepare(time.time())
             return {
-                ident: JobState(**read_snapshot(self.state.dir, ident, receipt)["job"])
+                ident: decode_job(read_snapshot(self.state.dir, ident, receipt)["job"])
                 for ident, receipt in index["receipts"].items()
             }
 
@@ -258,7 +279,9 @@ class Jobs:
                 if job.receipt_key == payload["receipt_key"]:
                     return job
             data = _submission(payload)
-            _resolve_receipt_tokens(data, existing, _branch_prefix(self.state.root))
+            host = _host_config(self.state.root)
+            data.setdefault("max_reviews", host.max_reviews)
+            _resolve_receipt_tokens(data, existing, host.branch_prefix)
             data.update(id=uuid.uuid4().hex, last_progress_at=now)
             self._copy_inputs(data)
             job = JobState(**data)
@@ -324,6 +347,7 @@ _OPTIONAL_FIELDS = {
     "expected_wait_seconds",
     "approval_required",
     "base",
+    "max_reviews",
     "public_text",
 }
 UNIT_FILES = ("title.txt", "body.md")
@@ -413,12 +437,7 @@ def _submission(payload: dict) -> dict:
         _public_text_field(data, review_only)
     data.setdefault("predecessors", [])
     _strings(data["predecessors"], "predecessors")
-    data.setdefault("expected_wait_seconds", 0)
-    data.setdefault("approval_required", False)
-    if type(data["expected_wait_seconds"]) is not int or data["expected_wait_seconds"] < 0:
-        raise ValueError("expected_wait_seconds must be a nonnegative integer")
-    if type(data["approval_required"]) is not bool:
-        raise ValueError("approval_required must be boolean")
+    _controls(data)
     inputs = data.get("inputs", {})
     if not isinstance(inputs, dict) or inputs.keys() - {"work", "review"}:
         raise ValueError("inputs must map work/review to file lists")
@@ -426,6 +445,17 @@ def _submission(payload: dict) -> dict:
         _strings(paths, role)
     data["inputs"] = {role: list(paths) for role, paths in inputs.items()}
     return data
+
+
+def _controls(data: dict) -> None:
+    data.setdefault("expected_wait_seconds", 0)
+    data.setdefault("approval_required", False)
+    if type(data["expected_wait_seconds"]) is not int or data["expected_wait_seconds"] < 0:
+        raise ValueError("expected_wait_seconds must be a nonnegative integer")
+    if type(data["approval_required"]) is not bool:
+        raise ValueError("approval_required must be boolean")
+    if "max_reviews" in data:
+        _max_reviews(data["max_reviews"])
 
 
 def _base_field(data: dict, review_only: bool) -> None:
@@ -436,11 +466,12 @@ def _base_field(data: dict, review_only: bool) -> None:
         raise ValueError("base applies only to code jobs that build a result")
 
 
-def _branch_prefix(root: Path) -> str:
+def _host_config(root: Path) -> JobConfig:
+    """The host settings a submission freezes; the built-in defaults before `init`."""
     try:
-        return load_job_config(root).branch_prefix
+        return load_job_config(root)
     except FileNotFoundError:
-        return DEFAULT_BRANCH_PREFIX
+        return JobConfig()
 
 
 def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix: str) -> None:
@@ -574,12 +605,18 @@ def _upgrade_record(job: dict) -> dict:
     return upgraded
 
 
+def decode_job(data: dict) -> JobState:
+    """A validated record as a JobState; an older record is migrated, never rewritten."""
+    _validate_record(data)
+    return JobState(**upgrade(data, DEFAULT_MAX_REVIEWS))
+
+
 def _validate_record(job: dict) -> None:
     if not isinstance(job.get("id"), str) or not re.fullmatch(r"[0-9a-f]{32}", job["id"]):
         raise RecordError("jobs.jsonl: invalid job id")
     if job.get("stage") not in STAGES or job.get("review") not in REVIEWS:
         raise RecordError("jobs.jsonl: unknown stage or review")
-    for key in ("attempt", "recoveries", "fix_rounds"):
+    for key in ("attempt", "recoveries"):
         if type(job.get(key)) is not int or job[key] < 0:
             raise RecordError(f"jobs.jsonl: invalid {key}")
     review_only = job.get("review_target") is not None
@@ -605,6 +642,7 @@ def _validate_record(job: dict) -> None:
         if type(job.get(key)) not in {int, float} or not math.isfinite(job[key]):
             raise RecordError(f"jobs.jsonl: invalid {key}")
     _validate_controls(job)
+    _validate_budget(job)
     if job.get("review_target") is not None:
         _validate_review_target(job)
     _validate_manifest(job)
@@ -643,6 +681,32 @@ def _validate_review_target(job: dict) -> None:
         valid = target.get("files") == job["outputs"] and bool(job["outputs"])
     if not valid:
         raise RecordError("jobs.jsonl: invalid review target")
+
+
+def _validate_budget(job: dict) -> None:
+    """The review budget: the older `fix_rounds`, or the current fields, never both."""
+    if "reviews_used" not in job:
+        if type(job.get("fix_rounds", 0)) is not int or job.get("fix_rounds", 0) < 0:
+            raise RecordError("jobs.jsonl: invalid fix_rounds")
+        return
+    if "fix_rounds" in job:
+        raise RecordError("jobs.jsonl: fix_rounds beside reviews_used")
+    maximum = job.get("max_reviews", DEFAULT_MAX_REVIEWS)
+    if type(maximum) is not int or not MIN_REVIEWS <= maximum <= MAX_REVIEWS:
+        raise RecordError("jobs.jsonl: invalid max_reviews")
+    # An overcount is conservative, so `reviews_used` has no upper bound here.
+    counts = {
+        "reviews_used": None,
+        "review_cycle_start": len(job["reviews"]),
+        "review_inflight": None,
+    }
+    for key, limit in counts.items():
+        value = job.get(key, 0)
+        if type(value) is not int or value < 0 or (limit is not None and value > limit):
+            raise RecordError(f"jobs.jsonl: invalid {key}")
+    deadline = job.get("retry_not_before", 0.0)
+    if type(deadline) not in {int, float} or not math.isfinite(deadline) or deadline < 0:
+        raise RecordError("jobs.jsonl: invalid retry_not_before")
 
 
 def _validate_controls(job: dict) -> None:

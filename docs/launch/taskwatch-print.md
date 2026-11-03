@@ -17,4 +17,4 @@ This text applies only when a taskwatch job started the review with `review_mode
 - `summary` is one sentence of at most 160 characters in the owner's words: what is wrong for the user, with no file name and no rule id. A `PASS` needs one on every P2 or P3 finding; the owner reads it in the card under "small problems left". Use an empty string for none. `detail` is the evidence and the reasoning; the worker reads it.
 - A `PASS` cannot carry a P0 or P1 finding.
 
-Taskwatch validates the object against the schema and reads only its fields, never the free text. A reply that is not accepted gets no follow-up in this mode (there is no session): it costs a round, and the worker sees the reason.
+Taskwatch validates the object against the schema and reads only its fields, never the free text. A reply that is not accepted gets no follow-up in this mode (there is no session): it uses its review attempt, the review runs again while an attempt is left, and the worker sees the reason.

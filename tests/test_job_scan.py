@@ -15,7 +15,6 @@ from taskwatch.job_env import job_environment
 from taskwatch.job_runner import run_job
 from taskwatch.job_scan import STALL_GRACE_SECONDS, Systemd, scan_jobs
 from taskwatch.jobs import (
-    MAX_FIX_ROUNDS,
     MAX_RECOVERIES,
     JobConfig,
     Jobs,
@@ -188,19 +187,17 @@ def test_next_step_waits_until_the_old_service_is_confirmed_stopped(tmp_path: Pa
     assert board.get(first).attempt == 2
 
 
-def test_recovery_keeps_fix_and_recovery_counters(board: Board) -> None:
+def test_a_dead_review_is_relaunched_on_a_new_reservation_not_a_recovery(board: Board) -> None:
     job_id = board.add()
     board.scan()
-    board.set(job_id, stage="review", fix_rounds=2, recoveries=1, session_dir="/s")
+    board.set(
+        job_id, stage="review", reviews_used=1, review_inflight=1, recoveries=1, session_dir="/s"
+    )
     board.kill(job_id)
     assert board.scan() == [job_id]
     job = board.get(job_id)
-    assert (job.stage, job.fix_rounds, job.recoveries, job.session_dir) == (
-        "review",
-        2,
-        2,
-        "/s",
-    )
+    assert (job.stage, job.reviews_used, job.review_inflight, job.recoveries) == ("review", 2, 2, 1)
+    assert job.session_dir == "/s"
 
 
 def test_dead_step_resumes_once_and_stale_attempt_is_fenced(board: Board) -> None:
@@ -300,39 +297,46 @@ def test_a_full_disk_is_reported_even_when_recoveries_are_used_up(
     assert board.get(job_id).wait_reason == "disk_full"
 
 
-def test_resume_into_review_fix_reserves_a_round_and_keeps_the_cap(board: Board) -> None:
+def test_review_launches_stop_at_the_cap_and_resume_opens_a_fresh_cycle(board: Board) -> None:
     job_id = board.add()
     board.scan()
-    board.set(job_id, stage="fix", fix_rounds=MAX_FIX_ROUNDS)
-    board.kill(job_id)
-    board.scan()
-    assert board.get(job_id).wait_reason == "review_exhausted"
-    reason = "approve a new cycle"
-    root = str(board.jobs.state.root)
-    assert cli_main(["--root", root, "resume", job_id, "--reason", reason]) == 0
+    board.set(job_id, stage="review", reviews_used=1, review_inflight=1)
     seen = []
-    while job_id in board.scan():
-        job = board.get(job_id)
-        seen.append((job.fix_rounds, job.recoveries))
+    for _ in range(2):
         board.kill(job_id)
-    assert seen == [(1, 0), (2, 0), (3, 0)]
-    assert board.get(job_id).wait_reason == "review_exhausted"
+        assert board.scan() == [job_id]
+        seen.append(board.get(job_id).reviews_used)
+    board.kill(job_id)
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert seen == [2, 3]
+    assert (job.stage, job.wait_reason, job.resume_stage) == (
+        "user_wait",
+        "review_exhausted",
+        "review",
+    )
+    assert (job.reviews_used, job.recoveries, job.unit) == (3, 0, "")
+    root = str(board.jobs.state.root)
+    assert cli_main(["--root", root, "resume", job_id, "--reason", "approve a new cycle"]) == 0
+    assert board.get(job_id).reviews_used == 0
+    assert board.scan() == [job_id]
+    assert board.get(job_id).reviews_used == 1
 
 
 def test_resume_into_check_repair_keeps_the_recovery_budget(board: Board) -> None:
     job_id = board.add()
     board.scan()
-    board.set(job_id, stage="fix", fix_rounds=0, recoveries=MAX_RECOVERIES)
+    board.set(job_id, stage="fix", recoveries=MAX_RECOVERIES)
     board.kill(job_id)
     board.scan()
     assert board.get(job_id).wait_reason == "recoveries_exhausted"
     root = str(board.jobs.state.root)
     assert cli_main(["--root", root, "resume", job_id, "--reason", "retry"]) == 0
-    assert board.get(job_id).fix_rounds == 0
+    assert board.get(job_id).reviews_used == 0
     assert board.scan() == [job_id]
     board.kill(job_id)
     assert board.scan() == [job_id]
-    assert (board.get(job_id).fix_rounds, board.get(job_id).recoveries) == (0, 1)
+    assert (board.get(job_id).reviews_used, board.get(job_id).recoveries) == (0, 1)
 
 
 def test_unreadable_progress_parks_only_that_job_and_the_scan_continues(
@@ -900,46 +904,133 @@ def test_systemd_unreachable_is_unknown(monkeypatch, tmp_path: Path) -> None:
     assert Systemd(tmp_path).stop("u.service") is False
 
 
-def test_dead_review_fix_attempts_are_capped_at_three_rounds(board: Board) -> None:
-    job_id = board.add()
+@pytest.mark.parametrize("cap", [1, 2, 3])
+def test_dead_review_attempts_never_exceed_max_reviews(tmp_path: Path, cap: int) -> None:
+    board = Board(tmp_path)
+    job_id = board.add(max_reviews=cap)
     board.scan()
-    board.set(job_id, stage="fix", fix_rounds=1)  # the runner reserved round 1 for this attempt
-    for expected in (2, 3):
-        board.kill(job_id)
-        assert board.scan() == [job_id]
-        assert board.get(job_id).fix_rounds == expected
+    board.set(job_id, stage="review", ended_at=board.clock)
     board.kill(job_id)
-    assert board.scan() == []
+    for _ in range(5):
+        board.scan()
+        board.kill(job_id)
+    assert len(board.service.started) == 1 + cap  # the work step, then one launch per review
     job = board.get(job_id)
-    assert (job.stage, job.wait_reason, job.resume_stage) == (
+    assert (job.stage, job.wait_reason, job.reviews_used, job.recoveries) == (
         "user_wait",
         "review_exhausted",
-        "fix",
+        cap,
+        0,
     )
-    assert (job.fix_rounds, job.recoveries, job.unit) == (3, 0, "")
-    assert len(board.service.started) == 3  # the first launch was the work step
 
 
-def test_fix_without_a_review_round_uses_the_recovery_budget(board: Board) -> None:
+def test_fix_after_a_review_uses_the_recovery_budget(board: Board) -> None:
     job_id = board.add()
     board.scan()
-    board.set(job_id, stage="fix", fix_rounds=0)
+    board.set(job_id, stage="fix", reviews_used=1)
     board.kill(job_id)
     assert board.scan() == [job_id]
     job = board.get(job_id)
-    assert (job.fix_rounds, job.recoveries) == (0, 1)
+    assert (job.reviews_used, job.recoveries) == (1, 1)
 
 
-def test_review_fix_lost_start_consumes_a_round(board: Board) -> None:
+def test_a_lost_review_start_consumes_a_reservation(board: Board) -> None:
     job_id = board.add()
     board.scan()
-    board.set(job_id, stage="fix", fix_rounds=1)
+    board.set(job_id, stage="review", reviews_used=1, review_inflight=1)
     board.kill(job_id)
     board.service.start_error = RuntimeError("no bus")
     assert board.scan() == [job_id]
     board.service.start_error = None
     assert board.scan() == [job_id]
-    assert board.get(job_id).fix_rounds == 3
+    assert board.get(job_id).reviews_used == 3
+
+
+def cool(board: Board, job_id: str, until: float, stage: str = "work", **extra: object) -> None:
+    """What the runner leaves after a terminal 429 with a known deadline: the saved stage, the
+    deadline, and an ended step whose service is dead."""
+    board.set(job_id, stage=stage, ended_at=board.clock, retry_not_before=until, **extra)
+    board.kill(job_id)
+
+
+def test_a_rate_limited_job_frees_its_slot_and_retries_once_when_due(tmp_path: Path) -> None:
+    board = Board(tmp_path, slots=1)
+    first, other = board.add(), board.add()
+    board.scan()
+    deadline = board.clock + 100
+    cool(board, first, deadline)
+    assert board.scan() == [other]  # the slot went to another job
+    job = board.get(first)
+    assert (job.stage, job.unit, job.attempt, job.recoveries) == ("work", "", 1, 0)
+    assert job.retry_not_before == deadline
+    board.finish_step(other, "done")
+    assert board.scan(advance=10) == []  # not due: nothing launches, however often it scans
+    assert board.scan() == []
+    assert board.scan(advance=100) == [first]
+    job = board.get(first)
+    assert (job.stage, job.attempt, job.retry_not_before, job.recoveries) == ("work", 2, 0.0, 0)
+    assert board.scan() == []
+
+
+def test_a_cooling_job_keeps_its_target_from_another_writer(board: Board) -> None:
+    first = board.add(target="shared", review="source")
+    board.scan()
+    second = board.add(target="shared", review="source")
+    cool(board, first, board.clock + 100)
+    assert board.scan() == []
+    assert board.get(second).wait_reason == "target"
+    assert board.scan(advance=200) == [first]
+    assert board.get(second).stage == "queued"
+
+
+def test_the_deadline_survives_a_reboot_and_gates_the_retry(board: Board) -> None:
+    job_id = board.add()
+    board.scan()
+    cool(board, job_id, board.clock + 100)
+    assert board.scan(boot="boot-2") == []
+    assert board.get(job_id).retry_not_before > 0
+    assert board.scan(advance=200, boot="boot-2") == [job_id]
+    assert board.get(job_id).boot_id == "boot-2"
+
+
+def test_cancel_removes_the_retry_for_good(board: Board) -> None:
+    job_id = board.add()
+    board.scan()
+    cool(board, job_id, board.clock + 100)
+    board.scan()
+    root = str(board.jobs.state.root)
+    assert cli_main(["--root", root, "cancel", job_id, "--reason", "no"]) == 0
+    assert (board.get(job_id).stage, board.get(job_id).retry_not_before) == ("cancelled", 0.0)
+    assert board.scan(advance=500) == []
+
+
+def test_approval_and_resume_never_skip_a_known_deadline(board: Board) -> None:
+    job_id = board.add()
+    board.scan()
+    deadline = board.clock + 100
+    cool(board, job_id, deadline, stage="review", reviews_used=1, review_inflight=0)
+    board.scan()
+    root = str(board.jobs.state.root)
+    assert cli_main(["--root", root, "wait", job_id, "--reason", "need a gate"]) == 0
+    assert cli_main(["--root", root, "approve", job_id, "--reason", "ok"]) == 0
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.resume_stage, job.retry_not_before) == ("queued", "review", deadline)
+    board.set(job_id, stage="user_wait", wait_reason="review_exhausted")
+    assert cli_main(["--root", root, "resume", job_id, "--reason", "again"]) == 0
+    assert board.get(job_id).retry_not_before == deadline
+    assert board.scan() == []
+    assert board.scan(advance=200) == [job_id]
+    assert board.get(job_id).reviews_used == 1  # the resume opened a cycle; this is its first
+
+
+def test_a_review_launch_after_a_rate_limit_reserves_its_own_attempt(board: Board) -> None:
+    job_id = board.add(max_reviews=1)
+    board.scan()
+    cool(board, job_id, board.clock + 10, stage="review", reviews_used=0)
+    assert board.scan(advance=20) == [job_id]
+    job = board.get(job_id)
+    assert (job.reviews_used, job.review_inflight, job.retry_not_before) == (1, 2, 0.0)
 
 
 def test_wake_runs_one_scan_two_seconds_later_within_a_second(monkeypatch, tmp_path: Path) -> None:

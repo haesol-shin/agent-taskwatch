@@ -251,7 +251,7 @@ def test_a_review_must_say_what_it_checked_and_did_not_check(tmp_path, monkeypat
     assert env.run("review") == 0
     record = env.get().reviews[-1]
     assert not record["ok"] and f"the verdict line needs a nonempty {missing}" in record["problems"]
-    assert env.get().stage == "fix"
+    assert env.get().stage == "review"  # an answer without a verdict reviews again, no fix
     env.put("review")
     assert run_job(env.jobs, env.config, env.job.id, env.attempt) == 0
     record = env.get().reviews[-1]

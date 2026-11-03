@@ -19,7 +19,7 @@ from pathlib import Path
 from .job_delivery import deliver_job, notify_wait
 from .job_env import job_environment
 from .job_workspace import settle
-from .jobs import MAX_FIX_ROUNDS, MAX_RECOVERIES, JobState, progress_fingerprint
+from .jobs import MAX_RECOVERIES, JobState, progress_fingerprint
 
 SLOT_STAGES = frozenset({"work", "check", "review", "fix"})
 DONE_STAGES = frozenset({"deliver_pending", "done"})
@@ -195,7 +195,7 @@ class _Scan:
         for identifier in self.order:
             job = self.all[identifier]
             if _is_gap(job) and self._confirm_dead(job):
-                self._launch(job, job.stage)
+                self._step_on(job)
         for identifier in self.order:
             job = self.all[identifier]
             if _is_pending(job) and not (job.stage == "queued" and job.approval_required):
@@ -335,19 +335,23 @@ class _Scan:
         full = self._full_disk(job)
         if full:
             self._park(job, "disk_full", full)
-        elif job.stage == "fix" and job.fix_rounds > 0:
-            self._retry_review_fix(job)
+        elif job.stage == "review":
+            # Each relaunch reserves its own review, so the review cap bounds it.
+            if self._confirm_dead(job):
+                self._launch(job, "review")
         elif job.recoveries >= MAX_RECOVERIES:
             self._park(job, "recoveries_exhausted")
         elif self._confirm_dead(job):
             self._launch(replace(job, recoveries=job.recoveries + 1), job.stage)
 
-    def _retry_review_fix(self, job: JobState) -> None:
-        """A failed fix after a review counts as a round: the cap bounds model invocations."""
-        if job.fix_rounds >= MAX_FIX_ROUNDS:
-            self._park(job, "review_exhausted")
-        elif self._confirm_dead(job):
-            self._launch(replace(job, fix_rounds=job.fix_rounds + 1), "fix")
+    def _step_on(self, job: JobState) -> None:
+        """A step ended and its service is dead: start the next step, or wait out a rate limit.
+
+        A job cooling down gives its slot back but keeps its target."""
+        if job.retry_not_before > self.now:
+            self._save(self._event(replace(job, unit=""), "cooling", until=job.retry_not_before))
+        else:
+            self._launch(job, job.stage)
 
     # -- launching --------------------------------------------------------------------------
 
@@ -364,14 +368,28 @@ class _Scan:
         for pred in job.predecessors:
             if pred not in self.all or self.all[pred].stage not in DONE_STAGES:
                 return f"predecessor:{pred}"
-        slots, targets = self._busy()
+        if job.retry_not_before > self.now:
+            return "cooling"
+        slots, targets = self._busy(job)
         if _shared_target(job) and job.target in targets:
             return "target"
         return "slot" if slots >= self.config.slots else None
 
-    def _busy(self) -> tuple[int, set[str]]:
-        held = [job for job in self.all.values() if _holds(job)]
-        return len(held), {job.target for job in held if job.target and _shared_target(job)}
+    def _busy(self, job: JobState) -> tuple[int, set[str]]:
+        """Occupied slots, and the targets other jobs hold: a running service holds both, a job
+        cooling down after a rate limit only its target."""
+        held = [other for other in self.all.values() if _holds(other)]
+        cooling = [
+            other
+            for other in self.all.values()
+            if other.stage in SLOT_STAGES and not other.unit and other.retry_not_before > self.now
+        ]
+        targets = {
+            other.target
+            for other in (*held, *cooling)
+            if other.id != job.id and other.target and _shared_target(other)
+        }
+        return len(held), targets
 
     def _launch(self, job: JobState, stage: str) -> None:
         try:
@@ -379,11 +397,16 @@ class _Scan:
         except _INPUT_ERRORS as exc:
             self._park(job, "inputs_invalid", str(exc))
             return
+        if stage == "review" and job.reviews_used >= job.max_reviews:
+            self._park(job, "review_exhausted", "review_exhausted")
+            return
+        attempt = job.attempt + 1
+        due = job.retry_not_before
         job = replace(
             job,
-            attempt=job.attempt + 1,
+            attempt=attempt,
             stage=stage,
-            unit=f"taskwatch-{job.id}-a{job.attempt + 1}.service",
+            unit=f"taskwatch-{job.id}-a{attempt}.service",
             boot_id=self.boot,
             started_at=self.now,
             ended_at=0.0,
@@ -391,9 +414,15 @@ class _Scan:
             stall_suspected=False,
             wait_reason="",
             error="",
+            # The deadline is cleared only here, once the launch is due.
+            retry_not_before=0.0,
+            # Reserved before the step starts: a review that is interrupted still used its slot.
+            reviews_used=job.reviews_used + int(stage == "review"),
+            review_inflight=attempt if stage == "review" else job.review_inflight,
         )
         # Reserve before the service call: a lost ack is found later by unit name.
-        job = self._event(job, "launched", stage=stage)
+        extra = {"retry_not_before": due} if due else {}
+        job = self._event(job, "launched", stage=stage, **extra)
         self._save(job)
         self.launched.append(job.id)
         try:

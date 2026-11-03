@@ -31,4 +31,4 @@ After that line, give every finding with its location. Each finding has a headin
 - Write `not_checked` as short plain items joined by `; `: the card shows each item as one bullet.
 - Taskwatch reads only these lines and the verdict line, never the free text.
 
-Taskwatch records your whole message as the review. A missing or second verdict line, or a finding that breaks these rules, makes the answer unacceptable. Taskwatch then sends you one follow-up in the same session with the exact errors and this contract; answer it with the complete review. A second answer that is still unacceptable costs a round.
+Taskwatch records your whole message as the review. A missing or second verdict line, or a finding that breaks these rules, makes the answer unacceptable. Taskwatch then sends you one follow-up in the same session with the exact errors and this contract; answer it with the complete review. A second answer that is still unacceptable uses the review attempt and the review runs again.

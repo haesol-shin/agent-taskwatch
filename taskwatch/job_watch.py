@@ -7,13 +7,14 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import choices
 from .brief import count_findings, decision_count
 from .job_cursor import decode, encode
 from .job_store import Store, projection, read_index, read_snapshot, validate_event
-from .jobs import JobState
+from .jobs import JobState, decode_job
 from .kinds import kind_label
 from .state import RecordError, state_dir
 
@@ -272,7 +273,7 @@ def needs(
 
 
 def _state(row: dict) -> JobState:
-    return JobState(**row["job"])
+    return decode_job(row["job"])
 
 
 def _snapshots(ledger: _Ledger, items: list[_Item]) -> dict[str, dict] | None:
@@ -379,6 +380,7 @@ def _lines(root: Path, rows: dict[str, dict], item: _Item) -> list[str]:
         return [
             f"job {job.id} {kind} user_wait {_line(job.wait_reason)}  {_stuck(job)}",
             f"  goal: {_goal(job)}",
+            *_deadline(job),
             f"  then: {cmd} resume {job.id} --reason <source> | cancel {job.id} --reason <text>",
         ]
     decisions = decision_count(_brief_text(root, job.id))
@@ -414,3 +416,17 @@ def _stuck(job: JobState) -> str:
     repeated = sorted({f["rule"] for f in last.get("findings", [])} & earlier - {"other"})
     text = f"round {len(reviews)}; open {count_findings(last)}"
     return text + (f"; repeated rules: {', '.join(repeated)}" if repeated else "")
+
+
+def _deadline(job: JobState) -> list[str]:
+    """A rate-limit deadline a resume does not bypass. A job that only waits for it is not
+    listed: nothing needs the owner."""
+    if job.retry_not_before <= 0:
+        return []
+    try:
+        when = datetime.fromtimestamp(job.retry_not_before, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except (OverflowError, OSError, ValueError):
+        when = f"epoch {job.retry_not_before:g} seconds"
+    return [f"  retry not before: {when} (resume does not skip it)"]

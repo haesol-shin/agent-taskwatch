@@ -73,11 +73,10 @@ def read_index(directory: Path) -> dict | None:
 
 
 def _job(data: dict):
-    from .jobs import JobState, _validate_record
+    from .jobs import decode_job
 
     try:
-        _validate_record(data)
-        return JobState(**data)
+        return decode_job(data)
     except (ValueError, TypeError, KeyError) as exc:
         raise RecordError(f"invalid job snapshot: {exc}") from exc
 

@@ -10,7 +10,8 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from .activity import activity
-from .jobs import JobConfig, Jobs, load_job_config
+from .job_findings import stop_problems
+from .jobs import JobConfig, Jobs, JobState, load_job_config
 from .state import RecordError, _create_new, _make_dirs
 
 # Commands after which a scan runs at once: a step ended, or a job became startable.
@@ -222,7 +223,7 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
         job = jobs.load()[args.job]
         command = args.command
         if command == "cancel":
-            job = replace(job, stage="cancelled", wait_reason=args.reason)
+            job = replace(job, stage="cancelled", wait_reason=args.reason, retry_not_before=0.0)
         elif command == "wait":
             if job.stage not in {"work", "check", "review", "fix", "queued"}:
                 raise ValueError("only an unfinished job can wait for approval")
@@ -242,24 +243,39 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
         elif command == "resume":
             if job.stage != "user_wait":
                 raise ValueError("job needs user judgment")
-            # A resume into a review fix opens a new cycle and spends its first round now, so
-            # the cap still bounds fixes; a check repair keeps the separate recovery budget.
-            # A review-only job has no fix: its retried review is the round.
-            retrying = job.resume_stage == "fix" or job.review_target is not None
-            reviewing = retrying and job.fix_rounds > 0
+            _check_root_cause(jobs, job)
+            # A resume opens a new review cycle at the saved stage and keeps every record. It
+            # never skips a rate-limit deadline: the scanner still waits for `retry_not_before`.
             job = replace(
                 job,
                 stage="deliver_pending" if job.resume_stage == "deliver_pending" else "queued",
                 wait_reason="",
                 error="",
                 recoveries=0,
-                fix_rounds=int(reviewing),
+                reviews_used=0,
+                review_cycle_start=len(job.reviews),
+                review_inflight=0,
             )
         job = replace(
             job, events=(*job.events, {"type": command, "at": now, "reason": args.reason})
         )
         jobs.save(job, now)
         return job.to_json()
+
+
+def _check_root_cause(jobs: Jobs, job: JobState) -> None:
+    """After a root-cause stop, a resume needs a note changed since the stop and complete for
+    every rule that triggered it."""
+    if job.wait_reason != "root_cause_required":
+        return
+    stops = [
+        event
+        for event in job.events
+        if event.get("type") == "user_wait" and event.get("reason") == "root_cause_required"
+    ]
+    problems = stop_problems(jobs.folder(job), stops[-1]) if stops else []
+    if problems:
+        raise ValueError("resume needs the root-cause analysis: " + "; ".join(problems))
 
 
 def _date(now: float) -> str:
