@@ -71,9 +71,37 @@ def code_payload(tmp_path: Path, units) -> dict:
     return {**data, "review": "code", "target": str(repo), "public_text": units}
 
 
-def test_submit_defaults_head_and_keeps_units(tmp_path):
+def test_submit_defaults_head_and_pins_an_external_base_to_its_sha(tmp_path):
     job = Jobs(tmp_path / "root").submit(code_payload(tmp_path, [{"id": "pr", "base": "main"}]), 10)
-    assert [dict(u) for u in job.public_text] == [{"id": "pr", "base": "main", "head": "HEAD"}]
+    sha = git(tmp_path / "repo", "rev-parse", "main")
+    assert [dict(u) for u in job.public_text] == [{"id": "pr", "base": sha, "head": "HEAD"}]
+
+
+def test_a_moved_ref_does_not_change_the_stored_external_base(tmp_path):
+    data = code_payload(tmp_path, [{"id": "pr", "base": "moving"}])
+    repo = tmp_path / "repo"
+    git(repo, "branch", "moving")
+    first = git(repo, "rev-parse", "moving")
+    job = Jobs(tmp_path / "root").submit(data, 10)
+    git(repo, "commit", "--allow-empty", "-m", "advance")
+    git(repo, "branch", "-f", "moving", "main")
+    assert git(repo, "rev-parse", "moving") != first
+    assert Jobs(tmp_path / "root").load()[job.id].public_text[0]["base"] == first
+
+
+def test_each_external_base_keeps_its_own_commit(tmp_path):
+    repo = make_repo(tmp_path, "repo")
+    (repo / "two.txt").write_text("2\n", encoding="utf-8")
+    git(repo, "add", "two.txt")
+    git(repo, "commit", "-m", "two")
+    units = [
+        {"id": "a", "base": "main~1", "head": "step-a"},
+        {"id": "b", "base": "main", "head": "HEAD"},
+    ]
+    data = {**payload(tmp_path), "review": "code", "target": str(repo), "public_text": units}
+    Path(data["spec"]).write_text(VALID_SPEC, encoding="utf-8")
+    bases = [u["base"] for u in Jobs(tmp_path / "root").submit(data, 10).public_text]
+    assert bases == [git(repo, "rev-parse", "main~1"), git(repo, "rev-parse", "main")]
 
 
 def test_submit_accepts_a_stacked_base_that_is_another_units_head(tmp_path):
@@ -81,7 +109,17 @@ def test_submit_accepts_a_stacked_base_that_is_another_units_head(tmp_path):
         {"id": "a", "base": "main", "head": "step-a"},
         {"id": "b", "base": "step-a", "head": "HEAD"},
     ]
-    assert len(Jobs(tmp_path / "root").submit(code_payload(tmp_path, units), 10).public_text) == 2
+    stored = Jobs(tmp_path / "root").submit(code_payload(tmp_path, units), 10).public_text
+    assert [u["base"] for u in stored] == [git(tmp_path / "repo", "rev-parse", "main"), "step-a"]
+
+
+def test_a_future_head_reference_stays_symbolic(tmp_path):
+    units = [
+        {"id": "a", "base": "main", "head": "HEAD~1"},
+        {"id": "b", "base": "HEAD~1", "head": "HEAD"},
+    ]
+    stored = Jobs(tmp_path / "root").submit(code_payload(tmp_path, units), 10).public_text
+    assert [u["base"] for u in stored] == [git(tmp_path / "repo", "rev-parse", "main"), "HEAD~1"]
 
 
 @pytest.mark.parametrize(
@@ -91,6 +129,7 @@ def test_submit_accepts_a_stacked_base_that_is_another_units_head(tmp_path):
         [{"id": "pr", "base": "main"}, {"id": "pr", "base": "main"}],
         [{"id": "Bad Id", "base": "main"}],
         [{"id": "pr", "base": "--upload-pack=x"}],
+        [{"id": "a", "base": "main", "head": "other"}, {"id": "b", "base": "HEAD~1"}],
         [{"id": "pr"}],
         [],
     ],
@@ -146,14 +185,16 @@ def test_every_continuation_line_names_its_bullet():
 class UnitEnv(Env):
     """A code job whose work folder is a real worktree with one unit."""
 
-    def __init__(self, tmp_path, monkeypatch):
+    def __init__(self, tmp_path, monkeypatch, base="main"):
         repo = make_repo(tmp_path, "repo")
+        if base != "main":
+            git(repo, "branch", base)
         super().__init__(
             tmp_path,
             monkeypatch,
             review="code",
             target=repo,
-            public_text=[{"id": "pr", "base": "main"}],
+            public_text=[{"id": "pr", "base": base}],
         )
         assert self.run("check") == 0  # creates the work folder; nothing is built yet
         self.tree = self.folder() / "worktree"

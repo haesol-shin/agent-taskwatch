@@ -435,9 +435,8 @@ def test_concurrent_scans_send_exactly_once(board: Board, sender: Sender):
 @pytest.mark.parametrize("stage", ["user_wait", "approval_wait"])
 @pytest.mark.parametrize("mode", ["success", "accepted_error", "malformed", "hang"])
 def test_stop_notice_is_once_per_entry_and_does_not_change_stage(
-    board: Board, sender: Sender, monkeypatch: pytest.MonkeyPatch, stage: str, mode: str
+    board: Board, sender: Sender, stage: str, mode: str
 ):
-    monkeypatch.setattr(job_delivery, "DELIVERY_TIMEOUT", 0.1)
     sender.modes(mode)
     job_id = board.add(prompt=PROMPT)
     board.set(job_id, stage=stage, wait_reason="synthetic_stop", error="needs judgment")

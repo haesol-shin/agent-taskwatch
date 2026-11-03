@@ -1,7 +1,9 @@
-"""Public omp RPC client over stdio (protocol v2): one process, JSONL frames, no model choice.
+"""Public omp RPC client over stdio (protocol v2): one process, JSONL frames.
 
 Only documented frames are used. A prompt is not complete at its response or at
-prompt_result: the caller also needs agent_start and a settled session.
+prompt_result: the caller also needs agent_start and a settled session. The client never
+picks a model by policy: the process, as launched, reports the model omp selected, and
+`open_session` binds the conversation to exactly that pair, so omp alone resolves roles.
 """
 
 import base64
@@ -16,10 +18,18 @@ from pathlib import Path
 
 DEFAULT_FRAME_BYTES = 1 << 20
 DEFAULT_REASSEMBLED_BYTES = 64 << 20
+OPEN_SESSION_NEEDS = (
+    "the omp command must support the public open_session provider and modelId "
+    'override (docs/configuration.md, "Model selection")'
+)
 
 
 class RpcError(Exception):
     """The RPC conversation failed. The step did not complete."""
+
+
+class RpcRejected(RpcError):
+    """The peer answered a command with success: false."""
 
 
 class RpcTimeout(RpcError):
@@ -286,14 +296,39 @@ class RpcClient:
         self._send({"id": ident, "type": kind, **fields})
         frame = self._wait(lambda: self._responses.pop(ident, None), timeout, kind)
         if not frame.get("success"):
-            raise RpcError(f"{kind} failed: {frame.get('error', 'unknown error')}")
+            raise RpcRejected(f"{kind} failed: {frame.get('error', 'unknown error')}")
         data = frame.get("data")
         return data if isinstance(data, dict) else {}
 
-    def open_session(self, session_dir: Path, timeout: float) -> dict:
-        data = self.request("open_session", timeout, sessionDir=str(session_dir))
+    def startup_model(self, timeout: float) -> tuple[str, str]:
+        """The `(provider, id)` omp selected when this process launched, from `get_state`."""
+        return _model_pair(self.request("get_state", timeout))
+
+    def open_session(
+        self, session_dir: Path, timeout: float, *, provider: str, model_id: str
+    ) -> dict:
+        """Bind the process to the conversation in `session_dir` and to the given model.
+
+        The pair replaces the model saved in the conversation. A peer that ignores it is
+        caught by reading the model back, so a stale selection never answers a prompt."""
+        try:
+            data = self.request(
+                "open_session",
+                timeout,
+                sessionDir=str(session_dir),
+                provider=provider,
+                modelId=model_id,
+            )
+        except RpcRejected as exc:
+            raise RpcError(f"{exc}; {OPEN_SESSION_NEEDS}") from exc
         if data.get("cancelled"):
             raise RpcError("open_session was cancelled")
+        bound = self.startup_model(timeout)
+        if bound != (provider, model_id):
+            raise RpcError(
+                f"open_session bound {bound[0]}/{bound[1]}, not {provider}/{model_id}; "
+                + OPEN_SESSION_NEEDS
+            )
         return data
 
     def prompt_and_wait(self, message: str, timeout: float) -> dict:
@@ -400,6 +435,15 @@ def _is_failure_frame(frame: dict) -> bool:
         and frame.get("level") == "error"
         and frame.get("source") == "session-persistence"
     )
+
+
+def _model_pair(state: dict) -> tuple[str, str]:
+    model = state.get("model")
+    provider = model.get("provider") if isinstance(model, dict) else None
+    ident = model.get("id") if isinstance(model, dict) else None
+    if not (isinstance(provider, str) and provider and isinstance(ident, str) and ident):
+        raise RpcError("get_state reported no model provider and id for the launched omp")
+    return provider, ident
 
 
 def _left(deadline: float) -> float:

@@ -86,6 +86,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 
 ### Fixed
 
+- A resumed RPC conversation is bound to the model its process launched with, not to the saved one: after a usage-limit failure the next launch of a command such as `omp --model @task` uses the current role order and the same conversation continues. A `public_text` base outside the unit heads is stored as its submit-time commit SHA, so moving that ref no longer makes a reviewed result stale (`docs/configuration.md`, "Model selection" and "Submit an approved job").
 - Job state validates checksums, preserves torn tails and refuses conflicting receipt identities; see [Job records](docs/configuration.md#job-records).
 - The delivery card is written in the configured `language`: `WORKFLOW.md` tells the worker to write the `Card` lines in it and the review prompt tells the reviewer to write finding `summary` and `not_checked` items in it. Without the key, the language of the intent stays (`docs/configuration.md`, "Language"; `docs/kinds/brief.md`).
 - The wake that starts the next stage sets the timer accuracy to 1 s (`--timer-property=AccuracySec=1s`); systemd's default of 1 minute let the next stage start 20 to 52 s late.
