@@ -306,7 +306,12 @@ def _attention(root: Path, row: dict) -> bool:
         folder = state_dir(root) / "jobs" / job.id
         workspace = Path(job.workspace)
         path = folder / "brief.md"
-        if brief.problems(path, (workspace, folder, Path(job.target))):
+        commit = None
+        roots = (workspace, folder, Path(job.target))
+        if job.review == "code" and job.review_target is None:
+            commit = (Path(job.target), job.fingerprint)
+            roots = (folder,)
+        if brief.problems(path, roots, commit=commit):
             return True
         if decision_count(path.read_text(encoding="utf-8")):
             return True

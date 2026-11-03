@@ -1,6 +1,7 @@
 """`needs` against synthetic ledgers written by the real Jobs store."""
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,7 +9,9 @@ import pytest
 
 from taskwatch.job_cli import main
 from taskwatch.job_watch import needs
+from taskwatch.job_workspace import settle
 from taskwatch.jobs import Jobs, _digest
+from tests.git_fixture import git, make_repo
 from tests.test_jobs import payload
 
 BRIEF = """## Why
@@ -490,3 +493,95 @@ def test_design_completion_requires_valid_choices_without_picks(ledger: Ledger, 
     code, text = ledger.watch(cursor, sleep)
     assert code == 0 and ident in text
     assert len(calls) == (1 if damage is None else 0)
+
+
+def committed_completion(ledger: Ledger, pointer: str) -> tuple[str, Path]:
+    repo = make_repo(ledger.tmp)
+    work = ledger.tmp / "result-work"
+    git(repo, "worktree", "add", "-b", "result", str(work))
+    (work / "new_result.py").write_text("first = 1\nsecond = 2\n", encoding="utf-8")
+    (work / "out.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    git(work, "add", "new_result.py", "out.txt")
+    git(work, "commit", "-m", "Add synthetic result")
+    sha = git(work, "rev-parse", "HEAD")
+    ident = ledger.add(
+        review="code",
+        stage="done",
+        target=str(repo),
+        workspace=str(work),
+        workspace_state="active",
+        branch="result",
+        branch_state="kept",
+        fingerprint=sha,
+        reviews=({**CLEAN_PASS, "fingerprint": sha},),
+    )
+    folder = ledger.jobs.folder(ledger.get(ident))
+    (folder / "brief.md").write_text(CLEAN_BRIEF.replace("a.py:1", pointer), encoding="utf-8")
+    (folder / "evidence.txt").write_text("Synthetic record\n", encoding="utf-8")
+    return ident, repo
+
+
+@pytest.mark.parametrize("pointer", ["new_result.py:2", "out.txt:3", "evidence.txt:1"])
+@pytest.mark.parametrize("cleaned", [False, True])
+def test_clean_code_completion_uses_accepted_commit_after_settlement(ledger, pointer, cleaned):
+    cursor = ledger.size()
+    ident, _ = committed_completion(ledger, pointer)
+    job = ledger.get(ident)
+    if cleaned:
+        changes = settle(job, dict(os.environ), {job.target})
+        assert changes["workspace_state"] == "removed" and not Path(job.workspace).exists()
+        ledger.set(ident, **changes)
+    now = [0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    code, text = needs(
+        ledger.root,
+        cursor=cursor,
+        wait=True,
+        timeout=2,
+        interval=1,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    assert code == 3 and "cursor:" not in text
+
+
+@pytest.mark.parametrize("damage", ["missing_file", "line_range", "missing_commit", "malformed"])
+def test_removed_code_completion_still_wakes_for_invalid_brief_evidence(ledger, damage):
+    cursor = ledger.size()
+    pointer = {
+        "missing_file": "missing.py:1",
+        "line_range": "out.txt:4",
+        "missing_commit": "out.txt:3",
+        "malformed": "out.txt:3",
+    }[damage]
+    ident, repo = committed_completion(ledger, pointer)
+    job = ledger.get(ident)
+    changes = settle(job, dict(os.environ), {job.target})
+    assert changes["workspace_state"] == "removed"
+    ledger.set(ident, **changes)
+    # A newer target checkout cannot validate a pointer absent from the accepted result.
+    (repo / "missing.py").write_text("synthetic = 1\n", encoding="utf-8")
+    (repo / "out.txt").write_text("line\n" * 10, encoding="utf-8")
+    git(repo, "add", "missing.py", "out.txt")
+    git(repo, "commit", "-m", "Change synthetic target")
+    if damage == "missing_commit":
+        ledger.set(ident, fingerprint="0" * 40)
+    elif damage == "malformed":
+        (ledger.jobs.folder(job) / "brief.md").write_text("Invalid brief\n", encoding="utf-8")
+    code, text = ledger.list(cursor=cursor, wait=True)
+    assert code == 0 and ident in text
+
+
+def test_code_completion_without_pointers_still_requires_a_readable_result_commit(ledger):
+    cursor = ledger.size()
+    ident, _ = committed_completion(ledger, "new_result.py:2")
+    job = ledger.get(ident)
+    path = ledger.jobs.folder(job) / "brief.md"
+    text = CLEAN_BRIEF.replace("- y. See a.py:1", "Complete synthetic result.")
+    path.write_text(text.replace("a.py:1", "Result commit."), encoding="utf-8")
+    ledger.set(ident, fingerprint="0" * 40)
+    code, report = ledger.list(cursor=cursor, wait=True)
+    assert code == 0 and ident in report
