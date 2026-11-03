@@ -102,7 +102,10 @@ class CI:
     def state(self) -> str:
         if not self.evidence or any(e.kind == "missing" for e in self.evidence):
             return "missing"
-        if any(e.status in {"queued", "in_progress", "pending", "waiting"} for e in self.evidence):
+        if any(
+            e.status in {"requested", "queued", "in_progress", "pending", "waiting"}
+            for e in self.evidence
+        ):
             return "pending"
         if any(e.status != "completed" or e.conclusion != "success" for e in self.evidence):
             return "failed"
@@ -251,8 +254,25 @@ class GitHub:
             raise error(f"command failed (exit {proc.returncode}); output withheld")
         return out
 
-    def _api(self, repo: Repository, endpoint: str, *, pages: bool = False):
-        argv = ["gh", "api", "--hostname", repo.host, "--method", "GET", endpoint]
+    def _api(
+        self,
+        repo: Repository,
+        endpoint: str,
+        *,
+        pages: bool = False,
+        fields: Mapping[str, str] | None = None,
+    ):
+        argv = [
+            "gh",
+            "api",
+            "--hostname",
+            repo.host,
+            "--method",
+            "POST" if fields else "GET",
+            endpoint,
+        ]
+        for key, value in (fields or {}).items():
+            argv += ["-f", f"{key}={value}"]
         if pages:
             argv += ["--paginate"]
         raw = self._command(argv)
@@ -297,8 +317,11 @@ class GitHub:
         self._command(["gh", "auth", "status", "--hostname", host])
         provisional = Repository(host, owner, name, "", None, None)
         data = _object(self._api(provisional, self._path(provisional)))
-        if _text(data.get("full_name")).lower() != f"{owner}/{name}".lower():
+        full_name = _text(data.get("full_name"))
+        if full_name.lower() != f"{owner}/{name}".lower():
             raise Mismatch("repository response differs from origin")
+        _, owner, name = parse_origin(f"https://{host}/{full_name}", self.authenticated_hosts)
+        provisional = Repository(host, owner, name, "", None, None)
         branch = _text(data.get("default_branch"))
         # The shared helper supplies local tracking evidence, never its main fallback as truth.
         try:
@@ -434,6 +457,42 @@ class GitHub:
         except ForgeError:
             raise Uncertain("create acknowledgement requires identity reconciliation") from None
 
+    def _has_classic_protection(self, repo: Repository) -> bool:
+        # A protected branch can have rulesets without a classic protection resource.
+        # Only an explicit null rule on this exact ref proves absence, never a REST 404.
+        query = (
+            "query($owner:String!,$name:String!,$ref:String!){"
+            "repository(owner:$owner,name:$name){nameWithOwner "
+            "ref(qualifiedName:$ref){name branchProtectionRule{id}}}}"
+        )
+        data = _object(
+            self._api(
+                repo,
+                "graphql",
+                fields={
+                    "query": query,
+                    "owner": repo.owner,
+                    "name": repo.name,
+                    "ref": f"refs/heads/{repo.default_branch}",
+                },
+            )
+        )
+        if "errors" in data:
+            raise ForgeError("classic protection query failed; output withheld")
+        repository = _object(_object(data.get("data")).get("repository"))
+        if _text(repository.get("nameWithOwner")).lower() != f"{repo.owner}/{repo.name}".lower():
+            raise Mismatch("classic protection repository differs")
+        ref = _object(repository.get("ref"))
+        if _text(ref.get("name")) != repo.default_branch:
+            raise Mismatch("classic protection branch differs")
+        if "branchProtectionRule" not in ref:
+            raise ForgeError("missing classic protection evidence")
+        rule = ref["branchProtectionRule"]
+        if rule is None:
+            return False
+        _text(_object(rule).get("id"))
+        return True
+
     def _required(self, repo: Repository) -> set[tuple[str, int | None]]:
         path = self._path(repo)
         branch = quote(repo.default_branch, safe="")
@@ -441,7 +500,8 @@ class GitHub:
         if _text(metadata.get("name")) != repo.default_branch:
             raise Mismatch("branch protection response differs")
         required = set()
-        if _bool(metadata.get("protected")):
+        rules = self._rules(repo, repo.default_branch)
+        if _bool(metadata.get("protected")) and self._has_classic_protection(repo):
             protection = _object(self._api(repo, f"{path}/branches/{branch}/protection"))
             checks = protection.get("required_status_checks")
             if checks is not None:
@@ -453,7 +513,7 @@ class GitHub:
                 for context in _list(checks.get("contexts")):
                     if not any(name == context for name, _ in required):
                         required.add((_text(context), None))
-        for rule in self._rules(repo, repo.default_branch):
+        for rule in rules:
             kind = _text(rule.get("type"))
             if kind == "merge_queue":
                 raise Unsupported("merge queue is required")

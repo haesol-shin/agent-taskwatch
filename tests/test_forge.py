@@ -54,16 +54,34 @@ if args[:2] == ["auth", "status"]:
     sys.exit(0)
 
 if args[:1] == ["api"]:
-    if option("--hostname") != "forge.invalid" or option("--method") != "GET":
-        fail()
     endpoint = args[args.index("--method") + 2]
+    if (option("--hostname") != "forge.invalid"
+            or option("--method") != ("POST" if endpoint == "graphql" else "GET")):
+        fail()
     if endpoint in state.get("raw", {}):
         print(state["raw"][endpoint])
         sys.exit(0)
     if endpoint in state.get("errors", []):
         fail()
+    if endpoint == "graphql":
+        fields = dict(args[index + 1].split("=", 1)
+                      for index, arg in enumerate(args) if arg == "-f")
+        if (fields.get("owner") != "sample" or fields.get("name") != "project"
+                or fields.get("ref") != "refs/heads/main"):
+            fail()
+        value = state.get("graphql", {"data": {"repository": {
+            "nameWithOwner": "sample/project", "ref": {
+                "name": "main",
+                "branchProtectionRule": state.get("classic_rule", {"id": "RULE_example"}),
+            },
+        }}})
+        emit(value)
+        sys.exit(0)
     parsed = urlsplit(endpoint)
     path = parsed.path
+    parts = path.split("/")
+    if len(parts) >= 3 and parts[0] == "repos":
+        path = "/".join([parts[0], parts[1].lower(), parts[2].lower(), *parts[3:]])
     query = parse_qs(parsed.query)
     paged = False
     if path == "repos/sample/project":
@@ -405,6 +423,7 @@ def test_ci_requires_at_least_one_successful_workflow(forge, kind):
         ("completed", "neutral", "failed"),
         ("in_progress", None, "pending"),
         ("queued", None, "pending"),
+        ("requested", None, "pending"),
     ],
 )
 def test_non_successful_registered_evidence_cannot_be_green(
@@ -812,3 +831,138 @@ except Cancelled:
                 os.killpg(int(marker.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_ruleset_only_protection_does_not_require_classic_resource(forge):
+    forge.data["branch"]["protected"] = True
+    forge.data["classic_rule"] = None
+    forge.data["errors"] = [f"{API}/branches/main/protection"]
+    forge.data["rules"] = [
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [{"context": "unit", "integration_id": 7}]
+                },
+            }
+        ]
+    ]
+    ci = forge.ci()
+    assert ci.state == "success"
+    assert next(e for e in ci.evidence if e.kind == "check").required is True
+    forge.data["checks"] = [[]]
+    assert forge.ci().state == "missing"
+
+
+def test_classic_and_ruleset_required_contexts_are_both_enforced(forge):
+    forge.data["branch"]["protected"] = True
+    forge.data["protection"]["required_status_checks"]["contexts"] = ["unit"]
+    forge.data["rules"] = [
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [{"context": "security", "integration_id": 7}]
+                },
+            }
+        ]
+    ]
+    ci = forge.ci()
+    assert ci.state == "missing"
+    assert next(e for e in ci.evidence if e.kind == "check").required is True
+    assert next(e for e in ci.evidence if e.kind == "missing").name == "security"
+    forge.data["checks"][0].append(check(forge.head, id=32, name="security"))
+    assert forge.ci().state == "success"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "errors": [{"message": "Permission denied"}],
+            "data": {
+                "repository": {
+                    "nameWithOwner": "sample/project",
+                    "ref": {
+                        "name": "main",
+                        "branchProtectionRule": None,
+                    },
+                },
+            },
+        },
+        {"data": {"repository": None}},
+        {"data": {"repository": {"nameWithOwner": "sample/project", "ref": None}}},
+        {"data": {"repository": {"nameWithOwner": "sample/project", "ref": {"name": "main"}}}},
+        {
+            "data": {
+                "repository": {
+                    "nameWithOwner": "sample/project",
+                    "ref": {
+                        "name": "main",
+                        "branchProtectionRule": {},
+                    },
+                }
+            }
+        },
+    ],
+)
+def test_missing_or_unauthorized_classic_observation_is_not_absence(forge, response):
+    forge.data["branch"]["protected"] = True
+    forge.data["graphql"] = response
+    with pytest.raises(ForgeError):
+        forge.ci()
+
+
+@pytest.mark.parametrize("field", ["repository", "branch"])
+def test_classic_observation_must_match_repository_and_branch(forge, field):
+    repository = {
+        "nameWithOwner": "sample/project",
+        "ref": {
+            "name": "main",
+            "branchProtectionRule": None,
+        },
+    }
+    if field == "repository":
+        repository["nameWithOwner"] = "other/project"
+    else:
+        repository["ref"]["name"] = "other"
+    forge.data["branch"]["protected"] = True
+    forge.data["graphql"] = {"data": {"repository": repository}}
+    with pytest.raises(Mismatch):
+        forge.ci()
+
+
+def test_classic_query_transport_failure_is_not_absence(forge):
+    forge.data["branch"]["protected"] = True
+    forge.data["errors"] = ["graphql"]
+    with pytest.raises(ForgeError):
+        forge.ci()
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        f"https://{HOST}/Sample/Project.git",
+        f"git@{HOST}:Sample/Project.git",
+    ],
+)
+def test_canonical_identity_survives_origin_case_and_attempt_check_urls(forge, origin):
+    git(forge.target, "remote", "set-url", "origin", origin)
+    forge.repo = forge.client.inspect_repository()
+    assert forge.repo.identity == IDENTITY
+    (pr,) = forge.client.find_pull_requests(forge.repo, "topic", "main", forge.head)
+    assert pr.url == f"https://{HOST}/sample/project/pull/17"
+    forge.data["checks"] = [[check(forge.head, id=30, conclusion="failure"), check(forge.head)]]
+    forge.data["runs"] = [[run(forge.head, attempt=2)]]
+    forge.data["jobs"] = [
+        [
+            {
+                "run_id": 51,
+                "run_attempt": attempt,
+                "head_sha": forge.head,
+                "check_run_url": f"https://{HOST}/api/v3/{API}/check-runs/{check_id}",
+            }
+            for check_id, attempt in [(30, 1), (31, 2)]
+        ]
+    ]
+    assert forge.ci().state == "success"
