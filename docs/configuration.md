@@ -275,19 +275,21 @@ Code jobs that build a result accept an optional `public_text` list with at most
 
 The item shape remains `{"id": "pr1", "base": "<ref>", "head": "HEAD"}`; `head` defaults to `HEAD`, and `id` is lowercase letters, digits and hyphens.
 
+A repository that requires the squash commit to be the pull request title with a blank body lets the item add `"blank_squash_body": true`. The key is optional and, when present, must be `true`; it is stored only when declared, so existing job records stay valid and a unit without it keeps the mandatory squash body.
+
 The item's external `base` resolves and is pinned at submission; checks require that commit to equal the job's effective workspace base, and its `head` must resolve to the complete result `HEAD`.
 
 Partial ranges, alternate heads and several publication items are rejected; equivalent refs are accepted by resolved commit identity.
 
 Independent pull requests require independent jobs; stacked jobs use the job-level `base` and `predecessors` described in [Chains and gates](#chains-and-gates), not multiple publication units in one job.
 
-The worker writes `pr/<id>/title.txt` for the pull request title, `pr/<id>/body.md` for its evidence and known limits, and `pr/<id>/commit.txt` for the mandatory squash commit body.
+The worker writes `pr/<id>/title.txt` for the pull request title, `pr/<id>/body.md` for its evidence and known limits, and `pr/<id>/commit.txt` for the squash commit body, which is mandatory unless the item declares `blank_squash_body`.
 
-`commit.txt` is body-only, not a complete commit message and not an optional description; the proposed squash subject comes from `title.txt`.
+`commit.txt` is body-only, not a complete commit message and not an optional description; the proposed squash subject comes from `title.txt`. When the item declares `blank_squash_body`, the file must still exist but must be blank (empty or whitespace only), and the squash message is the title alone.
 
 All three files live in the job folder, never in the work folder.
 
-The check rejects missing or blank required texts, an empty commit range, or invalid text and commit message shapes; [Checks](checks.md#public-text-evidence) owns validation, generated fingerprints, read-only snapshots, reviewed copies and historical status.
+The check rejects missing or blank required texts (a blank `commit.txt` only when the item does not declare `blank_squash_body`, and a nonblank one only when it does), an empty commit range, or invalid text and commit message shapes; [Checks](checks.md#public-text-evidence) owns validation, generated fingerprints, read-only snapshots, reviewed copies and historical status.
 
 Preparing or copying reviewed text does not publish, push, merge or authorize landing.
 
@@ -374,10 +376,10 @@ The deterministic `land` step runs in the existing transient service, not a mode
 
 1. **L1, accepted identity.** Require the shared freshness evidence, contract-2 snapshot and one entire-result unit whose head/tree is R/T. Before publication stale evidence follows existing check/review recovery; after publication it parks as `land_review_stale`, preserving identity.
 2. **L2, base.** Require a successful fetch and M=B, or M exactly equal to a declared same-repository predecessor's successfully landed S with tree(B)=tree(S), verified final tree and successful installation when configured. Otherwise park as `land_base_moved`; there is no stale-fetch fallback, cherry-pick, rebase or automatic conflict resolution.
-3. **L3, publication head.** Construct H with `git commit-tree T -p M`, using the reviewed title, one blank line and reviewed `commit.txt`. Verify its parent/tree and persist H plus commit metadata before pushing the deterministic `<job.branch>-land` branch. Retries reuse that object, not a new timestamp. An absent remote ref permits a normal same-H push, equal H resumes, and foreign H parks as `land_head_changed`; no blind force push.
+3. **L3, publication head.** Construct H with `git commit-tree T -p M`, using the reviewed title, one blank line and reviewed `commit.txt`; a unit that declares `blank_squash_body` uses the title alone. Verify its parent/tree and persist H plus commit metadata before pushing the deterministic `<job.branch>-land` branch. Retries reuse that object, not a new timestamp. An absent remote ref permits a normal same-H push, equal H resumes, and foreign H parks as `land_head_changed`; no blind force push.
 4. **L4, pull request.** Search all PR states by exact repository/head/base before creating. Reuse only one matching H, title, body and deterministic evidence footer; creation uses `--body-file`. Duplicate, edited or CLOSED-unmerged PRs park as `land_pr_mismatch`; ambiguous lookup parks as `land_interrupted` without creation. Persist the PR number/URL, never generate replacement prose or a replacement PR.
 5. **L5, CI.** Persist `started_at` and absolute `deadline=started_at+rpc_timeout` at the first observation after PR creation or reconciliation. Query registration immediately and again at 15 seconds if absent; missing registration after grace parks. Poll registered pending work every 20 seconds within that deadline. Require all registered checks/status contexts and all PR CI workflow runs for H, including optional workflows, to finish successfully, with at least one successful CI workflow run. No required checks is acceptable only with nonempty successful CI; missing, stale, empty, skipped-only, cancelled or failed evidence is not green.
-6. **L6, merge.** Immediately fetch/recheck M, exact PR H/base/text, mergeability, supported capabilities and green CI identity. Validate the final subject including deterministic ` (#n)` suffix under existing message rules, without rewriting it. Request head-pinned direct squash with reviewed snapshot commit body; only observed MERGED with full S is success. Refusal parks as `land_merge_failed` or a specific mismatch. Exit zero, a queue, auto-merge or unknown outcome is not success; no `--admin` or protection changes.
+6. **L6, merge.** Immediately fetch/recheck M, exact PR H/base/text, mergeability, supported capabilities and green CI identity. Validate the final subject including deterministic ` (#n)` suffix under existing message rules, without rewriting it. Request head-pinned direct squash with reviewed snapshot commit body (an empty body file when the unit declares `blank_squash_body`); only observed MERGED with full S is success. Refusal parks as `land_merge_failed` or a specific mismatch. Exit zero, a queue, auto-merge or unknown outcome is not success; no `--admin` or protection changes.
 7. **L7, final tree.** Persist discovered S before fetching and verifying tree(S)=T, current `origin/<default branch>` contains S and its tree is T; record that observed main SHA too. A mismatch parks as `land_tree_mismatch` with the merge visibly retained, no installation, rollback or replacement PR.
 8. **L8, install and deliver.** After L7, run only the approved frozen host hook or proceed if absent. Successful installation or no hook reaches `deliver_pending`, then the existing card/send-once/unknown-delivery policy. Normal cleanup follows delivery and never force-deletes dirty or unintegrated worktrees or job records.
 

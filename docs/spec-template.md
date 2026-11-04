@@ -54,4 +54,4 @@ The reviewer finds your answer by heading. Headings 1, 2, 3, 4, 6, 7, 9 and 10 m
 
 ## Public text
 
-<!-- `public_text: none`, or one item with unchanged `id`, `base` and `head` fields covering the complete job result, as [configuration](configuration.md#public-text) defines. Name the mandatory job-folder `title.txt`, `body.md` and body-only squash `commit.txt`; [Checks](checks.md#public-text-evidence) owns their validation, fingerprint, snapshot, copy and historical status. -->
+<!-- `public_text: none`, or one item with unchanged `id`, `base` and `head` fields covering the complete job result, as [configuration](configuration.md#public-text) defines. Name the mandatory job-folder `title.txt`, `body.md` and body-only squash `commit.txt`, and say when the repository requires a blank squash body so the item declares `blank_squash_body`; [Checks](checks.md#public-text-evidence) owns their validation, fingerprint, snapshot, copy and historical status. -->

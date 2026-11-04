@@ -168,6 +168,8 @@ class Transaction:
         self.commit_file = copy / "commit.txt"
         self.body_file = copy / "body.md"
         self.commit = self.commit_file.read_bytes().decode()
+        if bool(self.commit.strip()) == job_text.blank_body(job.public_text[0]):
+            raise LandStop("land_review_stale", "squash body does not match the unit declaration")
         repo = self.api.inspect_repository()
         self.api._writable(repo)
         if self.state.get("identity"):
@@ -256,7 +258,7 @@ class Transaction:
 
     def head(self):
         if not self.state.get("H"):
-            message = self.title + "\n\n" + self.commit
+            message = job_text.squash_message(self.title, self.commit)
             head = self.git("commit-tree", self.state["T"], "-p", self.state["M"], stdin=message)
             metadata = self.git("show", "-s", "--format=raw", head)
             self.save(H=head, commit_metadata=metadata, phase="head")
@@ -416,7 +418,8 @@ class Transaction:
             raise LandStop("land_ci_failed", "green CI identity changed before merge")
         subject = self.title + f" (#{pr.number})"
         problems = message_problems(
-            subject + "\n\n" + self.commit, bullet_one_line=self.ctx.config.bullet_one_line
+            job_text.squash_message(subject, self.commit),
+            bullet_one_line=self.ctx.config.bullet_one_line,
         )
         if problems:
             raise LandStop("land_merge_failed", "; ".join(problems))

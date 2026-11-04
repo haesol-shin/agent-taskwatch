@@ -401,6 +401,8 @@ _OPTIONAL_FIELDS = {
     "land",
 }
 UNIT_FILES = ("title.txt", "body.md", "commit.txt")
+# Optional public_text key: the repository requires the squash commit body to be blank.
+BLANK_SQUASH_BODY = "blank_squash_body"
 _UNIT_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 
 # The headings of docs/spec-template.md. A code or design job's spec answers each one, or says
@@ -600,18 +602,25 @@ def _public_text_field(data: dict, review_only: bool) -> None:
     if len(units) != 1:
         raise ValueError("public_text accepts exactly one unit; split publication units into jobs")
     unit = units[0]
-    if not isinstance(unit, dict) or unit.keys() - {"id", "base", "head"} or "base" not in unit:
-        raise ValueError("a public_text unit needs id and base, and may have head")
+    allowed = {"id", "base", "head", BLANK_SQUASH_BODY}
+    if not isinstance(unit, dict) or unit.keys() - allowed or "base" not in unit:
+        raise ValueError(
+            f"a public_text unit needs id and base, and may have head and {BLANK_SQUASH_BODY}"
+        )
     if not isinstance(unit.get("id"), str) or _UNIT_ID.fullmatch(unit["id"]) is None:
         raise ValueError("a public_text id is lowercase letters, digits and hyphens")
+    if BLANK_SQUASH_BODY in unit and unit[BLANK_SQUASH_BODY] is not True:
+        raise ValueError(f"public_text {BLANK_SQUASH_BODY} must be true when present")
     base = _ref(unit["base"], "public_text base")
-    data["public_text"] = [
-        {
-            "id": unit["id"],
-            "base": _resolve_commit(Path(data["target"]), base, "public_text base"),
-            "head": _ref(unit.get("head", "HEAD"), "public_text head"),
-        }
-    ]
+    pinned = {
+        "id": unit["id"],
+        "base": _resolve_commit(Path(data["target"]), base, "public_text base"),
+        "head": _ref(unit.get("head", "HEAD"), "public_text head"),
+    }
+    if unit.get(BLANK_SQUASH_BODY):
+        # Stored only when declared, so records of units without it keep their old shape.
+        pinned[BLANK_SQUASH_BODY] = True
+    data["public_text"] = [pinned]
 
 
 def _public_text_base(data: dict) -> None:
@@ -768,8 +777,13 @@ def _validate_public_text(job: dict) -> None:
         raise RecordError("jobs.jsonl: invalid texts")
     if not isinstance(units, list) or any(
         not isinstance(unit, dict)
-        or unit.keys() != {"id", "base", "head"}
-        or any(not isinstance(value, str) or not value for value in unit.values())
+        or unit.keys() - {BLANK_SQUASH_BODY} != {"id", "base", "head"}
+        or unit.get(BLANK_SQUASH_BODY, True) is not True
+        or any(
+            not isinstance(value, str) or not value
+            for key, value in unit.items()
+            if key != BLANK_SQUASH_BODY
+        )
         for unit in units
     ):
         raise RecordError("jobs.jsonl: invalid public_text")

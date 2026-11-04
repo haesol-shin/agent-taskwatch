@@ -77,6 +77,21 @@ def test_submit_defaults_head_and_pins_an_external_base_to_its_sha(tmp_path):
     assert [dict(u) for u in job.public_text] == [{"id": "pr", "base": sha, "head": "HEAD"}]
 
 
+def test_submit_stores_a_declared_blank_squash_body_only_when_declared(tmp_path):
+    unit = {"id": "pr", "base": "main", "blank_squash_body": True}
+    job = Jobs(tmp_path / "root").submit(code_payload(tmp_path, [unit]), 10)
+    assert job.public_text[0]["blank_squash_body"] is True
+    reloaded = Jobs(tmp_path / "root").load()[job.id]
+    assert reloaded.public_text[0]["blank_squash_body"] is True
+
+
+@pytest.mark.parametrize("value", [False, 1, "true", None])
+def test_submit_refuses_a_blank_squash_body_that_is_not_true(tmp_path, value):
+    unit = {"id": "pr", "base": "main", "blank_squash_body": value}
+    with pytest.raises(ValueError, match="blank_squash_body"):
+        Jobs(tmp_path / "root").submit(code_payload(tmp_path, [unit]), 10)
+
+
 def test_a_moved_ref_does_not_change_the_stored_external_base(tmp_path):
     data = code_payload(tmp_path, [{"id": "pr", "base": "moving"}])
     repo = tmp_path / "repo"
@@ -270,7 +285,7 @@ def test_every_continuation_line_names_its_bullet():
 class UnitEnv(Env):
     """A code job whose work folder is a real worktree with one unit."""
 
-    def __init__(self, tmp_path, monkeypatch, base="main"):
+    def __init__(self, tmp_path, monkeypatch, base="main", blank_body=False):
         repo = make_repo(tmp_path, "repo")
         if base != "main":
             git(repo, "branch", base)
@@ -279,7 +294,9 @@ class UnitEnv(Env):
             monkeypatch,
             review="code",
             target=repo,
-            public_text=[{"id": "pr", "base": base}],
+            public_text=[
+                {"id": "pr", "base": base, **({"blank_squash_body": True} if blank_body else {})}
+            ],
         )
         assert self.run("check") == 0  # creates the work folder; nothing is built yet
         self.tree = self.folder() / "worktree"
@@ -289,7 +306,7 @@ class UnitEnv(Env):
         (self.folder() / "pr" / "pr").mkdir(parents=True, exist_ok=True)
         self.write_text("title.txt", "feat(x): add\n")
         self.write_text("body.md", "body\n")
-        self.write_text("commit.txt", "- Preserve the complete result\n")
+        self.write_text("commit.txt", "" if blank_body else "- Preserve the complete result\n")
 
     def write_text(self, name: str, text: str) -> None:
         (self.folder() / "pr" / "pr" / name).write_text(text, encoding="utf-8")
@@ -310,6 +327,41 @@ def test_invalid_squash_body_cannot_reach_review(unit_env, body):
     unit_env.write_text("commit.txt", body)
     assert any("squash message" in p for p in unit_env.problems())
     assert unit_env.get().stage == "fix" and unit_env.get().reviews == ()
+
+
+def test_blank_squash_body_is_an_error_unless_declared(unit_env):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    unit_env.write_text("commit.txt", "")
+    assert any("squash body" in p for p in unit_env.problems())
+    assert unit_env.get().stage == "fix"
+
+
+@pytest.mark.parametrize("body", ["", "\n"])
+def test_a_declared_blank_squash_body_reaches_review(tmp_path, monkeypatch, body):
+    env = UnitEnv(tmp_path, monkeypatch, blank_body=True)
+    env.commit("feat(x): add\n\nWhy.")
+    env.write_text("commit.txt", body)
+    assert env.problems() == []
+    assert env.get().stage == "review"
+
+
+def test_a_declared_blank_squash_body_refuses_text(tmp_path, monkeypatch):
+    env = UnitEnv(tmp_path, monkeypatch, blank_body=True)
+    env.commit("feat(x): add\n\nWhy.")
+    env.write_text("commit.txt", "- Explain the reason\n")
+    assert any("must be blank" in p for p in env.problems())
+    assert env.get().stage == "fix"
+
+
+def test_a_declared_blank_squash_body_still_needs_the_file_title_and_body(tmp_path, monkeypatch):
+    env = UnitEnv(tmp_path, monkeypatch, blank_body=True)
+    env.commit("feat(x): add\n\nWhy.")
+    env.write_text("commit.txt", "")
+    (env.folder() / "pr/pr/commit.txt").unlink()
+    assert env.problems() == ["required file is missing: pr/pr/commit.txt"]
+    env.write_text("commit.txt", "")
+    env.write_text("body.md", "\n")
+    assert any("nonblank" in p for p in env.problems())
 
 
 def test_squash_bullet_rules_use_host_configuration_without_rewriting(unit_env):
