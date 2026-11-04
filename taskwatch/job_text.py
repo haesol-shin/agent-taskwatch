@@ -21,7 +21,7 @@ from .fingerprint import (
     tree_sha,
     without_evidence,
 )
-from .jobs import UNIT_FILES, JobState
+from .jobs import BLANK_SQUASH_BODY, UNIT_FILES, JobState
 
 SNAPSHOT = "text"
 EXIT_CHANGED = 2
@@ -30,6 +30,17 @@ EXIT_NOT_REVIEWED = 3
 
 def unit_file(folder: Path, unit_id: str, name: str) -> Path:
     return folder / "pr" / unit_id / name
+
+
+def blank_body(unit: Mapping) -> bool:
+    """The unit declares that its squash commit body is blank."""
+    return unit.get(BLANK_SQUASH_BODY) is True
+
+
+def squash_message(title: str, commit: str) -> str:
+    """Title, one blank line and the body; the title alone when the body is blank."""
+    subject = title.rstrip("\n")
+    return f"{subject}\n\n{commit}" if commit.strip() else f"{subject}\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,8 +84,15 @@ def collect(
         title, body, commit = (
             unit_file(folder, unit["id"], name).read_bytes().decode("utf-8") for name in UNIT_FILES
         )
-        if not all(text.strip() for text in (title, body, commit)):
-            raise ValueError("title.txt, body.md and commit.txt must be nonblank")
+        if not title.strip() or not body.strip():
+            raise ValueError("title.txt and body.md must be nonblank")
+        if blank_body(unit):
+            if commit.strip():
+                raise ValueError(f"commit.txt must be blank: the unit declares {BLANK_SQUASH_BODY}")
+        elif not commit.strip():
+            raise ValueError(
+                f"commit.txt must be nonblank unless the unit declares {BLANK_SQUASH_BODY}"
+            )
         units[unit["id"]] = UnitText(
             unit["id"],
             base,
@@ -249,7 +267,11 @@ def reviewed_copy(
     lines = [str(title), str(body)]
     if contract == 2:
         commit_path = out / "commit.txt"
-        commit_path.write_bytes((snapshot / unit_id / "commit.txt").read_bytes())
+        declared = any(blank_body(u) for u in job.public_text if u["id"] == unit_id)
+        # A declared blank body is published as an empty file, whatever whitespace was reviewed.
+        commit_path.write_bytes(
+            b"" if declared else (snapshot / unit_id / "commit.txt").read_bytes()
+        )
         lines.append(str(commit_path))
     else:
         lines.append(

@@ -471,6 +471,7 @@ class Lab(Env):
         window: int = 2,
         install: tuple[str, ...] | None = ("install", "{sha}", "{target}"),
         public_base: str = "main",
+        blank_body: bool = False,
         sender_modes: tuple[str, ...] | None = None,
         hook_modes: tuple[str, ...] | None = None,
         **extra,
@@ -494,6 +495,7 @@ class Lab(Env):
             self.set_hook_modes(*(hook_modes or ("ok",)))
         self.configure()
         self.service = StepService(self.root, tmp_path / "unit-logs")
+        self.blank_body = blank_body
         target = self.repo
         if alias:
             target = tmp_path / f"alias-{receipt}"
@@ -503,7 +505,13 @@ class Lab(Env):
             monkeypatch,
             review="code",
             target=target,
-            public_text=[{"id": "pr", "base": public_base}],
+            public_text=[
+                {
+                    "id": "pr",
+                    "base": public_base,
+                    **({"blank_squash_body": True} if blank_body else {}),
+                }
+            ],
             receipt_key=receipt,
             **({"land": True} if land else {}),
             **extra,
@@ -637,7 +645,9 @@ class Lab(Env):
         (self.folder() / "pr" / "pr").mkdir(parents=True, exist_ok=True)
         self.write_text("title.txt", "feat(x): add\n")
         self.write_text("body.md", "body\n")
-        self.write_text("commit.txt", "- Preserve the complete result\n")
+        self.write_text(
+            "commit.txt", "\n" if self.blank_body else "- Preserve the complete result\n"
+        )
         (self.tree / "out.txt").write_text("ok\n", encoding="utf-8")
         (self.tree / f"{self.receipt}.txt").write_text("one\n", encoding="utf-8")
         git(self.tree, "add", "-A")
@@ -763,6 +773,19 @@ def test_accepted_result_becomes_one_head_pr_squash_install_and_card(make):
     assert [(c["argv"], c["tty"]) for c in hook] == [(["install", squash, target], False)]
     assert hook[0]["cwd"] == target
     assert len(lab.cards()) == 1 and [d["status"] for d in job.deliveries] == ["success"]
+
+
+def test_a_declared_blank_squash_body_lands_with_the_title_alone(make):
+    lab = make(blank_body=True)
+    lab.accept()
+    assert lab.reviewed_text()["commit.txt"] == ""
+    lab.finish()
+    state = lab.land()
+    assert git(lab.bare, "log", "-1", "--format=%B", state["H"]) == "feat(x): add"
+    assert lab.forge()["merge_calls"] == [
+        {"number": 17, "subject": "feat(x): add (#17)", "body": ""}
+    ]
+    assert git(lab.bare, "log", "-1", "--format=%B", state["S"]) == "feat(x): add (#17)"
 
 
 def test_a_landed_job_is_not_landed_or_sent_again(make):

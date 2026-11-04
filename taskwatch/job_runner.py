@@ -646,8 +646,14 @@ def _text_lines(job: JobState, review_root: Path) -> list[str]:
             f"(final squash body), and the separate step messages under commits/ in "
             f"{review_root / job_text.SNAPSHOT / unit['id']}; "
             f"judge each claim against `git diff {base} {head}` and `git log {base}..{head}`."
-            " Validate the title plus one blank line plus commit.txt as the squash message; "
-            "the squash body must never be inferred from the step messages."
+            + (
+                " The unit declares a blank squash body: commit.txt must be blank and the squash "
+                "message is the title alone; the body must never be inferred from the step "
+                "messages."
+                if job_text.blank_body(unit)
+                else " Validate the title plus one blank line plus commit.txt as the squash "
+                "message; the squash body must never be inferred from the step messages."
+            )
         )
     return lines
 
@@ -1112,12 +1118,14 @@ def _squash_problems(ctx: Ctx) -> list[str]:
             problems.append(f"public text {unit['id']}: title.txt and commit.txt must be UTF-8")
             continue
         rules = message_problems(
-            title.rstrip("\n") + "\n\n" + commit,
-            bullet_one_line=ctx.config.bullet_one_line,
+            job_text.squash_message(title, commit), bullet_one_line=ctx.config.bullet_one_line
         )
         if len(title.rstrip("\n").splitlines()) != 1:
             rules.append("title.txt must contain exactly one subject line")
-        if not commit.strip():
+        if job_text.blank_body(unit):
+            if commit.strip():
+                rules.append("commit.txt must be blank: the unit declares a blank squash body")
+        elif not commit.strip():
             rules.append("commit.txt must contain the final squash body")
         problems += [f"public text {unit['id']}: squash message: {p}" for p in rules]
     return problems
