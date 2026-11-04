@@ -1,11 +1,6 @@
 # Configuration and state
 
-The `taskwatch` command never imports Hermes. `--root <root>` selects the root
-explicitly; otherwise `HERMES_HOME`, then `~/.hermes`, is used. Select the shared
-root, not a worker profile root. All state lives under `<root>/taskwatch/`; records
-share the lock `<root>/taskwatch/state/lock`.
-Use persistent, nonsynchronized storage for operational state. Temporary
-directories are suitable only for synthetic tests.
+The `taskwatch` command never imports Hermes. `--root <root>` selects the root explicitly; otherwise `HERMES_HOME`, then `~/.hermes`, is used. Select the shared root, not a worker profile root. All state lives under `<root>/taskwatch/`; records share the lock `<root>/taskwatch/state/lock`. Use persistent, nonsynchronized storage for operational state. Temporary directories are suitable only for synthetic tests.
 
 ## Job config
 
@@ -31,10 +26,7 @@ All keys shown above except `max_reviews` are required. The three numeric settin
 
 Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run independent reviews with a different command prefix. Like `omp_command`, it must be a nonempty list of nonempty strings. When omitted, RPC reviews use `omp_command`. With the default `review_mode` (`"rpc"`), review commands receive `--mode rpc --no-ui`. The `init` draft omits this optional key. Work and fix select their command through [Worker execution](#worker-execution).
 
-In `review_command` (and only there), an argument that is exactly `{guidelines}` becomes the
-job's own copy of the review guidelines, and exactly `{review}` becomes the job's `review`
-value. That lets the review command be the [reviewer launcher](review-launch.md), which
-reads the agent definition and those guidelines when the review starts:
+In `review_command` (and only there), an argument that is exactly `{guidelines}` becomes the job's own copy of the review guidelines, and exactly `{review}` becomes the job's `review` value. That lets the review command be the [reviewer launcher](review-launch.md), which reads the agent definition and those guidelines when the review starts:
 
 ```json
 "review_command": ["python3", "-m", "taskwatch.reviewer_launch", "--agent", "/srv/example/reviewer.md",
@@ -212,32 +204,14 @@ Optional `<root>/taskwatch/defaults.json` holds standing owner answers for desig
 A `code` job that builds a result works in `state/jobs/<id>/worktree`, on its own branch.
 
 - Base. Before creating a worktree without an explicit base, the runner runs noninteractive `git fetch origin <default branch>` with a 5 second cap; the branch is the one `origin/HEAD` names, or `main`. It starts from `origin/<default branch>`; a failed fetch or missing origin records `base_note: "base may be stale: <reason>"` and uses the local ref. An explicit `base` commit or branch is used without that creation fetch. `base: "@<receipt key>"` retains the original predecessor relationship: a nonlanding predecessor supplies its branch, while a landed predecessor supplies verified immutable squash commit S, not a branch that cleanup can delete. Workspace creation pins the effective base commit. Landing always requires a fresh successful fetch, regardless of the creation fallback; see [Automatic landing](#automatic-landing).
-- Branch. `<branch_prefix><first 8 characters of the job id>`. Optionally add
-  `"branch_prefix"` to `jobs-config.json` (default `"taskwatch/"`): letters, digits, `_` and
-  `-`, with parts joined by `/`. A resumed job reuses its worktree and branch.
-- Cleanup. When a job reaches `done` or `cancelled`, and not at `deliver_pending`, the scan runs
-  `git worktree remove` without `--force`. A folder with uncommitted or untracked files, or
-  that git refuses to remove, stays and `workspace_state` says why (`kept: <reason>`); the scan
-  retries it. The job folder, records, reviews and logs are never deleted.
-- Branch deletion. After a fetch, the branch is deleted only when it is integrated: its tip is
-  in the history of `origin/<default branch>`, or merging it onto that branch changes nothing
-  (a squash merge already holds its content). Otherwise `branch_state` stays `kept` and the
-  scan checks again later. `integrated` means integrated but git refused the deletion. The
-  integration check needs git 2.38 or later (`git merge-tree --write-tree`); on an older git
-  only a branch in the history is deleted.
-- Record fields: `base`, `base_note`, `branch`, `workspace_state` (`active`, `removed`,
-  `kept: <reason>`) and `branch_state` (`kept`, `integrated`, `deleted`), shown by
-  `taskwatch show`. Records from before these fields exist keep their detached worktree and are
-  not cleaned up.
+- Branch. `<branch_prefix><first 8 characters of the job id>`. Optionally add `"branch_prefix"` to `jobs-config.json` (default `"taskwatch/"`): letters, digits, `_` and `-`, with parts joined by `/`. A resumed job reuses its worktree and branch.
+- Cleanup. When a job reaches `done` or `cancelled`, and not at `deliver_pending`, the scan runs `git worktree remove` without `--force`. A folder with uncommitted or untracked files, or that git refuses to remove, stays and `workspace_state` says why (`kept: <reason>`); the scan retries it. The job folder, records, reviews and logs are never deleted.
+- Branch deletion. After a fetch, the branch is deleted only when it is integrated: its tip is in the history of `origin/<default branch>`, or merging it onto that branch changes nothing (a squash merge already holds its content). Otherwise `branch_state` stays `kept` and the scan checks again later. `integrated` means integrated but git refused the deletion. The integration check needs git 2.38 or later (`git merge-tree --write-tree`); on an older git only a branch in the history is deleted.
+- Record fields: `base`, `base_note`, `branch`, `workspace_state` (`active`, `removed`, `kept: <reason>`) and `branch_state` (`kept`, `integrated`, `deleted`), shown by `taskwatch show`. Records from before these fields exist keep their detached worktree and are not cleaned up.
 
 ### Job records
 
-A job keeps its checklist, progress and brief files in its job folder (`state/jobs/<id>/`), next to
-the logs and reviews, not in the workspace. The worker prompt and `WORKFLOW.md` give their
-absolute paths. The records are therefore never part of a result, and the clean-tree check of a
-`code` job needs no exception. `WORKFLOW.md` also carries the brief contract and the rules of the
-job's type from `docs/jobs/`. A job submitted earlier whose paths name `.taskwatch/...` still
-loads; those paths now resolve inside the job folder as well.
+A job keeps its checklist, progress and brief files in its job folder (`state/jobs/<id>/`), next to the logs and reviews, not in the workspace. The worker prompt and `WORKFLOW.md` give their absolute paths. The records are therefore never part of a result, and the clean-tree check of a `code` job needs no exception. `WORKFLOW.md` also carries the brief contract and the rules of the job's type from `docs/jobs/`. A job submitted earlier whose paths name `.taskwatch/...` still loads; those paths now resolve inside the job folder as well.
 
 ### Submit an approved job
 
@@ -267,24 +241,7 @@ Pass a JSON file to `taskwatch --root <root> submit <file>`. Example:
 }
 ```
 
-`target` must exist. `review` picks the review guidelines the reviewer reads: `code`,
-`design`, or `source` (a document that cites sources, such as research notes, summaries,
-or comparisons). Only `code` also runs the work in a Git worktree, because a code review
-reads the Git diff.
-A job with `review` `code` or `design` and a work contract needs a spec that follows
-[docs/spec-template.md](spec-template.md): each of its thirteen `## ` headings is present and
-answered, or says `n/a: <reason>`. Submit refuses a missing or empty heading by name, and a
-bare `n/a`. A `source` job and a review-only job skip this check. For these two job types the
-reviewer's verdict line also carries a `design_check` of eight answers (`root_cause`,
-`alternatives`, `one_home`, `overlaps`, `needed_now`, `repeated_judgment`, `portability`,
-`choices`), each `ok`, `finding` or `na` with its evidence; the runner checks only its shape.
-The review message names `approval_source` and `approval_scope`, so the reviewer can tell an
-owner decision from a writer's choice and compare the writes of the change with the scope.
-Output paths are relative to the job workspace, checklist and progress paths to the job
-folder; none can traverse outside its base. `check_command` runs as argv without an implicit
-shell; name a shell explicitly only when the approved check needs one.
-The work must create that check script if it is not already in its workspace.
-The checklist follows the existing nonempty `items` list of boolean `passes`.
+`target` must exist. `review` picks the review guidelines the reviewer reads: `code`, `design`, or `source` (a document that cites sources, such as research notes, summaries, or comparisons). Only `code` also runs the work in a Git worktree, because a code review reads the Git diff. A job with `review` `code` or `design` and a work contract needs a spec that follows [docs/spec-template.md](spec-template.md): each of its thirteen `## ` headings is present and answered, or says `n/a: <reason>`. Submit refuses a missing or empty heading by name, and a bare `n/a`. A `source` job and a review-only job skip this check. For these two job types the reviewer's verdict line also carries a `design_check` of eight answers (`root_cause`, `alternatives`, `one_home`, `overlaps`, `needed_now`, `repeated_judgment`, `portability`, `choices`), each `ok`, `finding` or `na` with its evidence; the runner checks only its shape. The review message names `approval_source` and `approval_scope`, so the reviewer can tell an owner decision from a writer's choice and compare the writes of the change with the scope. Output paths are relative to the job workspace, checklist and progress paths to the job folder; none can traverse outside its base. `check_command` runs as argv without an implicit shell; name a shell explicitly only when the approved check needs one. The work must create that check script if it is not already in its workspace. The checklist follows the existing nonempty `items` list of boolean `passes`.
 
 For jobs with a work contract, generated workflow and work, fix and resume messages grant writes outside the workspace only to the configured `progress` and `checklist` paths, `brief.md`, `findings.json`, `root-cause.md`, and the declared public-text files below.
 
@@ -300,35 +257,17 @@ Findings are written when repairing review findings; root-cause evidence is need
 
 Neither is mandatory for an untouched initial result.
 
-The exception does not include the original prompt, copied inputs, `WORKFLOW.md`,
-reviews, snapshots, logs, sessions or global state. Review-only jobs receive no
-worker-owned file exception. Preparing declared public text grants no authority
-to publish it. Any action outside the recorded scope and named file exceptions
-still requires the existing wait-before-action approval procedure.
+The exception does not include the original prompt, copied inputs, `WORKFLOW.md`, reviews, snapshots, logs, sessions or global state. Review-only jobs receive no worker-owned file exception. Preparing declared public text grants no authority to publish it. Any action outside the recorded scope and named file exceptions still requires the existing wait-before-action approval procedure.
 
 `inputs`, `predecessors`, `expected_wait_seconds`, `approval_required`, `max_reviews`, and `land` are optional. Every other example field is required. Each entry of `predecessors` is an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored record keeps the resolved job ids. Derive the receipt key from the approval message and its job number. A repeated key returns the original job even if other arguments differ. The command records the caller's approval assertion; it cannot authenticate the conversation.
 
 `max_reviews` is the review limit of this job. When it is absent the job takes the host setting; see [Review limit](#review-limit).
 
-A job with `predecessors` gets one block per predecessor in the work and review
-messages: its id, job type label (`research` for `review: source`, `design`,
-`implement` for `review: code`, `review` for a `review_target`), stage, result
-location (the output files in its workspace, or for a code job the branch
-`<branch_prefix><first 8 of the id>` in its target), result fingerprint and the
-path of its `brief.md`. The block is read only: nothing is copied, so input hashes
-and the review basis do not change, and the spec still says how to use the result.
+A job with `predecessors` gets one block per predecessor in the work and review messages: its id, job type label (`research` for `review: source`, `design`, `implement` for `review: code`, `review` for a `review_target`), stage, result location (the output files in its workspace, or for a code job the branch `<branch_prefix><first 8 of the id>` in its target), result fingerprint and the path of its `brief.md`. The block is read only: nothing is copied, so input hashes and the review basis do not change, and the spec still says how to use the result.
 
-`approval_required` defaults to `false`. If `true`, the first scan moves the job
-to `approval_wait` before its first work run. With `predecessors`, the job stays
-`queued` (wait reason `predecessor:<id>`) until every predecessor is `done`, so the
-owner has the predecessor's result before the question; a cancelled or
-`user_wait` predecessor leaves it queued. A job without `approval_required`
-still starts once its predecessors reach `deliver_pending`. `approve` clears the
-flag and allows work to start. A later `wait` records the current step for approval.
+`approval_required` defaults to `false`. If `true`, the first scan moves the job to `approval_wait` before its first work run. With `predecessors`, the job stays `queued` (wait reason `predecessor:<id>`) until every predecessor is `done`, so the owner has the predecessor's result before the question; a cancelled or `user_wait` predecessor leaves it queued. A job without `approval_required` still starts once its predecessors reach `deliver_pending`. `approve` clears the flag and allows work to start. A later `wait` records the current step for approval.
 
-`approval_scope` is a recorded boundary, not operating-system isolation.
-The runner's shell tools have the user's permissions; instructions and
-explicit approval records cannot enforce those permissions.
+`approval_scope` is a recorded boundary, not operating-system isolation. The runner's shell tools have the user's permissions; instructions and explicit approval records cannot enforce those permissions.
 
 ### Public text
 
@@ -352,89 +291,36 @@ The check rejects missing or blank required texts, an empty commit range, or inv
 
 Preparing or copying reviewed text does not publish, push, merge or authorize landing.
 
-The check command must exit `0`. Required outputs and a nonempty passing
-checklist must also exist after the command finishes. Minimal checklist:
+The check command must exit `0`. Required outputs and a nonempty passing checklist must also exist after the command finishes. Minimal checklist:
 
 ```json
 {"items": [{"passes": true}]}
 ```
 
-No other checklist item fields are required. A `false` item, missing file,
-invalid JSON, or empty list blocks progress. The independent reviewer returns
-exactly one verdict JSON line followed by findings, for example:
+No other checklist item fields are required. A `false` item, missing file, invalid JSON, or empty list blocks progress. The independent reviewer returns exactly one verdict JSON line followed by findings, for example:
 
 ```text
 {"verdict": "PASS", "blocking": false, "reviewer": "independent-review", "checked": "the diff against the spec", "not_checked": "runtime behavior"}
 No blocking findings.
 ```
 
-A FAIL, malformed verdict, missing input, or blocking finding prevents
-`deliver_pending`. See [review records](checks.md#review-records) for the shared contract.
+A FAIL, malformed verdict, missing input, or blocking finding prevents `deliver_pending`. See [review records](checks.md#review-records) for the shared contract.
 
 #### Job records
 
-The paths here are relative to `<root>/taskwatch/state/`. Use
-`taskwatch --root <root> show [<id>]` for an authoritative read or
-`taskwatch --root <root> scan` for normal scheduling and recovery. Read
-[What needs the owner](#what-needs-the-owner) for the list identities and wake
-conditions; do not edit storage files to acknowledge an item.
+The paths here are relative to `<root>/taskwatch/state/`. Use `taskwatch --root <root> show [<id>]` for an authoritative read or `taskwatch --root <root> scan` for normal scheduling and recovery. Read [What needs the owner](#what-needs-the-owner) for the list identities and wake conditions; do not edit storage files to acknowledge an item.
 
-Submission copies and hashes intent, spec, and role-specific inputs. The original
-prompt is kept intact. `jobs/<id>/state.json` is the sole current
-full snapshot, in a version-2 envelope with a positive revision and a SHA-256
-checksum covering both the revision and all job fields. `jobs-store.json` records
-the format, stream generation and job-id-to-receipt membership. Receipt keys are
-immutable and globally unique. An indexed missing or corrupt snapshot is an
-error, not an absent job; unindexed folders left by input copying are not jobs.
-Corruption blocks scheduling rather than allowing a job to start or pass.
+Submission copies and hashes intent, spec, and role-specific inputs. The original prompt is kept intact. `jobs/<id>/state.json` is the sole current full snapshot, in a version-2 envelope with a positive revision and a SHA-256 checksum covering both the revision and all job fields. `jobs-store.json` records the format, stream generation and job-id-to-receipt membership. Receipt keys are immutable and globally unique. An indexed missing or corrupt snapshot is an error, not an absent job; unindexed folders left by input copying are not jobs. Corruption blocks scheduling rather than allowing a job to start or pass.
 
-Writers share the existing reentrant state lock. Each save validates its affected
-snapshot, membership and unseen committed event tail, rather than rereading
-obsolete full snapshots or unrelated jobs. A cold load validates the indexed
-current snapshots. `job-changes.jsonl` holds checksummed version-2 events with
-generation, sequence, job id, revision and only the needs projection: stage,
-wait reason, wait/approve/resume entry count, predecessors and last event time.
-Every successful save emits an event, including an unchanged projection; needs
-identities, not save count, determine a wake. Full event/review histories remain
-in current snapshots and may grow. The small log grows linearly with saves; there
-is no automatic rotation or bound on total disk use.
+Writers share the existing reentrant state lock. Each save validates its affected snapshot, membership and unseen committed event tail, rather than rereading obsolete full snapshots or unrelated jobs. A cold load validates the indexed current snapshots. `job-changes.jsonl` holds checksummed version-2 events with generation, sequence, job id, revision and only the needs projection: stage, wait reason, wait/approve/resume entry count, predecessors and last event time. Every successful save emits an event, including an unchanged projection; needs identities, not save count, determine a wake. Full event/review histories remain in current snapshots and may grow. The small log grows linearly with saves; there is no automatic rotation or bound on total disk use.
 
-A save writes and fsyncs a restrictive same-directory temporary snapshot, then
-atomically publishes and syncs `jobs-pending.json`, a small prepared transaction
-containing the temporary basename, revision/digest, exact event bytes and any new
-receipt membership, never another full snapshot. It replaces and syncs the
-snapshot, publishes new membership if needed, appends and fsyncs the event, then
-removes the pending marker and syncs its directory before returning success.
-These files are **not** independently updated atomically. Failure before the
-pending marker leaves the old state authoritative and may leave an unreferenced
-temporary file. Failure after publication is uncertain to the caller: the next
-locked authoritative read or mutation rolls the transaction forward, validating
-its revision, digest and sequence. An already matching event is synced again,
-not duplicated; receipt retries retain the original identity. Torn final events
-are preserved beside the log before repair. No external operation runs in
-storage recovery.
+A save writes and fsyncs a restrictive same-directory temporary snapshot, then atomically publishes and syncs `jobs-pending.json`, a small prepared transaction containing the temporary basename, revision/digest, exact event bytes and any new receipt membership, never another full snapshot. It replaces and syncs the snapshot, publishes new membership if needed, appends and fsyncs the event, then removes the pending marker and syncs its directory before returning success. These files are **not** independently updated atomically. Failure before the pending marker leaves the old state authoritative and may leave an unreferenced temporary file. Failure after publication is uncertain to the caller: the next locked authoritative read or mutation rolls the transaction forward, validating its revision, digest and sequence. An already matching event is synced again, not duplicated; receipt retries retain the original identity. Torn final events are preserved beside the log before repair. No external operation runs in storage recovery.
 
-On first authoritative `show`, normal `scan` or mutation without a format marker,
-the writer validates every committed legacy snapshot once, including checksums,
-versions, typed fields, ids and receipt invariants. It preserves a torn suffix,
-stages latest states and one initial projection per job, syncs them, and publishes
-the index last. Interrupted pre-marker migration accepts only artifacts matching
-the exact validated legacy latest states; conflicts or orphaned v2 files without
-a legacy source fail closed. Empty roots initialize the same format.
+On first authoritative `show`, normal `scan` or mutation without a format marker, the writer validates every committed legacy snapshot once, including checksums, versions, typed fields, ids and receipt invariants. It preserves a torn suffix, stages latest states and one initial projection per job, syncs them, and publishes the index last. Interrupted pre-marker migration accepts only artifacts matching the exact validated legacy latest states; conflicts or orphaned v2 files without a legacy source fail closed. Empty roots initialize the same format.
 
-After cutover, `jobs.jsonl` and `jobs.cursors.json` remain untouched historical
-backups: no dual writes, automatic deletion or movement. Stop old workers and
-watchers before replacing binaries; an old binary is not a supported v2 writer.
-Back up the index, current states, change log and pending/temporary files together
-with writers stopped or under the same lock. Rollback means restoring a consistent
-pre-migration backup with every process stopped, not running an old writer against
-v2 files.
+After cutover, `jobs.jsonl` and `jobs.cursors.json` remain untouched historical backups: no dual writes, automatic deletion or movement. Stop old workers and watchers before replacing binaries; an old binary is not a supported v2 writer. Back up the index, current states, change log and pending/temporary files together with writers stopped or under the same lock. Rollback means restoring a consistent pre-migration backup with every process stopped, not running an old writer against v2 files.
 
-If validation refuses a stable file or migration conflict, inspect the command
-error and scan service journal; do not remove the marker or adopt orphan files.
-Restore a consistent backup with all processes stopped rather than bypassing
-checksums or receipt checks. Keep copied inputs and execution evidence when
-backing up the job folders, as well as the other state ledgers.
+If validation refuses a stable file or migration conflict, inspect the command error and scan service journal; do not remove the marker or adopt orphan files. Restore a consistent backup with all processes stopped rather than bypassing checksums or receipt checks. Keep copied inputs and execution evidence when backing up the job folders, as well as the other state ledgers.
 
 `needs` remains unlocked and read-only: it follows committed version-2 projection bytes, whose format is unchanged, and loads validated, revision-matched current snapshots for rendered jobs, required gate predecessors and new finished candidates classified by the [wake policy](#what-needs-the-owner). Classified snapshots are cached by generation, job id and revision. It rechecks the event boundary, generation and every rendered or classified snapshot before returning. A selected newer snapshot without its committed event defers the result only when a matching pending marker exists, preserving the incoming cursor; a non-wait call explains how to recover with `show` or normal `scan`, while a wait keeps polling. A watcher never repairs a crashed writer. Until the next normal locked read/scan recovers it, an unpublished transition need not be visible. A stable snapshot/event mismatch without a matching pending marker is corruption.
 
@@ -444,9 +330,7 @@ Each job has `state/jobs/<id>/`, a separate workspace, copied inputs, a `WORKFLO
 
 #### Review-only jobs
 
-Replace `outputs`, `check_command`, `checklist`, and `progress` with one `review_target` to
-review something that already exists. There is no work stage and no check; the job starts at
-the review step, in the target directory itself.
+Replace `outputs`, `check_command`, `checklist`, and `progress` with one `review_target` to review something that already exists. There is no work stage and no check; the job starts at the review step, in the target directory itself.
 
 ```json
 {
@@ -462,9 +346,7 @@ the review step, in the target directory itself.
 }
 ```
 
-`review_target` is exactly one of `{"files": ["relative/path"]}` (files under `target`) or
-`{"commit": "<revision>"}` (resolved to a full SHA when the job is submitted). `inputs`,
-`predecessors`, `expected_wait_seconds`, `approval_required`, and `max_reviews` work as for other jobs.
+`review_target` is exactly one of `{"files": ["relative/path"]}` (files under `target`) or `{"commit": "<revision>"}` (resolved to a full SHA when the job is submitted). `inputs`, `predecessors`, `expected_wait_seconds`, `approval_required`, and `max_reviews` work as for other jobs.
 
 The verdict is the result. A parsed `PASS` or `FAIL` is recorded and delivered; a `FAIL` does not start a fix, because there is nothing to fix. An answer with no acceptable verdict line, or a target that changed during the review, uses its review attempt and reviews again, up to `max_reviews` attempts in all; after that the job stops for user judgment (`review_exhausted`). The review record and job state are in `show <id>`.
 
@@ -521,28 +403,11 @@ The original `@receipt` relationship is durable. At successor workspace creation
 
 ### Timer entry point
 
-Install the scan timer with the units that `init` stages; see
-[Installation](#installation). The timer is the fallback and keeps its five-minute
-schedule. A scan also runs two seconds after a step ends and after `submit`,
-`approve` and `resume`, through `systemd-run --user --on-active=2s`; a failed
-wake only prints a warning. A failed step does not wake, so the timer spaces
-its retries.
+Install the scan timer with the units that `init` stages; see [Installation](#installation). The timer is the fallback and keeps its five-minute schedule. A scan also runs two seconds after a step ends and after `submit`, `approve` and `resume`, through `systemd-run --user --on-active=2s`; a failed wake only prints a warning. A failed step does not wake, so the timer spaces its retries.
 
-`taskwatch --root <root> init --unit-dir <empty-unit-staging-directory>` writes
-`agent-taskwatch-scan.service` and `.timer` without installing, reloading, or
-enabling them. Existing files are refused. The service calls the standalone
-`scan` with the current interpreter and explicit root. Inspect the staged files
-and replace the existing service only as part of an approved installation.
-Run `systemctl --user daemon-reload` after installing it. Confirm the timer is
-enabled and active, and confirm linger with `loginctl show-user <user> -p Linger`
-if jobs must survive logout. Run these installation steps only on the intended
-host with approval.
+`taskwatch --root <root> init --unit-dir <empty-unit-staging-directory>` writes `agent-taskwatch-scan.service` and `.timer` without installing, reloading, or enabling them. Existing files are refused. The service calls the standalone `scan` with the current interpreter and explicit root. Inspect the staged files and replace the existing service only as part of an approved installation. Run `systemctl --user daemon-reload` after installing it. Confirm the timer is enabled and active, and confirm linger with `loginctl show-user <user> -p Linger` if jobs must survive logout. Run these installation steps only on the intended host with approval.
 
-`scan` is a short scheduler, not a resident dispatcher. It reserves the job
-attempt durably before invoking `systemd-run --user`. The deterministic
-`taskwatch-<id>-a<attempt>.service` name allows a later scan to find a start
-whose acknowledgement was lost. `taskwatch run <id> --attempt <n>` is an
-internal step command; do not run it alongside the service.
+`scan` is a short scheduler, not a resident dispatcher. It reserves the job attempt durably before invoking `systemd-run --user`. The deterministic `taskwatch-<id>-a<attempt>.service` name allows a later scan to find a start whose acknowledgement was lost. `taskwatch run <id> --attempt <n>` is an internal step command; do not run it alongside the service.
 
 ### Installation
 
@@ -566,15 +431,9 @@ The distribution is `agent-taskwatch` and the units are `agent-taskwatch-scan.se
 
 ### Delivery
 
-The `init` draft sets `deliver_command` to `["false", "{message}"]`, which
-intentionally cannot send. An attempt with this draft stops for user judgment,
-so replace it before enabling the timer.
+The `init` draft sets `deliver_command` to `["false", "{message}"]`, which intentionally cannot send. An attempt with this draft stops for user judgment, so replace it before enabling the timer.
 
-`jobs-config.json` requires `deliver_command`: a list of nonempty strings run as
-argv without a shell. Exactly one argument must be the whole string `{message}`;
-it is replaced with the absolute path of the generated message file. The
-destination is a literal argument written in this command, not the job's
-`target` (a workspace path). Example, with a synthetic destination:
+`jobs-config.json` requires `deliver_command`: a list of nonempty strings run as argv without a shell. Exactly one argument must be the whole string `{message}`; it is replaced with the absolute path of the generated message file. The destination is a literal argument written in this command, not the job's `target` (a workspace path). Example, with a synthetic destination:
 
 ```json
 "deliver_command": ["hermes", "send", "--to", "discord:#synthetic-channel", "--file", "{message}", "--json"]
@@ -582,53 +441,18 @@ destination is a literal argument written in this command, not the job's
 
 Choose a configured Hermes target with `hermes send --list`.
 
-Hermes is optional. Without it, provide a sender executable for your channel and
-configure its argv instead, for example
-`["notify-command", "--to", "person.invalid", "--file", "{message}"]`.
-The sender must wait for the channel server's response and implement this contract:
-stdout must contain exactly one JSON object, with no diagnostic text around it.
-Write diagnostics to stderr. Both streams and the exit code are recorded.
-For example, exit 0 with `{"success": true, "message_id": "synthetic-message"}`
-confirms sending. Every other outcome is unknown, including a nonzero exit with
-a readable JSON `error`: a timeout or partial send may already have delivered content.
+Hermes is optional. Without it, provide a sender executable for your channel and configure its argv instead, for example `["notify-command", "--to", "person.invalid", "--file", "{message}"]`. The sender must wait for the channel server's response and implement this contract: stdout must contain exactly one JSON object, with no diagnostic text around it. Write diagnostics to stderr. Both streams and the exit code are recorded. For example, exit 0 with `{"success": true, "message_id": "synthetic-message"}` confirms sending. Every other outcome is unknown, including a nonzero exit with a readable JSON `error`: a timeout or partial send may already have delivered content.
 
-For a job at `deliver_pending`, `scan` runs this step under the state lock after
-the old unit has been released. It writes `delivery.txt` and `delivery-review.txt` in the
-job folder, records the attempt as `started` with the message file and the SHA-256 of
-`delivery.txt`, then runs the command with a fixed 60 second timeout. `delivery.txt` is
-the card and nothing else: the conclusion from the worker's `## Card`, a blank line, then only the
-lists that have content under their [`language`](#language) headings: the worker's bullets
-(`Changed`), one bullet per P2 or P3 finding of the last review that has a `summary`, worst first (`Small
-problems left`), and the items of the reviewer's `not_checked`, split on `; ` (`Not checked`).
-A list shows at most 6 bullets of at most 160 characters; a seventh shows as `+N`. The message has
-no paths and no pick block, so it stays under Telegram's 4096 characters.
-The full decision brief is composed on read by [`brief`](commands.md#brief), which lists its contents and exit codes.
+For a job at `deliver_pending`, `scan` runs this step under the state lock after the old unit has been released. It writes `delivery.txt` and `delivery-review.txt` in the job folder, records the attempt as `started` with the message file and the SHA-256 of `delivery.txt`, then runs the command with a fixed 60 second timeout. `delivery.txt` is the card and nothing else: the conclusion from the worker's `## Card`, a blank line, then only the lists that have content under their [`language`](#language) headings: the worker's bullets (`Changed`), one bullet per P2 or P3 finding of the last review that has a `summary`, worst first (`Small problems left`), and the items of the reviewer's `not_checked`, split on `; ` (`Not checked`). A list shows at most 6 bullets of at most 160 characters; a seventh shows as `+N`. The message has no paths and no pick block, so it stays under Telegram's 4096 characters. The full decision brief is composed on read by [`brief`](commands.md#brief), which lists its contents and exit codes.
 
 Before sending, the result fingerprint, declared output content digest including Git-ignored files, review basis and checked text evidence must match the accepted PASS, using the same acceptance policy as landing. Changed, missing, or unreadable evidence normally returns to `check`, spending the existing recovery budget; exhaustion stops at `user_wait/result_unstable`. After publication, stale evidence parks as `land_review_stale`; after a recorded merge it retains S and never requeues into another publication, merge or install.
 
-After scheduling work and result deliveries, each scan sends one short stop
-notice for every new `user_wait` or `approval_wait` entry through the same
-`deliver_command`, timeout, and success contract. `notice-<index>.txt` names the
-job, first prompt line, stage, wait reason, error, and resume/approve/cancel
-commands. Attempts are reserved in `notices` under the state lock before sending.
-The sender runs without that lock; only its notice result is merged into the latest
-snapshot, so unrelated jobs can finish while it waits. No outcome causes an automatic
-retry or changes the stage. Interrupted attempts become unknown.
-`delivery_unknown` receives a separate notice, never a result resend.
+After scheduling work and result deliveries, each scan sends one short stop notice for every new `user_wait` or `approval_wait` entry through the same `deliver_command`, timeout, and success contract. `notice-<index>.txt` names the job, first prompt line, stage, wait reason, error, and resume/approve/cancel commands. Attempts are reserved in `notices` under the state lock before sending. The sender runs without that lock; only its notice result is merged into the latest snapshot, so unrelated jobs can finish while it waits. No outcome causes an automatic retry or changes the stage. Interrupted attempts become unknown. `delivery_unknown` receives a separate notice, never a result resend.
 
-For result delivery, success needs exit code 0, a JSON object with a truthy
-`success`, no `error`, and a present `message_id`. Then the job becomes `done` and is never sent again.
-Success means the command reported acceptance; it is not a read receipt. A
-response with only `skipped` is unknown, not done.
+For result delivery, success needs exit code 0, a JSON object with a truthy `success`, no `error`, and a present `message_id`. Then the job becomes `done` and is never sent again. Success means the command reported acceptance; it is not a read receipt. A response with only `skipped` is unknown, not done.
 
-- Every non-confirmed outcome (including a readable `error`, timeout, unreadable
-  output, signal, ambiguous response, or an earlier attempt still `started`)
-  moves the job to `user_wait` with reason `delivery_unknown`. It is never resent
-  automatically. Hermes provides neither lookup nor an idempotency key.
-- `resume <id>` restores `deliver_pending` for one new send and keeps the attempt
-  history; an interrupted `started` attempt is recorded as unknown. Resume only
-  when a duplicate message is explicitly accepted, because the earlier message
-  may have been delivered. `cancel` prevents further sends.
+- Every non-confirmed outcome (including a readable `error`, timeout, unreadable output, signal, ambiguous response, or an earlier attempt still `started`) moves the job to `user_wait` with reason `delivery_unknown`. It is never resent automatically. Hermes provides neither lookup nor an idempotency key.
+- `resume <id>` restores `deliver_pending` for one new send and keeps the attempt history; an interrupted `started` attempt is recorded as unknown. Resume only when a duplicate message is explicitly accepted, because the earlier message may have been delivered. `cancel` prevents further sends.
 
 ### Checking a result before it ends
 
@@ -689,11 +513,7 @@ The job retains its parallel slot through work, checks, review, fixes and landin
 
 Dead or reboot-interrupted runs resume only after the old service is known to have stopped. An unknown service outcome requires user judgment. Unchanged progress and output content first produces a stall suspicion; an unchanged scan at least 300 seconds later stops the service and recovers. Log growth alone is not progress. Expected waits delay stall recovery.
 
-When a run is found dead and the filesystem of the job folder or of `TMPDIR` (the configured
-`env` value, else the system temporary folder) has less than 256 MiB free, the scan does not
-relaunch. It parks the job as `user_wait` with `wait_reason: disk_full` and
-`error: disk_full: <path> has <n> bytes free, the floor is <bytes>`, and uses no recovery. Free
-space, then `resume` the job.
+When a run is found dead and the filesystem of the job folder or of `TMPDIR` (the configured `env` value, else the system temporary folder) has less than 256 MiB free, the scan does not relaunch. It parks the job as `user_wait` with `wait_reason: disk_full` and `error: disk_full: <path> has <n> bytes free, the floor is <bytes>`, and uses no recovery. Free space, then `resume` the job.
 
 Three consecutive failed recoveries stop for user judgment. A passing check resets that recovery budget and nothing else. A work, fix or check failure uses only this budget and never a review.
 
@@ -716,11 +536,7 @@ taskwatch --root <root> cancel <id> --reason "User cancelled"
 
 Wait and cancel fence late output immediately. The scanner confirms service termination before reusing the slot, target or landing repository reservation. Approval resumes the saved step; an explicit user resume outside landing opens a new review cycle and a new recovery budget. Resuming a landing stop preserves the accepted review and its review budget; a distinct resume entry authorizes only the specific persisted create, CI observation or install retry described in [Automatic landing](#automatic-landing), not new content or another review cycle. Commands do not send messages themselves; scans send results and stop notices. Landing reconciles only its persisted exact external identities; arbitrary worker actions and unknown result deliveries are not reconciled.
 
-`approve --reason` appends `Gate <date>: <reason>` to the approval source; the
-original approval stays and the worker and reviewer see both. `approve --scope`
-records a replacement approved scope. Omit it to preserve the original scope,
-such as an initial approval wait. Do not use a broader scope than the user
-actually approved.
+`approve --reason` appends `Gate <date>: <reason>` to the approval source; the original approval stays and the worker and reviewer see both. `approve --scope` records a replacement approved scope. Omit it to preserve the original scope, such as an initial approval wait. Do not use a broader scope than the user actually approved.
 
 After checks and review pass, an eligible job with `land: true` enters `land`; all others enter `deliver_pending`. Successful verified landing and install, or no configured hook, then reaches `deliver_pending`, not `done`; see [Delivery](#delivery).
 
