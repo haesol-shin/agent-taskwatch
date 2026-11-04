@@ -5,7 +5,7 @@ A research job saves what it read and writes its claims in files this check can 
 in the result as `[C1]`. Plain code, standard library, no network, no model. It cannot tell that
 the saved text is what a URL served, that a quote supports its claim, or that the sources cover
 the question; the reviewer judges support (S-3, S-6) for the pairs this check found present.
-The format is in docs/kinds/research.md.
+The format is in docs/jobs/research.md.
 """
 
 import hashlib

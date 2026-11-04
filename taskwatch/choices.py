@@ -1,6 +1,6 @@
 """`choices.json` of a design job: the picks the owner answers, and the check on its shape.
 
-The schema and the four tests that make a choice a pick are in docs/kinds/design.md. The check
+The schema and the four tests that make a choice a pick are in docs/jobs/design.md. The check
 here is plain code. It cannot tell whether a choice that is listed as decided should have been
 a pick; the reviewer's `choices` key and rule D-9 judge that.
 """
@@ -12,9 +12,9 @@ import shlex
 from collections.abc import Mapping
 from pathlib import Path
 
+from .job_types import CHOICES_FILE as FILE
+from .job_types import builds_design
 from .jobs import Jobs, JobState
-from .kinds import CHOICES_FILE as FILE
-from .kinds import builds_design
 from .pointers import pointer_problem, pointers
 from .review_docs import docs_dir
 from .review_print import MAX_ERRORS, validate
@@ -244,9 +244,9 @@ def defaults_lines(root: Path, job: JobState) -> list[str]:
 
 
 def _defaults_schema() -> Mapping:
-    source = docs_dir("kinds")
+    source = docs_dir("jobs")
     if source is None:
-        raise ValueError("kinds documents were not found")
+        raise ValueError("job type documents were not found")
     return json.loads((source / DEFAULTS_SCHEMA).read_text(encoding="utf-8"))
 
 

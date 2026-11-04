@@ -11,7 +11,7 @@ Use `taskwatch` for approved background jobs (`review`: `source`, `design`, or `
 ## 1. Split and prepare
 
 - Split a multi-unit or multi-job request and write the `## Units` table by [`docs/review/design.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/review/design.md#splitting-a-plan) and [`docs/spec-template.md`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/spec-template.md); each independently reviewable and mergeable pull request is a separate job.
-- Check `<root>/taskwatch/defaults.json` for standing owner choices ([`docs/configuration.md#owner-defaults`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#owner-defaults) and [`docs/kinds/design.md#choicesjson`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/kinds/design.md#choicesjson)).
+- Check `<root>/taskwatch/defaults.json` for standing owner choices ([`docs/configuration.md#owner-defaults`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#owner-defaults) and [`docs/jobs/design.md#choicesjson`](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/jobs/design.md#choicesjson)).
 
 ## 2. Submit
 
@@ -25,7 +25,7 @@ Follow [`docs/configuration.md#chains-and-gates`](https://github.com/haesol-shin
 
 ## 3. Arm `needs --wait`
 
-Follow the canonical [wake policy and exit codes](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#what-needs-the-owner), including the optional `--include-done` mode, rather than maintaining a separate completion policy here. Start exactly one background waiter for the room with `terminal(background=true, notify_on_complete=true)`:
+Follow the canonical [exit codes](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/commands.md#needs) and [wake policy](https://github.com/haesol-shin/agent-taskwatch/blob/main/docs/configuration.md#what-needs-the-owner), including the optional `--include-done` mode, rather than maintaining a separate completion policy here. Start exactly one background waiter for the room with `terminal(background=true, notify_on_complete=true)`:
 
 ```sh
 taskwatch --root <root> needs --wait --from <cursor>

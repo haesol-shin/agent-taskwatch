@@ -1,4 +1,4 @@
-## Kind: implement (review `code`)
+## Job type: implement (review `code`)
 
 An implement job builds the change in its own work folder and branch.
 

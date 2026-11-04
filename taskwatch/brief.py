@@ -1,6 +1,6 @@
 """The worker's part of a job's decision brief: `brief.md` in the job folder.
 
-The contract is in docs/kinds/brief.md. `problems` checks only what code can check: the six
+The contract is in docs/jobs/brief.md. `problems` checks only what code can check: the six
 headings, the size limits, and that every `file:line` pointer names a file that has the line.
 Whether the brief is complete and honest is the reviewer's rule C-19.
 
@@ -18,8 +18,8 @@ from pathlib import Path
 from . import choices
 from .fingerprint import git_fingerprint, resolve_commit
 from .job_env import job_environment
+from .job_types import job_type_label
 from .jobs import JobConfig, Jobs, JobState
-from .kinds import kind_label
 from .pointers import POINTER, pointer_problem, pointers
 
 SECTIONS = (
@@ -247,7 +247,7 @@ def card(jobs: Jobs, config: JobConfig, job: JobState) -> list[str]:
     )
     # A job without a worker brief (a review-only job) has no conclusion: the verdict stands in.
     verdict = review.get("verdict") or "none"
-    lines = conclusion or [f"{kind_label(job)} job {job.id}: verdict {verdict}."]
+    lines = conclusion or [f"{job_type_label(job)} job {job.id}: verdict {verdict}."]
     for label, bullets in zip(labels, lists):
         if bullets:
             lines += ["", label, *_bounded(bullets)]
@@ -340,7 +340,7 @@ def _facts(jobs: Jobs, config: JobConfig, job: JobState, review: Mapping) -> lis
     verdict = review.get("verdict") or "none yet"
     rounds = f"review round {len(job.reviews)}" if job.reviews else "no review"
     return [
-        f"Job {job.id} ({kind_label(job)}): {goal}",
+        f"Job {job.id} ({job_type_label(job)}): {goal}",
         f"Verdict: {verdict}; {rounds}; {check}; {_elapsed(job)}",
         _result(job),
         _changed(job, config),

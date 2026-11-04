@@ -16,7 +16,7 @@ from types import MappingProxyType
 from .job_env import validate_env
 from .job_legacy import upgrade
 from .job_store import Store, read_snapshot
-from .kinds import CHOICES_FILE, builds_design, declares_choices
+from .job_types import CHOICES_FILE, builds_design, declares_choices
 from .state import RecordError, State, _create_new, _make_dirs
 
 STAGES = frozenset(
@@ -508,7 +508,7 @@ def _submission(payload: dict) -> dict:
     if not review_only and builds_design(data["review"]) and not declares_choices(data["outputs"]):
         raise ValueError(
             f"design outputs must declare required root {CHOICES_FILE} for independent "
-            "review; see docs/kinds/design.md"
+            "review; see docs/jobs/design.md"
         )
     return data
 

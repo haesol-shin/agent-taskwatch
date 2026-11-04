@@ -16,7 +16,7 @@ SOURCE_OUTPUT = "claims.json"
 
 def profile_names(review: str, outputs: tuple[str, ...] = ()) -> tuple[str, ...]:
     """The documents a review reads. A job whose outputs include the claims file also answers to
-    the source rules, whatever its own review kind (a design with research included)."""
+    the source rules, whatever its own review profile (a design with research included)."""
     names = (*COMMON, PROFILES[review])
     if SOURCE_OUTPUT in outputs and PROFILES["source"] not in names:
         names = (*names, PROFILES["source"])

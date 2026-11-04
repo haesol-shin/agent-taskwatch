@@ -205,7 +205,7 @@ Optionally add `"env"`, an object of string keys and string values, to set the e
 
 ### Owner defaults
 
-Optional `<root>/taskwatch/defaults.json` holds standing owner answers for design jobs (`{"version": 1, "defaults": [{"id", "value", "scope": "global" | "<target path>", "source": "<owner words>"}]}`), validated against [`docs/kinds/defaults.schema.json`](kinds/defaults.schema.json). Every design job's work and review messages name the file and its short SHA-256 hash (`Owner defaults: <root>/taskwatch/defaults.json (sha256 <12 hex> | absent)`); see [`docs/kinds/design.md`](kinds/design.md#choicesjson) for the scope precedence and `choices.json` check rules.
+Optional `<root>/taskwatch/defaults.json` holds standing owner answers for design jobs (`{"version": 1, "defaults": [{"id", "value", "scope": "global" | "<target path>", "source": "<owner words>"}]}`), validated against [`docs/jobs/defaults.schema.json`](jobs/defaults.schema.json). Every design job's work and review messages name the file and its short SHA-256 hash (`Owner defaults: <root>/taskwatch/defaults.json (sha256 <12 hex> | absent)`); see [`docs/jobs/design.md`](jobs/design.md#choicesjson) for the scope precedence and `choices.json` check rules.
 
 ### Code job work folders
 
@@ -236,7 +236,7 @@ A job keeps its checklist, progress and brief files in its job folder (`state/jo
 the logs and reviews, not in the workspace. The worker prompt and `WORKFLOW.md` give their
 absolute paths. The records are therefore never part of a result, and the clean-tree check of a
 `code` job needs no exception. `WORKFLOW.md` also carries the brief contract and the rules of the
-job's kind from `docs/kinds/`. A job submitted earlier whose paths name `.taskwatch/...` still
+job's type from `docs/jobs/`. A job submitted earlier whose paths name `.taskwatch/...` still
 loads; those paths now resolve inside the job folder as well.
 
 ### Submit an approved job
@@ -274,7 +274,7 @@ reads the Git diff.
 A job with `review` `code` or `design` and a work contract needs a spec that follows
 [docs/spec-template.md](spec-template.md): each of its thirteen `## ` headings is present and
 answered, or says `n/a: <reason>`. Submit refuses a missing or empty heading by name, and a
-bare `n/a`. A `source` job and a review-only job skip this check. For these two kinds the
+bare `n/a`. A `source` job and a review-only job skip this check. For these two job types the
 reviewer's verdict line also carries a `design_check` of eight answers (`root_cause`,
 `alternatives`, `one_home`, `overlaps`, `needed_now`, `repeated_judgment`, `portability`,
 `choices`), each `ok`, `finding` or `na` with its evidence; the runner checks only its shape.
@@ -311,7 +311,7 @@ still requires the existing wait-before-action approval procedure.
 `max_reviews` is the review limit of this job. When it is absent the job takes the host setting; see [Review limit](#review-limit).
 
 A job with `predecessors` gets one block per predecessor in the work and review
-messages: its id, kind label (`research` for `review: source`, `design`,
+messages: its id, job type label (`research` for `review: source`, `design`,
 `implement` for `review: code`, `review` for a `review_target`), stage, result
 location (the output files in its workspace, or for a code job the branch
 `<branch_prefix><first 8 of the id>` in its target), result fingerprint and the
@@ -602,13 +602,7 @@ lists that have content under their [`language`](#language) headings: the worker
 problems left`), and the items of the reviewer's `not_checked`, split on `; ` (`Not checked`).
 A list shows at most 6 bullets of at most 160 characters; a seventh shows as `+N`. The message has
 no paths and no pick block, so it stays under Telegram's 4096 characters.
-`taskwatch --root <root> brief <job>` composes the full brief on read: the facts, the worker's
-sections, the picks with their reply line, what the reviewer checked and did not check, and at
-the end the command for the brief, the review body file (once delivery wrote it), the `Public
-text` folder and `Text fingerprint` of each unit, and the path of the worker's `brief.md`. It is
-read only and exits `2` for an unknown job. The facts are written by the runner from the job
-record: kind, verdict, review rounds, check result, result location, changed files, open finding
-counts and time. Why, what changed, decisions and pointers come from the worker's `brief.md`.
+The full decision brief is composed on read by [`brief`](commands.md#brief), which lists its contents and exit codes.
 
 Before sending, the result fingerprint, declared output content digest including Git-ignored files, review basis and checked text evidence must match the accepted PASS, using the same acceptance policy as landing. Changed, missing, or unreadable evidence normally returns to `check`, spending the existing recovery budget; exhaustion stops at `user_wait/result_unstable`. After publication, stale evidence parks as `land_review_stale`; after a recorded merge it retains S and never requeues into another publication, merge or install.
 
@@ -638,22 +632,22 @@ response with only `skipped` is unknown, not done.
 
 ### Checking a result before it ends
 
-`taskwatch --root <root> check <job-id> [--run-command]` prints, one `- ` line each, what the check step would reject about the shape of the job's result now: required files, progress and checklist, the brief, the public text files and commit messages, the finding records, and uncommitted changes. It calls the same functions as the check step, so there is no second rule. Exit codes: `0` no problem (it prints `no problems`), `1` problems printed, `2` unknown job, a review-only job, or a job that has no workspace yet. It reads the result and the records only. `--run-command` also runs the job's `check_command`, with its output in `logs/precheck.log`; without it the test command is not run, because the check step runs it anyway. `WORKFLOW.md` names the command in its End section as the last step before the agent finishes.
+[`check`](commands.md#check) shows what the check step would reject about a result before the job ends; its output, options and exit codes are in the command reference. `WORKFLOW.md` names the command in its End section as the last step before the agent finishes.
 
 `WORKFLOW.md` tells the worker to run only the tests that cover the files it changed while working, and `check <job> --run-command` once just before it ends.
 
 ### Chains and gates
 
-A kind is a label derived from `review` and `review_target`; it names the contract in `docs/kinds/` that `WORKFLOW.md` carries.
+A job type is a label derived from `review` and `review_target`; it names the contract in [docs/jobs](jobs/brief.md) that `WORKFLOW.md` carries. There is no job type field in a record or a submission.
 
-| Kind | Fields | Result | Checked by code |
+| Job type | Fields | Result | Checked by code |
 |---|---|---|---|
 | research | `review: source` | `result.md`, `claims.json`, `sources/` | source check (when `outputs` has `claims.json`), checklist, brief |
 | design | `review: design` | `design.md`, `choices.json` | `choices.json`, `check_command`, checklist, brief |
 | implement | `review: code` | committed branch | the repository's tests as `check_command`, clean commit, brief |
 | review | `review_target` set | the review record | none (no work stage) |
 
-Publishing is a gate, not a kind. The common chain is research, a gate, design, a gate, implement; a small change can skip the first two, and a design job with `claims.json` in `outputs` includes its own research.
+Publishing is a gate, not a job type. The common chain is research, a gate, design, a gate, implement; a small change can skip the first two, and a design job with `claims.json` in `outputs` includes its own research.
 
 The submit rule for a caller that sends ordered units under one approval:
 
@@ -665,11 +659,11 @@ The submit rule for a caller that sends ordered units under one approval:
 
 ### What needs the owner
 
-`taskwatch --root <root> needs` lists what waits for the owner and prints an opaque integer `cursor`. Pass it unchanged to `--from`; do not calculate it from file size. It is read only: no lock, nothing written, derived on every call. See [Job records](#job-records) for generation and cutover replay semantics.
+`taskwatch --root <root> needs` lists what waits for the owner and prints an opaque integer `cursor`. Pass it unchanged to `--from`; do not calculate it from file size. It is read only: no lock, nothing written, derived on every call. See [Job records](#job-records) for generation and cutover replay semantics, and [commands](commands.md#needs) for usage.
 
 Sections: `GATE` (a job in `approval_wait`: with `predecessors` it names them and their briefs and counts the decisions in their `brief.md`, or the picks of a design predecessor with the reply template `ok | <id>=<key> | text`; otherwise it shows the reason), `NEEDS YOU` (a job in `user_wait`: reason, review round, open findings, rules that repeated in earlier reviews), `BLOCKED` (a queued job behind a cancelled or `user_wait` predecessor) and, only with `--from`, `FINISHED SINCE THE CURSOR` (a job that is `done` now and was not at the cursor, with its verdict, decision count and open findings). At most 20 jobs are shown. A non-wait call keeps listing finished jobs regardless of the wake policy.
 
-`needs --wait --from <cursor> [--include-done] [--timeout <seconds>] [--interval <seconds>]` waits for a new `GATE`, `NEEDS YOU` or `BLOCKED` item, or a newly finished job that needs attention. An item is `(job, stage, reason, entry)`, where `entry` counts the job's `wait`, `approve` and `resume` events, so a job that is answered and then stops again for the same reason wakes the watcher, and a re-save of the same stop does not.
+`needs --wait --from <cursor>` waits for a new `GATE`, `NEEDS YOU` or `BLOCKED` item, or a newly finished job that needs attention; [commands](commands.md#needs) lists its options. An item is `(job, stage, reason, entry)`, where `entry` counts the job's `wait`, `approve` and `resume` events, so a job that is answered and then stops again for the same reason wakes the watcher, and a re-save of the same stop does not.
 
 A newly finished job stays quiet only when its latest review is a `PASS` accepted by `job_findings.accepted` with at least one of `ok` or `final` equal to `true`, that review has no findings, its brief passes `brief.problems` and has zero decisions, and, for a design job, `choices.json` is valid and has no picks. An absent or unknown verdict, an unaccepted or failed review, any remaining findings, owner decisions or design picks, and missing, unreadable or invalid review, brief or choices content wake conservatively. Job-store corruption is still an error, not a content problem converted into a wake.
 
@@ -677,7 +671,7 @@ For a result-building code job, brief file and line pointers are checked against
 
 `--include-done` makes every newly finished job a wake trigger and is valid only with `--wait`; `--wait` always requires `--from`. On a wake, the capped list prioritizes new triggering items, then current waiting items, then clean finished jobs, so a clean completion cannot displace the reason for waking. Clean finished jobs may appear alongside a trigger without triggering a wake themselves. If more than 20 items need attention, use `show` to inspect the omitted jobs before re-arming: the returned cursor covers the whole committed boundary, not only the displayed items. Wake filtering does not change [result delivery](#delivery): the configured delivery command still sends every card unchanged, including for quiet completions.
 
-Exit codes: `0` a list and cursor were printed; `3` the `--timeout` (default 82800 seconds) passed without a wake; `2` a usage error, including `--wait` without `--from` or `--include-done` without `--wait`; `1` another error, such as a corrupt snapshot used for rendering or classification. A timeout does not return or advance a cursor: re-arm with the original cursor. After exit `0`, handle the result and re-arm with its returned cursor. Keep only one watcher per room instead of one `watch` per job:
+Flags, exit codes and how to re-arm after each exit are in [commands](commands.md#needs). Keep only one watcher per room instead of one `watch` per job:
 
 ```python
 terminal(
@@ -687,7 +681,7 @@ terminal(
 )
 ```
 
-The list is a hint; re-read the state with `show` before acting. See [Job records](#job-records) for storage, recovery and cursor cutover. `taskwatch --root <root> show [<id>]` prints the job record (or list of records) with one derived key, `"activity"` (not persisted and not in `needs`): for a job in `work`, `fix`, `check`, `review` or `land`, `"<stage> <m>m; last progress <m>m ago: <last non-empty progress line>"` (from `started_at`, `last_progress_at` and the progress file in the job folder, collapsed to at most 120 characters, or without the trailing progress text when empty); for all other stages, `null`. Landing stops expose the concrete reason and retained PR, merge and install facts; inspect `land_state` with `show` before resuming or cancelling. An example skill for this loop is in [`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
+The list is a hint; re-read the state with `show` before acting ([commands](commands.md#show) describes the record and its derived `activity` key). See [Job records](#job-records) for storage, recovery and cursor cutover. Landing stops expose the concrete reason and retained PR, merge and install facts; inspect `land_state` with `show` before resuming or cancelling. An example skill for this loop is in [`examples/hermes/skills/taskwatch/SKILL.md`](../examples/hermes/skills/taskwatch/SKILL.md).
 
 ### Recovery and decisions
 

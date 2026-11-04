@@ -6,7 +6,7 @@ A check that cannot read its input is not a pass. An unreadable progress or outp
 
 ## Job checks
 
-The check service runs the approved `check_command` in the job workspace and records its exit code and complete combined output. It then verifies required outputs, progress, and checklist. The agent can run the same shape checks inside its session with [`taskwatch check <job>`](configuration.md#checking-a-result-before-it-ends), so a missing file or field is fixed before the session ends instead of costing a failed check.
+The check service runs the approved `check_command` in the job workspace and records its exit code and complete combined output. It then verifies required outputs, progress, and checklist. The agent can run the same shape checks inside its session with [`taskwatch check <job>`](commands.md#check), so a missing file or field is fixed before the session ends instead of costing a failed check.
 
 When the result fingerprint and the basis (intent, spec, guidelines) equal those of an earlier check of the same job whose command exited 0, the check does not run the command again. It records `reused_check`, the `seq` of the check that ran it, and the exit code and log of that run; every file, text and finding check still runs. Any change of the result, the intent, the spec or the guidelines runs the command. The command is assumed to depend only on the result: if it also depends on something outside it (network, clock), a reused run can be stale.
 
@@ -18,13 +18,13 @@ Work and review sessions must settle and report no pending asynchronous work thr
 
 Code results must be committed and clean. Other results use hashes of named output paths and file contents.
 
-Every job with a work stage writes `brief.md` in the job folder, next to the progress and checklist files. The check fails when a heading of the contract in [kinds/brief.md](kinds/brief.md) is missing or empty, the file is over 60 lines, a bullet has no `file:line` pointer, a pointer names a file or line that does not exist, or the `Card` has no conclusion line, more than two, more than 6 bullets (the job was too big), a bullet over 160 characters or a pointer. The reviewer compares the brief with the result (rule C-19).
+Every job with a work stage writes `brief.md` in the job folder, next to the progress and checklist files. The check fails when a heading of the contract in [jobs/brief.md](jobs/brief.md) is missing or empty, the file is over 60 lines, a bullet has no `file:line` pointer, a pointer names a file or line that does not exist, or the `Card` has no conclusion line, more than two, more than 6 bullets (the job was too big), a bullet over 160 characters or a pointer. The reviewer compares the brief with the result (rule C-19).
 
-A design job also writes `choices.json` in its workspace and lists it in `outputs`: at most 5 picks for the owner, each with at least 2 options, evidence and a recommended option; the choices it decided itself, each with a source; and the existing tools it searched for. The check validates the shape, that every local `file:line` evidence exists, that every decided id appears in the `Writer choices` section of an output, and that its brief marks every pick `awaiting owner`. An implement job after a design job fails its check unless its approval source has a `PICKS:` line that answers every pick and its brief lists every pick and decided id. The schema and the four tests that make a choice a pick are in [kinds/design.md](kinds/design.md); permission, deploy, publish, spending and scope are never picks.
+A design job also writes `choices.json` in its workspace and lists it in `outputs`: at most 5 picks for the owner, each with at least 2 options, evidence and a recommended option; the choices it decided itself, each with a source; and the existing tools it searched for. The check validates the shape, that every local `file:line` evidence exists, that every decided id appears in the `Writer choices` section of an output, and that its brief marks every pick `awaiting owner`. An implement job after a design job fails its check unless its approval source has a `PICKS:` line that answers every pick and its brief lists every pick and decided id. The schema and the four tests that make a choice a pick are in [jobs/design.md](jobs/design.md); permission, deploy, publish, spending and scope are never picks.
 
-New work-building design submissions must declare the root output before any inputs are copied; see [the design output contract](kinds/design.md). This early validation does not replace the end checks.
+New work-building design submissions must declare the root output before any inputs are copied; see [the design output contract](jobs/design.md). This early validation does not replace the end checks.
 
-A job whose `outputs` include `claims.json` also passes the source check: saved sources, the quotes of its claims and the citations in its result are compared by code, without a network or a model. It fails a missing or changed source file, a quote that is not in its source, a number of a claim that is not in its quote, a claim cited nowhere or a citation without a claim, and an `absence` claim with no search terms. Claims that rest only on search-result snippets are counted and shown in the brief. The check writes `source-table.md` for the reviewer, who judges support only for the pairs it found present (rule S-9). See [kinds/research.md](kinds/research.md).
+A job whose `outputs` include `claims.json` also passes the source check: saved sources, the quotes of its claims and the citations in its result are compared by code, without a network or a model. It fails a missing or changed source file, a quote that is not in its source, a number of a claim that is not in its quote, a claim cited nowhere or a citation without a claim, and an `absence` claim with no search terms. Claims that rest only on search-result snippets are counted and shown in the brief. The check writes `source-table.md` for the reviewer, who judges support only for the pairs it found present (rule S-9). See [jobs/research.md](jobs/research.md).
 
 ## Review records
 
@@ -52,11 +52,11 @@ The review reads a read-only snapshot containing the three texts and the step co
 
 A changed title, pull request body, squash body or step commit message invalidates an earlier PASS; when the code is unchanged, the next round receives the text diff as a text-only review.
 
-`taskwatch text <job> [--pr <id>] --out <dir>` validates the accepted snapshot digest and current text fingerprint, then copies the reviewed `title.txt`, `body.md` and `commit.txt` from that snapshot.
+[`taskwatch text`](commands.md#text) validates the accepted snapshot digest and current text fingerprint, then copies the reviewed `title.txt`, `body.md` and `commit.txt` from that snapshot.
 
 The copied pull request body gains one `Review evidence:` line; the squash body is copied without that line.
 
-The command exits 2 if the live text or accepted snapshot changed and 3 if no text review has passed.
+Its exit codes are in [commands](commands.md#text).
 
 Historical records without `text_contract: 2` remain readable using their original newline-normalized fingerprint and title/body snapshot; they are explicitly nonlandable because they prove neither a reviewed squash body nor complete-result landing coverage.
 

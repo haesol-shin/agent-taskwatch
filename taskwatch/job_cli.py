@@ -18,21 +18,38 @@ from .state import RecordError, _create_new, _make_dirs
 WAKE_COMMANDS = frozenset({"run", "submit", "approve", "resume"})
 
 
+_GROUPS = """commands by use:
+  first use           init, submit, show, brief
+  attention           needs, cancel, wait, approve, resume
+  result and text     check, text
+  operator            scan, run
+
+`taskwatch <command> --help` describes one command."""
+
+
+def _command(commands, name: str, text: str) -> argparse.ArgumentParser:
+    return commands.add_parser(name, help=text, description=text)
+
+
 def parser() -> argparse.ArgumentParser:
-    cli = argparse.ArgumentParser(prog="taskwatch")
-    cli.add_argument("--root", type=Path, default=None)
+    cli = argparse.ArgumentParser(
+        prog="taskwatch", epilog=_GROUPS, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    cli.add_argument(
+        "--root", type=Path, default=None, help="State root (default HERMES_HOME, then ~/.hermes)"
+    )
     commands = cli.add_subparsers(dest="command", required=True)
-    init = commands.add_parser("init", help="Write config and timer units without activating them")
-    init.add_argument("--unit-dir", type=Path)
-    submit = commands.add_parser("submit", help="Durably store an approved job JSON document")
-    submit.add_argument("file", type=Path)
-    commands.add_parser("scan", help="Schedule job steps once")
-    run = commands.add_parser("run", help="Run one reserved job step")
+    init = _command(commands, "init", "Write config and timer units without activating them")
+    init.add_argument("--unit-dir", type=Path, help="Empty folder to stage the scan units in")
+    submit = _command(commands, "submit", "Durably store an approved job JSON document")
+    submit.add_argument("file", type=Path, help="The job JSON document")
+    _command(commands, "scan", "Schedule job steps once (operator; the timer runs it)")
+    run = _command(commands, "run", "Run one reserved job step (operator; scan starts it)")
     run.add_argument("job")
-    run.add_argument("--attempt", type=int, required=True)
-    show = commands.add_parser("show")
+    run.add_argument("--attempt", type=int, required=True, help="The attempt scan reserved")
+    show = _command(commands, "show", "Print the record of a job, or of every job")
     show.add_argument("job", nargs="?")
-    needs = commands.add_parser("needs", help="List what needs the owner; read only, no lock")
+    needs = _command(commands, "needs", "List what needs the owner; read only, no lock")
     needs.add_argument(
         "--from", dest="cursor", type=_seconds(0), help="Cursor from an earlier list"
     )
@@ -42,25 +59,33 @@ def parser() -> argparse.ArgumentParser:
     )
     needs.add_argument("--timeout", type=_seconds(1), default=82800, help="Seconds (default 82800)")
     needs.add_argument("--interval", type=_seconds(5), default=30, help="Poll seconds (min 5)")
-    brief = commands.add_parser("brief", help="Print the decision brief of a job, composed on read")
+    brief = _command(commands, "brief", "Print the decision brief of a job, composed on read")
     brief.add_argument("job")
-    check = commands.add_parser(
-        "check", help="Print what the runner's shape checks reject now; read only for the result"
+    check = _command(
+        commands,
+        "check",
+        "Print what the runner's shape checks reject now; read only for the result",
     )
     check.add_argument("job")
     check.add_argument(
         "--run-command", action="store_true", help="Also run the job's check command"
     )
-    text = commands.add_parser("text", help="Write the reviewed publication texts")
+    text = _command(commands, "text", "Write the reviewed publication texts")
     text.add_argument("job")
     text.add_argument("--pr", help="Unit id; optional when the job has one unit")
     text.add_argument(
         "--out", type=Path, required=True, help="Folder for title.txt, body.md and commit.txt"
     )
-    for name in ("cancel", "wait", "approve", "resume"):
-        action = commands.add_parser(name)
+    actions = {
+        "cancel": "End a job",
+        "wait": "Park an unfinished job until the owner approves",
+        "approve": "Open a job that waits for approval",
+        "resume": "Restore a job that waits for user judgment",
+    }
+    for name, summary in actions.items():
+        action = _command(commands, name, summary)
         action.add_argument("job")
-        action.add_argument("--reason", required=True)
+        action.add_argument("--reason", required=True, help="Recorded with the decision")
         if name == "approve":
             action.add_argument("--scope", help="Replace the approved scope with this exact text")
     return cli

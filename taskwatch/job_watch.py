@@ -15,8 +15,8 @@ from .activity import land_facts
 from .brief import count_findings, decision_count
 from .job_cursor import decode, encode
 from .job_store import Store, projection, read_index, read_snapshot, validate_event
+from .job_types import job_type_label
 from .jobs import JobState, decode_job
-from .kinds import kind_label
 from .state import RecordError, state_dir
 
 
@@ -459,15 +459,15 @@ def _brief_text(root: Path, job_id: str) -> str:
 def _lines(root: Path, rows: dict[str, dict], item: _Item) -> list[str]:
     job = _state(rows[item.job_id])
     cmd = f"taskwatch --root {_line(root)}"
-    kind = kind_label(job)
+    job_type = job_type_label(job)
     if item.section == "BLOCKED":
         return [f"job {job.id} queued behind {item.blocker}"]
     review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
     if item.section == "GATE":
-        return _gate_lines(root, rows, job, kind, cmd)
+        return _gate_lines(root, rows, job, job_type, cmd)
     if item.section == "NEEDS YOU":
         return [
-            f"job {job.id} {kind} user_wait {_line(job.wait_reason)}  {_stuck(job)}",
+            f"job {job.id} {job_type} user_wait {_line(job.wait_reason)}  {_stuck(job)}",
             f"  goal: {_goal(job)}",
             *[f"  land: {fact}" for fact in land_facts(job)],
             *([f"  error: {_line(job.error)}"] if job.error and job.land_state else []),
@@ -477,7 +477,7 @@ def _lines(root: Path, rows: dict[str, dict], item: _Item) -> list[str]:
     decisions = decision_count(_brief_text(root, job.id))
     verdict = review.get("verdict") or "none"
     return [
-        f"job {job.id} {kind} done {verdict}; decisions: {decisions}; "
+        f"job {job.id} {job_type} done {verdict}; decisions: {decisions}; "
         f"open {_finding_count(review)}   brief: {cmd} brief {job.id}"
     ]
 
@@ -489,14 +489,19 @@ def _finding_count(review: Mapping) -> str:
         return "unknown"
 
 
-def _gate_lines(root: Path, rows: dict[str, dict], job: JobState, kind: str, cmd: str) -> list[str]:
+def _gate_lines(
+    root: Path, rows: dict[str, dict], job: JobState, job_type: str, cmd: str
+) -> list[str]:
     preds = [_state(rows[p]) for p in job.predecessors if p in rows]
     if preds:
-        after = ", ".join(f"{p.id} ({kind_label(p)}) {p.stage}" for p in preds)
-        lines = [f"job {job.id} {kind}  after job {after}", f"  goal: {_goal(job)}"]
+        after = ", ".join(f"{p.id} ({job_type_label(p)}) {p.stage}" for p in preds)
+        lines = [f"job {job.id} {job_type}  after job {after}", f"  goal: {_goal(job)}"]
         lines += [f"  brief: {cmd} brief {p.id}" for p in preds]
     else:
-        lines = [f"job {job.id} {kind}  gate: {_line(job.wait_reason)}", f"  goal: {_goal(job)}"]
+        lines = [
+            f"job {job.id} {job_type}  gate: {_line(job.wait_reason)}",
+            f"  goal: {_goal(job)}",
+        ]
     picks = sum(choices.pick_count(Path(p.workspace)) for p in preds if choices.is_design(p))
     if picks:
         decisions = f"{picks} picks   reply: ok | <id>=<key> | text"
