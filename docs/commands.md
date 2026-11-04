@@ -33,7 +33,7 @@ Read `show` before acting on a `needs` list: the list is a hint, the record is t
 
 ### brief
 
-`taskwatch --root <root> brief <job>` prints the decision brief of a job, composed on every call and read only. It holds the runner's facts (job type, verdict, review rounds, check result, result location, changed files, open finding counts and time), the worker's sections, the picks with their reply line, what the reviewer checked and did not check, and at the end the path of the worker's `brief.md`. The contract of that file is [docs/jobs/brief.md](jobs/brief.md).
+`taskwatch --root <root> brief <job>` prints the decision brief of a job, composed on every call and read only. It holds the runner's facts (job type, verdict, review rounds, check result, result location, changed files, open finding counts and time), the worker's sections, the picks with their reply line, what the reviewer checked and did not check, and at the end the command for the brief, the review body file (once delivery wrote it), the `Public text` folder and `Text fingerprint` of each unit, and the path of the worker's `brief.md`. The runner writes the facts from the job record; why, what changed, decisions and pointers come from the worker's `brief.md`, whose contract is [docs/jobs/brief.md](jobs/brief.md).
 
 Exit codes: `0` printed, `2` unknown job, `1` another error. A job that has not written `brief.md` yet still prints the runner's facts, with `(none)` for the worker's sections.
 

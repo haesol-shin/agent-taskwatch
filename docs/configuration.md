@@ -602,7 +602,7 @@ lists that have content under their [`language`](#language) headings: the worker
 problems left`), and the items of the reviewer's `not_checked`, split on `; ` (`Not checked`).
 A list shows at most 6 bullets of at most 160 characters; a seventh shows as `+N`. The message has
 no paths and no pick block, so it stays under Telegram's 4096 characters.
-`taskwatch --root <root> brief <job>` composes the full brief on read: the facts, the worker's sections, the picks with their reply line, what the reviewer checked and did not check, and at the end the command for the brief, the review body file (once delivery wrote it), the `Public text` folder and `Text fingerprint` of each unit, and the path of the worker's `brief.md`. It is read only; [commands](commands.md#brief) lists its exit codes. The facts are written by the runner from the job record: job type, verdict, review rounds, check result, result location, changed files, open finding counts and time. Why, what changed, decisions and pointers come from the worker's `brief.md`.
+The full decision brief is composed on read by [`brief`](commands.md#brief), which lists its contents and exit codes.
 
 Before sending, the result fingerprint, declared output content digest including Git-ignored files, review basis and checked text evidence must match the accepted PASS, using the same acceptance policy as landing. Changed, missing, or unreadable evidence normally returns to `check`, spending the existing recovery budget; exhaustion stops at `user_wait/result_unstable`. After publication, stale evidence parks as `land_review_stale`; after a recorded merge it retains S and never requeues into another publication, merge or install.
 
@@ -632,7 +632,7 @@ response with only `skipped` is unknown, not done.
 
 ### Checking a result before it ends
 
-`taskwatch --root <root> check <job-id> [--run-command]` prints what the check step would reject about the shape of the job's result now: required files, progress and checklist, the brief, the public text files and commit messages, the finding records, and uncommitted changes. It calls the same functions as the check step, so there is no second rule, and it reads the result and the records only. Options and exit codes are in [commands](commands.md#check). `WORKFLOW.md` names the command in its End section as the last step before the agent finishes.
+[`check`](commands.md#check) shows what the check step would reject about a result before the job ends; its output, options and exit codes are in the command reference. `WORKFLOW.md` names the command in its End section as the last step before the agent finishes.
 
 `WORKFLOW.md` tells the worker to run only the tests that cover the files it changed while working, and `check <job> --run-command` once just before it ends.
 
