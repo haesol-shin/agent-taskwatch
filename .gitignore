@@ -226,3 +226,7 @@ __marimo__/
 
 # Job output kept in the workspace, not part of the repository
 /ACCEPTANCE.md
+
+# Optional omp client: locked development dependencies and smoke scratch space
+examples/omp/taskwatch/node_modules/
+examples/omp/taskwatch/.smoke/
