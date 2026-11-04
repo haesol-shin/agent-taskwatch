@@ -66,7 +66,7 @@ A stage the command refuses is an error, exit `1`, and the record is unchanged. 
 
 `taskwatch --root <root> check <job> [--run-command]` prints, one `- ` line each, what the check step would reject about the shape of the job's result now: required files, progress and checklist, the brief, the public text files and commit messages, the finding records and uncommitted changes. It calls the same functions as the check step, so there is no second rule; [checks](checks.md) owns what is accepted. It reads the result and the records only.
 
-`--run-command` also runs the job's `check_command` and writes its output to `logs/precheck.log` in the job folder. Without it the test command is not run, because the check step runs it anyway.
+`--run-command` also runs the job's `check_command` and writes its output to `logs/precheck.log` in the job folder. A run that exits 0 on a committed result that the command left unchanged is recorded in `logs/precheck.json`, and the check step reuses it instead of running the command again; a result that changed afterwards runs the command again, see [job checks](checks.md#job-checks). Without the option the command is not run.
 
 Exit codes: `0` no problem (it prints `no problems`), `1` problems printed, `2` an unknown job, a review-only job, or a job that has no workspace yet.
 

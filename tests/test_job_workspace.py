@@ -569,3 +569,30 @@ def test_nonlanding_receipt_base_keeps_existing_branch_behavior(tmp_path, remote
     path = tmp_path / "successor-worktree"
     changes = job_workspace.create(successor, path, JobConfig(), ENV, jobs)
     assert changes["base"] == git(remote.target, "rev-parse", branch)
+
+
+def test_public_text_receipt_base_resolves_with_the_job_base(tmp_path, remote):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote)
+    unit = {"id": "result", "base": "@predecessor"}
+    successor = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="successor",
+        base="@predecessor",
+        predecessors=["predecessor"],
+        public_text=[unit],
+    )
+    assert successor.public_text[0]["base"] == "@predecessor"
+    prepared = job_workspace.prepare(successor, ENV, jobs)
+    landed = predecessor.land_state["S"]
+    assert prepared["base"] == landed
+    assert [u["base"] for u in prepared["public_text"]] == [landed]
+    assert prepared["public_text"][0]["id"] == "result"
+    # A unit pinned to a commit at submit has nothing to resolve.
+    pinned = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="pinned",
+        public_text=[{"id": "result", "base": "HEAD"}],
+    )
+    assert "public_text" not in job_workspace.prepare(pinned, ENV, jobs)

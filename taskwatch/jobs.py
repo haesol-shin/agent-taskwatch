@@ -330,7 +330,7 @@ class Jobs:
             host = _host_config(self.state.root)
             data.setdefault("max_reviews", host.max_reviews)
             _resolve_receipt_tokens(data, existing, host.branch_prefix)
-            _public_text_base(data)
+            _public_text_base(data, existing)
             data.update(id=uuid.uuid4().hex, last_progress_at=now)
             self._copy_inputs(data)
             job = JobState(**data)
@@ -592,6 +592,18 @@ def _ref(value: object, label: str) -> str:
     return value
 
 
+def _pin_public_text_base(data: dict, base: str) -> str:
+    try:
+        return _resolve_commit(Path(data["target"]), base, "public_text base")
+    except ValueError as exc:
+        if str(data.get("base", "")).startswith("@"):
+            raise ValueError(
+                f"{exc}; the job base is {data['base']}, so give public_text base the same"
+                " reference"
+            ) from exc
+        raise
+
+
 def _public_text_field(data: dict, review_only: bool) -> None:
     """Normalize and pin the sole complete-result publication unit."""
     units = data["public_text"]
@@ -612,9 +624,18 @@ def _public_text_field(data: dict, review_only: bool) -> None:
     if BLANK_SQUASH_BODY in unit and unit[BLANK_SQUASH_BODY] is not True:
         raise ValueError(f"public_text {BLANK_SQUASH_BODY} must be true when present")
     base = _ref(unit["base"], "public_text base")
+    if base.startswith("@"):
+        if data.get("base") != base:
+            raise ValueError(
+                f"public_text base {base} must equal the job base: give base the same reference"
+            )
+        # A receipt reference stays symbolic: workspace creation resolves it with the job base.
+        commit = base
+    else:
+        commit = _pin_public_text_base(data, base)
     pinned = {
         "id": unit["id"],
-        "base": _resolve_commit(Path(data["target"]), base, "public_text base"),
+        "base": commit,
         "head": _ref(unit.get("head", "HEAD"), "public_text head"),
     }
     if unit.get(BLANK_SQUASH_BODY):
@@ -623,10 +644,18 @@ def _public_text_field(data: dict, review_only: bool) -> None:
     data["public_text"] = [pinned]
 
 
-def _public_text_base(data: dict) -> None:
-    """Reject a known partial range without changing workspace base selection."""
+def _public_text_base(data: dict, existing: Mapping[str, JobState]) -> None:
+    """Reject a public text base that can never match the job base, without changing the
+    workspace base selection. A receipt reference is resolved with the job base later."""
     if not data.get("public_text") or not data.get("base"):
         return
+    if data["public_text"][0]["base"].startswith("@"):
+        return
+    if _awaits_predecessor(data, existing):
+        raise ValueError(
+            "public_text base cannot match the job base: the predecessor's result is not a "
+            "commit yet; give public_text base the same @<receipt key> as base"
+        )
     try:
         base = _resolve_commit(Path(data["target"]), data["base"], "base")
     except ValueError:
@@ -637,11 +666,23 @@ def _public_text_base(data: dict) -> None:
         raise ValueError("public_text base must equal the effective job base")
 
 
+def _awaits_predecessor(data: dict, existing: Mapping[str, JobState]) -> bool:
+    """The job base is a predecessor's branch whose tip is not final: a landed predecessor was
+    resolved to its commit, and a nonlanding one is final once its checks and review passed."""
+    if re.fullmatch(r"[0-9a-f]{40}", data["base"]):
+        return False
+    pred = existing.get(data.get("base_predecessor", ""))
+    return pred is not None and (pred.land or pred.stage not in {"deliver_pending", "done"})
+
+
 def _work_fields(data: dict) -> None:
     for key in ("outputs", "check_command"):
         _strings(data[key], key, nonempty=True)
+    root = Path(data["target"])
     for item in data["outputs"]:
         _relative(item, "output")
+        if (root / item).is_dir():
+            raise ValueError(f"output is a directory, name its files: {item}")
     for key in ("checklist", "progress"):
         _relative(data[key], key)
 

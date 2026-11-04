@@ -5,6 +5,8 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Fixed
+- The check step reuses the passing `check --run-command` run of the agent for the same result and basis instead of running the check command a second time, and records `reused_precheck` with its own copy of the log; a result changed after that run still runs the command ([checks](docs/checks.md#job-checks), [commands](docs/commands.md#check)).
+- Submit refuses an output that is an existing directory of the target, and a `public_text` base that cannot match a predecessor base. A `public_text` base now takes the same `@<receipt key>` as the job `base`; workspace creation resolves both to one commit ([public text](docs/configuration.md#public-text)).
 - `needs --wait --from <cursor>` stays quiet for accepted clean PASS completions and wakes conservatively for attention; `--include-done` restores every-completion wakes only with `--wait`, timeout preserves the original cursor, and capped output prioritizes wake triggers without changing non-wait listings or delivery cards ([wake policy](docs/configuration.md#what-needs-the-owner)).
 - Quiet completion checks validate code-result brief pointers against the accepted commit even after normal worktree cleanup, without accepting invalid file or line pointers from a newer target checkout.
 - Quiet completion checks resolve brief pointers through symlinks within the accepted commit, including after worktree cleanup, and still wake for escaping, missing or looping targets.

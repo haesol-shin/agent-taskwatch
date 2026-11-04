@@ -158,25 +158,22 @@ def test_submit_refuses_a_unit_base_that_omits_part_of_the_explicit_job_range(tm
 
 
 @pytest.mark.parametrize("branch_exists", [False, True])
-def test_public_text_preserves_predecessor_receipt_base_resolution(tmp_path, branch_exists):
+def test_public_text_follows_the_receipt_base_of_an_unfinished_predecessor(tmp_path, branch_exists):
     data = code_payload(tmp_path, [{"id": "pr", "base": "main"}])
     jobs = Jobs(tmp_path / "root")
     predecessor = jobs.submit({**data, "receipt_key": "predecessor"}, 10)
     branch = f"taskwatch/{predecessor.id[:8]}"
     if branch_exists:
         git(tmp_path / "repo", "branch", branch)
-    successor = jobs.submit(
-        {
-            **data,
-            "receipt_key": "successor",
-            "base": "@predecessor",
-            "predecessors": ["predecessor"],
-        },
-        11,
-    )
+    chain = {"receipt_key": "successor", "base": "@predecessor", "predecessors": ["predecessor"]}
+    # A commit frozen now cannot be the base the predecessor's result gives later.
+    with pytest.raises(ValueError, match="same @<receipt key> as base"):
+        jobs.submit({**data, **chain}, 11)
+    unit = [{"id": "pr", "base": "@predecessor"}]
+    successor = jobs.submit({**data, **chain, "public_text": unit}, 11)
     assert successor.base == branch
     assert successor.predecessors == (predecessor.id,)
-    assert successor.public_text[0]["base"] == git(tmp_path / "repo", "rev-parse", "main")
+    assert successor.public_text[0]["base"] == "@predecessor"
 
 
 def test_historical_multiple_units_and_two_file_text_evidence_remain_readable(tmp_path):

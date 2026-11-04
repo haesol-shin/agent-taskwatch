@@ -680,3 +680,106 @@ def test_print_still_validates_unused_omp_argv(tmp_path, command):
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match="omp_command"):
         load_job_config(root)
+
+
+def test_submission_rejects_an_output_that_is_a_directory_of_the_target(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "a.md").write_text("a\n", encoding="utf-8")
+    jobs = Jobs(tmp_path / "root")
+    with pytest.raises(ValueError, match="output is a directory.*docs"):
+        jobs.submit(_code_payload(tmp_path, "dir", target=str(repo), outputs=["docs"]))
+    assert jobs.load() == {}
+    job = jobs.submit(_code_payload(tmp_path, "file", target=str(repo), outputs=["docs/a.md"]))
+    assert job.outputs == ("docs/a.md",)
+
+
+def _chain(tmp_path):
+    """A target repository with a first job `first`, whose branch exists as mid-work."""
+    repo = make_repo(tmp_path)
+    jobs = Jobs(tmp_path / "root")
+    first = jobs.submit(_code_payload(tmp_path, "first", target=str(repo)), 10)
+    git(repo, "branch", f"taskwatch/{first.id[:8]}", "HEAD")
+    return repo, jobs, first
+
+
+def test_public_text_base_takes_the_receipt_reference_of_the_job_base(tmp_path):
+    repo, jobs, first = _chain(tmp_path)
+    second = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "second",
+            target=str(repo),
+            predecessors=["first"],
+            base="@first",
+            public_text=[{"id": "pr1", "base": "@first"}],
+        ),
+        20,
+    )
+    assert second.base_predecessor == first.id
+    # Workspace creation resolves it together with the job base.
+    assert second.public_text[0]["base"] == "@first"
+    assert jobs.load()[second.id].public_text[0]["base"] == "@first"
+
+
+@pytest.mark.parametrize("job_base", [None, "@other", "HEAD"])
+def test_public_text_receipt_base_must_equal_the_job_base(tmp_path, job_base):
+    repo, jobs, _ = _chain(tmp_path)
+    jobs.submit(_code_payload(tmp_path, "other", target=str(repo)), 15)
+    extra = {} if job_base is None else {"base": job_base}
+    with pytest.raises(ValueError, match="must equal the job base"):
+        jobs.submit(
+            _code_payload(
+                tmp_path,
+                "second",
+                target=str(repo),
+                public_text=[{"id": "pr1", "base": "@first"}],
+                **extra,
+            )
+        )
+
+
+def test_public_text_ref_that_cannot_match_a_running_predecessor_is_rejected(tmp_path):
+    repo, jobs, first = _chain(tmp_path)
+    # The predecessor's branch resolves now, but its tip moves until the job ends.
+    for ref in ("HEAD", f"taskwatch/{first.id[:8]}"):
+        with pytest.raises(ValueError, match="same @<receipt key> as base"):
+            jobs.submit(
+                _code_payload(
+                    tmp_path,
+                    "second",
+                    target=str(repo),
+                    base="@first",
+                    public_text=[{"id": "pr1", "base": ref}],
+                ),
+                20,
+            )
+    # A predecessor that has not started has no branch, which the pin says in the same words.
+    jobs.submit(_code_payload(tmp_path, "later", target=str(repo)), 30)
+    with pytest.raises(ValueError, match="give public_text base the same reference"):
+        jobs.submit(
+            _code_payload(
+                tmp_path,
+                "third",
+                target=str(repo),
+                base="@later",
+                public_text=[{"id": "pr1", "base": "taskwatch/not-yet"}],
+            ),
+            40,
+        )
+
+
+def test_public_text_ref_still_matches_a_finished_nonlanding_predecessor(tmp_path):
+    repo, jobs, first = _chain(tmp_path)
+    jobs.save(replace(first, stage="deliver_pending", branch=f"taskwatch/{first.id[:8]}"), 15)
+    second = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "second",
+            target=str(repo),
+            base="@first",
+            public_text=[{"id": "pr1", "base": "HEAD"}],
+        ),
+        20,
+    )
+    assert second.public_text[0]["base"] == git(repo, "rev-parse", "HEAD")
