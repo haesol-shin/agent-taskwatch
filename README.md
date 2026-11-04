@@ -83,6 +83,7 @@ taskwatch --root <root> resume <job> --reason <text> # open a new recovery and r
 - [docs/principles.md](docs/principles.md): the rules behind the design and their sources.
 - [docs/review](docs/review/README.md): review guidelines.
 - [docs/review-launch.md](docs/review-launch.md): launch a review through taskwatch or with omp alone, from the same guidelines.
+- [docs/omp.md](docs/omp.md): optional native omp client over the installed `taskwatch` command.
 
 ## Contributing
 
