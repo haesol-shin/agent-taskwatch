@@ -144,7 +144,14 @@ def prepare(job: JobState, env: Mapping[str, str], jobs: Jobs | None = None) -> 
             raise WorkspaceError("base predecessor no longer exists")
         predecessor = verified_predecessor_base(job.target, record, env)
     sha, note = (predecessor, "") if predecessor else _base(job, env)
-    return {"base": sha, "base_note": note, "workspace_state": "prepared"}
+    prepared = {"base": sha, "base_note": note, "workspace_state": "prepared"}
+    # A unit base given as `@<receipt key>` is the job base: both resolve to this one commit.
+    if any(unit["base"].startswith("@") for unit in job.public_text):
+        prepared["public_text"] = [
+            {**unit, "base": sha} if unit["base"].startswith("@") else dict(unit)
+            for unit in job.public_text
+        ]
+    return prepared
 
 
 def create(

@@ -59,6 +59,8 @@ from .rate_limit import RateLimit, print_rate_limit, scrub
 from .review_docs import docs_dir, profile_names
 
 STEPS = frozenset({"work", "fix", "check", "review", "land"})
+PRECHECK_LOG = "precheck.log"
+PRECHECK_RECORD = "precheck.json"
 SOURCE_TABLE = "source-table.md"
 EVIDENCE_EVERY = 15.0
 SETTLE_POLL = 2.0
@@ -467,7 +469,9 @@ Work inputs:
   `{ctx.folder / job_findings.FINDINGS_FILE}` before you finish, as the fix message shows.
   A rule that repeats also needs a section in `{ctx.folder / job_findings.NOTE_FILE}`.
 - While working, run only the tests that cover the files you changed. Run the whole check once,
-  with the `--run-command` option of the command in the End section, just before you end.
+  with the `--run-command` option of the command in the End section, just before you end. The
+  runner reuses a passing run instead of running the command again, if the result does not
+  change after it.
 {card_language}- If you delegate to subagents, wait until each one finished.
 
 {_job_type_text(job)}
@@ -1277,7 +1281,8 @@ def shape_problems(
     jobs: Jobs, config: JobConfig, job: JobState, run_command: bool = False
 ) -> list[str]:
     """What the check step would report about the shape of the result now. The result and the
-    records are only read; the check command runs only when asked, into its own log."""
+    records are only read; the check command runs only when asked, into its own log, and a
+    passing run is recorded so the check step does not run it again."""
     if job.review_target is not None:
         raise ValueError("a review-only job has no result to check")
     if not job.workspace or not Path(job.workspace).is_dir():
@@ -1285,24 +1290,55 @@ def shape_problems(
     ctx = Ctx(jobs, config, job, jobs.folder(job), Path(job.workspace))
     problems: list[str] = []
     if run_command:
-        problems += _run_command(ctx, ctx.folder / "logs" / "precheck.log")[1]
+        problems += _precheck(ctx)
     _shape(ctx, problems)
     return problems
 
 
+def _precheck(ctx: Ctx) -> list[str]:
+    """Run the check command for the agent. A run that exits 0 on a result and basis the
+    command did not change is written to `logs/precheck.json`, where `_passing_run` finds it."""
+    log = ctx.folder / "logs" / PRECHECK_LOG
+    record = ctx.folder / "logs" / PRECHECK_RECORD
+    record.unlink(missing_ok=True)  # An earlier run says nothing about this one.
+    before = _identity(ctx)
+    run, problems = _run_command(ctx, log)
+    if not problems and before is not None and _identity(ctx) == before:
+        fingerprint, basis = before
+        text = json.dumps(
+            {
+                **run,
+                "fingerprint": fingerprint,
+                "basis": basis,
+                "check_command": list(ctx.job.check_command),
+            }
+        )
+        scratch = record.with_suffix(".tmp")
+        scratch.write_text(text, encoding="utf-8")
+        os.replace(scratch, record)
+    return problems
+
+
+def _identity(ctx: Ctx) -> tuple[str, str] | None:
+    """The result fingerprint and the basis the command would see, or None if unreadable."""
+    try:
+        identity = _fingerprint(ctx.job, ctx.workspace, ctx.env), _basis(ctx.job, ctx.folder)
+    except (ValueError, OSError):
+        return None
+    return identity if identity[0] else None
+
+
 def _passing_run(ctx: Ctx) -> dict | None:
-    """The latest earlier check whose command exited 0 on this very result and basis, if any.
+    """The latest earlier command run that exited 0 on this very result and basis, if any:
+    a recorded check, else the agent's own run of `check --run-command`.
 
     The fingerprint covers the result and the basis covers intent, spec and guidelines, so the
     command would see the same input; only the file, text and finding checks run again.
     """
-    try:
-        fingerprint = _fingerprint(ctx.job, ctx.workspace, ctx.env)
-        basis = _basis(ctx.job, ctx.folder)
-    except (ValueError, OSError):
+    identity = _identity(ctx)
+    if identity is None:
         return None
-    if not fingerprint:
-        return None
+    fingerprint, basis = identity
     for check in reversed(ctx.job.checks):
         if (
             check.get("exit_code") == 0
@@ -1312,23 +1348,53 @@ def _passing_run(ctx: Ctx) -> dict | None:
             and Path(check["log"]).is_file()
         ):
             return check
-    return None
+    return _precheck_run(ctx, fingerprint, basis)
 
 
-def _check_step(ctx: Ctx) -> int:
-    job = ctx.job
-    seq = len(job.checks) + len(job.reviews) + 1
+def _precheck_run(ctx: Ctx, fingerprint: str, basis: str) -> dict | None:
+    """The agent's passing run for this result, basis and command, while its log is intact."""
+    log = ctx.folder / "logs" / PRECHECK_LOG
+    try:
+        record = json.loads((ctx.folder / "logs" / PRECHECK_RECORD).read_text(encoding="utf-8"))
+        sha = _file_sha(log)
+        matches = (
+            record["exit_code"] == 0
+            and record["fingerprint"] == fingerprint
+            and record["basis"] == basis
+            and record["check_command"] == list(ctx.job.check_command)
+            and record["log_sha256"] == sha
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return {"exit_code": 0, "log": str(log), "log_sha256": sha} if matches else None
+
+
+def _command_run(ctx: Ctx, seq: int) -> tuple[dict, list[str]]:
+    """The command's run for check `seq`: an earlier passing run is reused, else it runs."""
+    log = ctx.folder / "logs" / f"check-{seq}.log"
     reused = _passing_run(ctx)
-    if reused is None:
-        run, problems = _run_command(ctx, ctx.folder / "logs" / f"check-{seq}.log")
-    else:
+    if reused is not None and "seq" in reused:
         run = {
             "exit_code": 0,
             "log": reused["log"],
             "log_sha256": reused["log_sha256"],
             "reused_check": reused.get("reused_check", reused["seq"]),
         }
-        problems = []
+        return run, []
+    if reused is not None:
+        # The agent may run the command again later and overwrite its log; keep this run's.
+        try:
+            shutil.copyfile(reused["log"], log)
+        except OSError:
+            return _run_command(ctx, log)
+        return {**reused, "log": str(log), "reused_precheck": True}, []
+    return _run_command(ctx, log)
+
+
+def _check_step(ctx: Ctx) -> int:
+    job = ctx.job
+    seq = len(job.checks) + len(job.reviews) + 1
+    run, problems = _command_run(ctx, seq)
     # After the command: it may have changed or removed what the checks require.
     fingerprint, basis, texts, notes = _shape(ctx, problems)
     record = {

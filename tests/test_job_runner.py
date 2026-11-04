@@ -731,6 +731,21 @@ def test_code_job_uses_worktree_and_committed_fingerprint(tmp_path, monkeypatch)
     subprocess.run(["git", "-C", str(repo), "worktree", "list"], check=True, capture_output=True)
 
 
+def test_code_job_check_reuses_the_agents_run_on_the_committed_result(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path, "repo")
+    env = Env(tmp_path, monkeypatch, review="code", target=repo)
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.scenario([work_turn(run=[["git", "add", "-A"], [*GIT, "commit", "-m", "work"]])])
+    assert env.run("work") == 0
+    problems = job_runner.shape_problems(env.jobs, env.config, env.get(), run_command=True)
+    assert problems == [] and counter.read_text() == "x"
+    assert env.run("check") == 0
+    job = env.get()
+    assert job.stage == "review" and counter.read_text() == "x"
+    assert job.checks[-1]["reused_precheck"] is True
+
+
 def test_stale_attempt_cannot_create_worktree_before_base_intent_is_saved(tmp_path, monkeypatch):
     repo = make_repo(tmp_path, "repo")
     env = Env(tmp_path, monkeypatch, review="code", target=repo)
@@ -1147,3 +1162,77 @@ def test_a_reply_that_only_mentions_429_is_not_a_rate_limit(env):
     assert env.run("review") == 0
     job = env.get()
     assert (job.stage, job.retry_not_before) == ("deliver_pending", 0.0)
+
+
+def _precheck(env) -> list[str]:
+    """`check --run-command` as the agent runs it, while the job is in its work stage."""
+    (env.folder() / "logs").mkdir(exist_ok=True)  # The runner makes it when a step starts.
+    with env.jobs.state.lock():
+        job = replace(env.get(), workspace=str(env.folder() / "work"))
+        env.jobs.save(job, 1500.0)
+    return job_runner.shape_problems(env.jobs, env.config, env.get(), run_command=True)
+
+
+def test_check_reuses_the_command_run_the_agent_made_for_the_same_result(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.seed(GOOD_FILES)
+    assert _precheck(env) == []
+    assert counter.read_text() == "x"
+    assert env.run("check") == 0
+    job = env.get()
+    check = job.checks[-1]
+    assert counter.read_text() == "x" and check["ok"] and job.stage == "review"
+    assert check["reused_precheck"] is True and "reused_check" not in check
+    # The record has a log of its own, so a later run of the agent cannot change it.
+    assert check["log"].endswith(f"check-{check['seq']}.log")
+    assert Path(check["log"]).read_bytes() == (env.folder() / "logs/precheck.log").read_bytes()
+    # A later check of the same result reuses the recorded check, not the agent's run.
+    assert env.run("check") == 0
+    assert counter.read_text() == "x" and env.get().checks[-1]["reused_check"] == check["seq"]
+
+
+def test_check_runs_the_command_when_the_result_changed_after_the_agents_run(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.seed(GOOD_FILES)
+    assert _precheck(env) == []
+    (env.folder() / "work" / "out.txt").write_text("ok\nmore\n", encoding="utf-8")
+    assert env.run("check") == 0
+    assert counter.read_text() == "xx" and "reused_precheck" not in env.get().checks[-1]
+
+
+def test_check_runs_the_command_when_the_agents_log_was_rewritten(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.seed(GOOD_FILES)
+    assert _precheck(env) == []
+    (env.folder() / "logs" / "precheck.log").write_text("rewritten\n", encoding="utf-8")
+    assert env.run("check") == 0
+    assert counter.read_text() == "xx" and "reused_precheck" not in env.get().checks[-1]
+
+
+def test_a_failing_run_of_the_agent_replaces_its_passing_one(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    _counting_check(env, counter)
+    env.seed(GOOD_FILES)
+    assert _precheck(env) == []
+    out = env.folder() / "work" / "out.txt"
+    out.write_text("bad\n", encoding="utf-8")
+    assert any("exited 1" in problem for problem in _precheck(env))
+    out.write_text("ok\n", encoding="utf-8")
+    assert not (env.folder() / "logs" / "precheck.json").exists()
+    assert env.run("check") == 0
+    assert counter.read_text() == "xxx" and "reused_precheck" not in env.get().checks[-1]
+
+
+def test_a_command_that_changes_the_result_is_not_recorded_as_a_run(env, tmp_path):
+    counter = tmp_path / "runs.txt"
+    script = f"open({str(counter)!r}, 'a').write('x')\nopen('out.txt', 'a').write('ok\\n')\n"
+    with env.jobs.state.lock():
+        env.jobs.save(replace(env.get(), check_command=(sys.executable, "-c", script)), 1500.0)
+    env.seed(GOOD_FILES)
+    assert _precheck(env) == []
+    assert not (env.folder() / "logs" / "precheck.json").exists()
+    assert env.run("check") == 0
+    assert counter.read_text() == "xx"
