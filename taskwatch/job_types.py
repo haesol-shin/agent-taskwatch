@@ -1,4 +1,4 @@
-"""The kind label of a job, derived from fields that exist. There is no `kind` field."""
+"""The job type label of a job, derived from fields that exist. There is no job type field."""
 
 from __future__ import annotations
 
@@ -23,6 +23,6 @@ def declares_choices(outputs: Iterable[str]) -> bool:
     return any(Path(output) == Path(CHOICES_FILE) for output in outputs)
 
 
-def kind_label(job: JobState) -> str:
+def job_type_label(job: JobState) -> str:
     """research, design, implement, or review (a review-only job has a `review_target`)."""
     return "review" if job.review_target is not None else _LABELS[job.review]

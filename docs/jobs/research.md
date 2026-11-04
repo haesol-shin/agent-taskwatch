@@ -1,4 +1,4 @@
-## Kind: research (review `source`)
+## Job type: research (review `source`)
 
 A research job answers a question from sources and shows where each statement comes from.
 

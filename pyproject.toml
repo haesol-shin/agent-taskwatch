@@ -21,7 +21,7 @@ packages = ["taskwatch"]
 [tool.setuptools.data-files]
 "share/agent-taskwatch/review" = ["docs/review/*.md"]
 "share/agent-taskwatch/launch" = ["docs/launch/*.md", "docs/launch/*.json"]
-"share/agent-taskwatch/kinds" = ["docs/kinds/*.md", "docs/kinds/*.json"]
+"share/agent-taskwatch/jobs" = ["docs/jobs/*.md", "docs/jobs/*.json"]
 
 [project.urls]
 Repository = "https://github.com/haesol-shin/agent-taskwatch"

@@ -45,6 +45,7 @@ from .fingerprint import (
 )
 from .job_env import job_environment
 from .job_rpc import RpcAborted, RpcClient, RpcError
+from .job_types import declares_choices, job_type_label
 from .jobs import (
     LANGUAGE_NAMES,
     MAX_RECOVERIES,
@@ -54,7 +55,6 @@ from .jobs import (
     JobState,
     progress_fingerprint,
 )
-from .kinds import declares_choices, kind_label
 from .rate_limit import RateLimit, print_rate_limit, scrub
 from .review_docs import docs_dir, profile_names
 
@@ -404,15 +404,15 @@ def _approval_text(ctx: Ctx) -> str:
     return text
 
 
-def _kind_text(job: JobState) -> str:
-    """The brief contract and the kind's own rules, read from docs/kinds when the step starts."""
-    names = ("brief.md", f"{kind_label(job)}.md")
+def _job_type_text(job: JobState) -> str:
+    """The brief contract and the job type's own rules, read from docs/jobs when the step starts."""
+    names = ("brief.md", f"{job_type_label(job)}.md")
     try:
         return "\n\n".join(
-            (_docs_source("kinds") / name).read_text(encoding="utf-8").strip() for name in names
+            (_docs_source("jobs") / name).read_text(encoding="utf-8").strip() for name in names
         )
     except OSError as exc:
-        raise StepError(f"kind documents are unreadable: {exc}") from exc
+        raise StepError(f"job type documents are unreadable: {exc}") from exc
 
 
 def _language_name(config: JobConfig) -> str | None:
@@ -470,7 +470,7 @@ Work inputs:
   with the `--run-command` option of the command in the End section, just before you end.
 {card_language}- If you delegate to subagents, wait until each one finished.
 
-{_kind_text(job)}
+{_job_type_text(job)}
 
 {_approval_text(ctx)}
 
@@ -499,7 +499,7 @@ def _predecessor_lines(ctx: Ctx) -> list[str]:
         if pred is None:
             lines.append(f"- {identifier}: not found")
             continue
-        lines.append(f"- {pred.id} ({kind_label(pred)}), stage {pred.stage}")
+        lines.append(f"- {pred.id} ({job_type_label(pred)}), stage {pred.stage}")
         lines += [f"  {line}" for line in _result_lines(ctx.jobs, ctx.config, pred)]
     return lines
 
@@ -834,7 +834,7 @@ def _schema_path(ctx: Ctx) -> Path:
 
 def _command(ctx: Ctx, review_root: Path | None = None) -> tuple[str, ...]:
     """The review step may use its own command. {guidelines} and {review} name the job copy and
-    the review kind, {schema} the verdict schema file, {output} the file of the last message
+    the review profile, {schema} the verdict schema file, {output} the file of the last message
     (print mode)."""
     config = ctx.config
     if ctx.stage != "review" or config.review_command is None:
