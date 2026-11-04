@@ -682,7 +682,7 @@ def test_print_still_validates_unused_omp_argv(tmp_path, command):
         load_job_config(root)
 
 
-def test_submission_rejects_an_output_that_is_a_directory_of_the_target(tmp_path):
+def test_submission_rejects_a_directory_output_of_the_target_only_for_a_code_job(tmp_path):
     repo = make_repo(tmp_path)
     (repo / "docs").mkdir()
     (repo / "docs" / "a.md").write_text("a\n", encoding="utf-8")
@@ -692,6 +692,12 @@ def test_submission_rejects_an_output_that_is_a_directory_of_the_target(tmp_path
     assert jobs.load() == {}
     job = jobs.submit(_code_payload(tmp_path, "file", target=str(repo), outputs=["docs/a.md"]))
     assert job.outputs == ("docs/a.md",)
+    # A source or design job writes in its own work folder, so a same-named target folder
+    # does not refuse it.
+    other = jobs.submit(
+        {**payload(tmp_path, "src"), "target": str(repo), "outputs": ["docs"]},
+    )
+    assert other.outputs == ("docs",)
 
 
 def _chain(tmp_path):

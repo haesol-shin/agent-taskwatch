@@ -678,10 +678,12 @@ def _awaits_predecessor(data: dict, existing: Mapping[str, JobState]) -> bool:
 def _work_fields(data: dict) -> None:
     for key in ("outputs", "check_command"):
         _strings(data[key], key, nonempty=True)
+    # Only a code job writes in the target (a worktree of it); other reviews write in the job
+    # work folder, where a same-named folder of the target is irrelevant.
     root = Path(data["target"])
     for item in data["outputs"]:
         _relative(item, "output")
-        if (root / item).is_dir():
+        if data["review"] == "code" and (root / item).is_dir():
             raise ValueError(f"output is a directory, name its files: {item}")
     for key in ("checklist", "progress"):
         _relative(data[key], key)
