@@ -873,11 +873,11 @@ def test_the_start_argv_binds_the_private_tmp_in_a_user_namespace(
     seen = _run_capture(monkeypatch)
     Systemd(tmp_path).start(_unit_job(), tmp_path / "private-tmp")
     argv = seen[0]
-    assert "--property=PrivateUsers=yes" in argv
-    assert f"--property=BindPaths={tmp_path / 'private-tmp'}:/tmp" in argv
-    assert argv.index("--property=BindPaths=" + f"{tmp_path / 'private-tmp'}:/tmp") < argv.index(
-        sys.executable
-    )
+    # `exec` makes systemd-run fail when the namespace or the mount cannot be set up.
+    options = argv[: argv.index(sys.executable)]
+    assert "--service-type=exec" in options
+    assert "--property=PrivateUsers=yes" in options
+    assert f"--property=BindPaths={tmp_path / 'private-tmp'}:/tmp" in options
 
 
 def test_the_start_argv_has_no_namespace_properties_without_a_private_tmp(
@@ -885,7 +885,11 @@ def test_the_start_argv_has_no_namespace_properties_without_a_private_tmp(
 ) -> None:
     seen = _run_capture(monkeypatch)
     Systemd(tmp_path).start(_unit_job())
-    assert not [item for item in seen[0] if "BindPaths" in item or "PrivateUsers" in item]
+    assert not [
+        item
+        for item in seen[0]
+        if "BindPaths" in item or "PrivateUsers" in item or "service-type" in item
+    ]
 
 
 def test_a_refused_private_tmp_start_names_the_switch(monkeypatch, tmp_path: Path) -> None:

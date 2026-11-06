@@ -69,7 +69,10 @@ class Systemd:
         """Start the step as a user service; with `private_tmp` its /tmp is that folder.
 
         The bind needs a user namespace (`PrivateUsers=yes`) because a user manager cannot
-        mount without root. A host that cannot give one fails here, with the switch named.
+        mount without root. With the default `simple` type, systemd-run reports success
+        before the namespace and the mount are set up, so a refused setup would only show as
+        a dead unit. `exec` makes the start wait for them, so such a host fails here, with
+        the switch named.
         """
         argv = [
             "systemd-run",
@@ -81,7 +84,11 @@ class Systemd:
         if private_tmp is not None:
             if _UNBINDABLE & set(str(private_tmp)):
                 raise RuntimeError(f"private /tmp: the path {private_tmp} cannot be bound")
-            argv += ["--property=PrivateUsers=yes", f"--property=BindPaths={private_tmp}:/tmp"]
+            argv += [
+                "--service-type=exec",
+                "--property=PrivateUsers=yes",
+                f"--property=BindPaths={private_tmp}:/tmp",
+            ]
         argv += [
             sys.executable,
             "-m",

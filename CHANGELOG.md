@@ -5,7 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Changed
-- Each job step starts with a private `/tmp` backed by a `private-tmp` folder in the job folder (`PrivateUsers=yes` and `BindPaths`), so a fixed `/tmp/<name>` write goes to disk, stays per job and is deleted when the step ends. Set `"private_tmp": false` in `jobs-config.json` on a host without user namespaces; a refused start records `start_failed` with the reason and a hint naming that key ([configuration](docs/configuration.md#private-tmp)).
+- Each job step starts with a private `/tmp` backed by a `private-tmp` folder in the job folder (`PrivateUsers=yes` and `BindPaths`), so a fixed `/tmp/<name>` write goes to disk, stays per job and is deleted when the step ends. The unit uses `--service-type=exec`, so a refused namespace or bind fails the start itself. Set `"private_tmp": false` in `jobs-config.json` on a host without user namespaces; a refused start records `start_failed` with the reason and a hint naming that key ([configuration](docs/configuration.md#private-tmp)).
 
 ### Fixed
 - The check step reuses the passing `check --run-command` run of the agent for the same result and basis instead of running the check command a second time, and records `reused_precheck` with its own copy of the log; a result changed after that run still runs the command ([checks](docs/checks.md#job-checks), [commands](docs/commands.md#check)).
