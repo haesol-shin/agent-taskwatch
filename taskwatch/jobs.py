@@ -164,6 +164,7 @@ class JobConfig:
     install_command: tuple[str, ...] | None = None
     worker_mode: str = "rpc"
     worker_command: tuple[str, ...] | None = None
+    private_tmp: bool = True
 
 
 COMMIT_RULES = ("bullet_one_line",)
@@ -223,6 +224,7 @@ def load_job_config(root: Path) -> JobConfig:
         "worker_mode",
         "worker_command",
         "install_command",
+        "private_tmp",
     } != {
         "version",
         "slots",
@@ -267,6 +269,9 @@ def load_job_config(root: Path) -> JobConfig:
     review_mode = _review_mode(obj)
     max_reviews = _max_reviews(obj["max_reviews"]) if "max_reviews" in obj else DEFAULT_MAX_REVIEWS
     install = _install_command(obj.get("install_command"))
+    private_tmp = obj.get("private_tmp", True)
+    if type(private_tmp) is not bool:
+        raise ValueError("private_tmp must be true or false")
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -289,6 +294,7 @@ def load_job_config(root: Path) -> JobConfig:
         install,
         worker_mode,
         tuple(obj["worker_command"]) if "worker_command" in obj else None,
+        private_tmp,
     )
 
 
