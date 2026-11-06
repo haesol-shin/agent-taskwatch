@@ -8,6 +8,7 @@ then launches that next step under a new attempt while the job keeps its slot an
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,11 @@ WAKE_ACCURACY = "1s"
 # A step writes logs, sessions, git objects and temporary files. Below this much free space a
 # relaunch is likely to die on ENOSPC again, so the scan stops instead of burning a recovery.
 DISK_FLOOR_BYTES = 256 * 1024 * 1024
+# The folder, inside the job folder, that a step sees as /tmp (see `Systemd.start`).
+PRIVATE_TMP = "private-tmp"
+# systemd splits BindPaths on whitespace and ':', and unquotes and unescapes it, so such a
+# path cannot be passed through as is.
+_UNBINDABLE = frozenset(" \t\n:'\"\\")
 
 
 class Systemd:
@@ -59,13 +65,24 @@ class Systemd:
             return "active"
         return "inactive" if state in ("inactive", "failed") else "unknown"
 
-    def start(self, job: JobState) -> None:
+    def start(self, job: JobState, private_tmp: Path | None = None) -> None:
+        """Start the step as a user service; with `private_tmp` its /tmp is that folder.
+
+        The bind needs a user namespace (`PrivateUsers=yes`) because a user manager cannot
+        mount without root. A host that cannot give one fails here, with the switch named.
+        """
         argv = [
             "systemd-run",
             "--user",
             "--quiet",
             f"--unit={job.unit}",
             "--property=KillMode=control-group",
+        ]
+        if private_tmp is not None:
+            if _UNBINDABLE & set(str(private_tmp)):
+                raise RuntimeError(f"private /tmp: the path {private_tmp} cannot be bound")
+            argv += ["--property=PrivateUsers=yes", f"--property=BindPaths={private_tmp}:/tmp"]
+        argv += [
             sys.executable,
             "-m",
             "taskwatch.job_cli",
@@ -76,7 +93,16 @@ class Systemd:
             "--attempt",
             str(job.attempt),
         ]
-        subprocess.run(argv, check=True, capture_output=True, timeout=30)
+        try:
+            subprocess.run(argv, check=True, capture_output=True, timeout=30)
+        except subprocess.CalledProcessError as exc:
+            if private_tmp is None:
+                raise
+            reason = (exc.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+            raise RuntimeError(
+                f"systemd-run failed with a private /tmp ({reason or exc}); a host without user "
+                'namespaces needs "private_tmp": false in jobs-config.json'
+            ) from exc
 
     def wake(self) -> None:
         """Run one extra scan shortly, so the next step does not wait for the timer."""
@@ -120,6 +146,21 @@ class Systemd:
         if proc.returncode != 0 and info.get("LoadState") != "not-found":
             return None
         return info
+
+
+def _remove_tree(path: Path) -> None:
+    """Delete a step's temp folder. A tool can leave read-only folders (module caches), so
+    each is made writable first. What cannot be deleted stays and is retried at the next
+    step end. Symbolic links are never followed."""
+    if path.is_symlink() or not path.is_dir():
+        return
+    os.chmod(path, 0o700)
+    for base, dirs, _ in os.walk(path):
+        for name in dirs:
+            child = Path(base) / name
+            if not child.is_symlink():
+                os.chmod(child, 0o700)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _cgroup_empty(cgroup: str) -> bool:
@@ -252,6 +293,8 @@ class _Scan:
     def _confirm_dead(self, job: JobState) -> bool:
         """True when the job's whole old service is dead; never assumed, even after a reboot."""
         if self.service.status(job.unit) in DEAD or self.service.stop(job.unit):
+            # Nothing in a step's /tmp is evidence, so it goes with the step.
+            _remove_tree(self.jobs.folder(job) / PRIVATE_TMP)
             return True
         if job.error != "stop_unconfirmed":
             self._save(replace(job, error="stop_unconfirmed"))
@@ -319,6 +362,7 @@ class _Scan:
     def _full_disk(self, job: JobState) -> str:
         """The first of the job folder and TMPDIR whose filesystem is under the floor, or ''.
 
+        The private /tmp lives inside the job folder, so the first check covers it.
         A filesystem that cannot be read is not reported full: nothing proves it.
         """
         temp = job_environment(self.config.env).get("TMPDIR") or tempfile.gettempdir()
@@ -460,9 +504,17 @@ class _Scan:
         self._save(job)
         self.launched.append(job.id)
         try:
-            self.service.start(job)
+            self.service.start(job, self._private_tmp(job))
         except _SPAWN_ERRORS as exc:
-            self._save(self._event(replace(job, error=f"start_failed: {exc}"), "start_failed"))
+            failed = replace(job, error=f"start_failed: {exc}")
+            self._save(self._event(failed, "start_failed", error=str(exc)))
+
+    def _private_tmp(self, job: JobState) -> Path | None:
+        if not self.config.private_tmp:
+            return None
+        path = self.jobs.folder(job) / PRIVATE_TMP
+        path.mkdir(mode=0o700, exist_ok=True)
+        return path
 
     def _park(self, job: JobState, reason: str, error: str = "") -> None:
         """Wait for the user. The unit is kept until it is confirmed dead, so slot and target

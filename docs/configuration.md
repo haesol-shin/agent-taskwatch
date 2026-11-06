@@ -195,6 +195,16 @@ Optionally add `"env"`, an object of string keys and string values, to set the e
 "env": {"PATH": "~/.local/bin:~/.bun/bin:$PATH"}
 ```
 
+### Private /tmp
+
+`TMPDIR` in `env` moves the temporary files of well-behaved tools to disk, but an agent can still write a fixed `/tmp/<name>`, and on many hosts `/tmp` is a size-limited tmpfs in memory that every process shares. A job that fills it can break unrelated programs, and nothing removes what it left.
+
+By default each job step therefore starts with its own `/tmp`. The step unit is started with `PrivateUsers=yes` and `BindPaths=<job folder>/private-tmp:/tmp`, so a write to `/tmp/<name>` lands in the `private-tmp` folder of the job folder, on the disk of the job folder, and the host's `/tmp` is untouched. The folder is created when the step starts. The scan deletes it, read-only subfolders included, as soon as it confirms the step's service is dead, because nothing in it is evidence. `TMPDIR` handling is unchanged, and the [disk floor](#recovery-and-decisions) already covers the folder because it is inside the job folder.
+
+Optionally add `"private_tmp": false` to turn it off. The default is `true` and the `init` draft omits the key. The bind needs user namespaces, since a user manager cannot mount without root. On a host where user namespaces are disabled, `systemd-run` refuses the unit: the scan records `start_failed` with the `systemd-run` message and a hint naming this key, and it does not retry without the private `/tmp`. Set `"private_tmp": false` there. A job folder path that holds whitespace, a colon, a quote or a backslash cannot be passed to systemd, so the start fails with `start_failed` and the reason; use another root or turn the key off.
+
+Inside the user namespace the step keeps its own user and group id, but files owned by other users, including root, show as owned by `nobody`, and `sudo` and setuid programs do not gain privileges. A tool that refuses files it does not own can notice this. This is not a sandbox: the rest of the filesystem and the network stay as before.
+
 ### Owner defaults
 
 Optional `<root>/taskwatch/defaults.json` holds standing owner answers for design jobs (`{"version": 1, "defaults": [{"id", "value", "scope": "global" | "<target path>", "source": "<owner words>"}]}`), validated against [`docs/jobs/defaults.schema.json`](jobs/defaults.schema.json). Every design job's work and review messages name the file and its short SHA-256 hash (`Owner defaults: <root>/taskwatch/defaults.json (sha256 <12 hex> | absent)`); see [`docs/jobs/design.md`](jobs/design.md#choicesjson) for the scope precedence and `choices.json` check rules.

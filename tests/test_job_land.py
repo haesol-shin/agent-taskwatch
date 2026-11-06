@@ -425,7 +425,7 @@ class StepService:
             return "missing"
         return "active" if proc.poll() is None else "inactive"
 
-    def start(self, job: JobState) -> None:
+    def start(self, job: JobState, private_tmp: Path | None = None) -> None:
         argv = [sys.executable, "-c", RUN_STEP, "--root", str(self.root)]
         argv += ["run", job.id, "--attempt", str(job.attempt)]
         with (self.logs / f"{job.unit}.log").open("wb") as log:

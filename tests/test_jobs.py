@@ -436,6 +436,27 @@ def test_init_writes_the_default_and_the_loader_reads_it(tmp_path):
     assert load_job_config(root).worker_command is None
 
 
+def test_private_tmp_is_on_when_the_init_draft_omits_it(tmp_path):
+    root = tmp_path / "root"
+    path = host_config(root)
+    assert "private_tmp" not in json.loads(path.read_text(encoding="utf-8"))
+    assert load_job_config(root).private_tmp is True
+
+
+def test_private_tmp_can_be_turned_off(tmp_path):
+    root = tmp_path / "root"
+    host_config(root, private_tmp=False)
+    assert load_job_config(root).private_tmp is False
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_a_private_tmp_that_is_not_a_boolean_is_a_config_error(tmp_path, value):
+    root = tmp_path / "root"
+    host_config(root, private_tmp=value)
+    with pytest.raises(ValueError, match="private_tmp"):
+        load_job_config(root)
+
+
 def test_max_reviews_is_per_job_over_host_over_built_in_and_frozen_at_submit(tmp_path):
     root = tmp_path / "root"
     jobs = Jobs(root)

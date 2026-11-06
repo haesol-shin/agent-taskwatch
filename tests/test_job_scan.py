@@ -37,14 +37,16 @@ class FakeService:
         self.stopped: list[str] = []
         self.stop_ok = True
         self.start_error: Exception | None = None
+        self.private_tmps: list[Path | None] = []
 
     def status(self, unit: str) -> str:
         return self.states.get(unit, "missing")
 
-    def start(self, job: JobState) -> None:
+    def start(self, job: JobState, private_tmp: Path | None = None) -> None:
         if self.start_error:
             raise self.start_error
         self.started.append(job.unit)
+        self.private_tmps.append(private_tmp)
         self.states[job.unit] = "active"
 
     def stop(self, unit: str) -> bool:
@@ -813,6 +815,102 @@ def test_scan_events_record_why_a_step_was_relaunched(board: Board) -> None:
     board.scan()
     kinds = [e["kind"] for e in board.get(job_id).events if e.get("source") == "scan"]
     assert kinds == ["launched", "service_dead", "launched"]
+
+
+# -- the private /tmp of a step ---------------------------------------------------------------
+
+
+def test_a_step_gets_a_private_tmp_inside_its_job_folder_unless_disabled(board: Board) -> None:
+    job_id = board.add()
+    board.scan()
+    folder = board.jobs.folder(board.get(job_id)) / job_scan.PRIVATE_TMP
+    assert board.service.private_tmps == [folder] and folder.is_dir()
+    board.config = replace(board.config, private_tmp=False)
+    other = board.add()
+    board.scan()
+    assert board.service.private_tmps[-1] is None
+    assert not (board.jobs.folder(board.get(other)) / job_scan.PRIVATE_TMP).exists()
+
+
+def test_the_private_tmp_is_removed_when_the_step_ends_even_with_read_only_folders(
+    board: Board,
+) -> None:
+    job_id = board.add()
+    board.scan()
+    private = board.jobs.folder(board.get(job_id)) / job_scan.PRIVATE_TMP
+    cache = private / "mod" / "v1"
+    cache.mkdir(parents=True)
+    (cache / "file").write_text("x", encoding="utf-8")
+    (private / "link").symlink_to(board.root)
+    cache.chmod(0o500)
+    (private / "mod").chmod(0o500)
+    board.kill(job_id)
+    board.scan()
+    # The dead step was confirmed and a new one started with an empty folder.
+    assert sorted(p.name for p in private.iterdir()) == []
+    assert (board.root / "src" / "intent.md").exists()
+
+
+def _run_capture(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None) -> list:
+    seen: list = []
+
+    def run(argv, **kwargs):
+        seen.append(argv)
+        if error:
+            raise error
+
+    monkeypatch.setattr(job_scan.subprocess, "run", run)
+    return seen
+
+
+def _unit_job() -> SimpleNamespace:
+    return SimpleNamespace(unit="taskwatch-j-a1.service", id="j", attempt=1)
+
+
+def test_the_start_argv_binds_the_private_tmp_in_a_user_namespace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seen = _run_capture(monkeypatch)
+    Systemd(tmp_path).start(_unit_job(), tmp_path / "private-tmp")
+    argv = seen[0]
+    assert "--property=PrivateUsers=yes" in argv
+    assert f"--property=BindPaths={tmp_path / 'private-tmp'}:/tmp" in argv
+    assert argv.index("--property=BindPaths=" + f"{tmp_path / 'private-tmp'}:/tmp") < argv.index(
+        sys.executable
+    )
+
+
+def test_the_start_argv_has_no_namespace_properties_without_a_private_tmp(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seen = _run_capture(monkeypatch)
+    Systemd(tmp_path).start(_unit_job())
+    assert not [item for item in seen[0] if "BindPaths" in item or "PrivateUsers" in item]
+
+
+def test_a_refused_private_tmp_start_names_the_switch(monkeypatch, tmp_path: Path) -> None:
+    error = subprocess.CalledProcessError(1, ["systemd-run"], stderr=b"Failed to set up user ns\n")
+    _run_capture(monkeypatch, error)
+    with pytest.raises(RuntimeError, match=r"Failed to set up user ns.*private_tmp") as info:
+        Systemd(tmp_path).start(_unit_job(), tmp_path / "private-tmp")
+    assert info.value.__cause__ is error
+    with pytest.raises(subprocess.CalledProcessError):
+        Systemd(tmp_path).start(_unit_job())
+
+
+def test_a_path_systemd_would_split_is_refused_before_starting(monkeypatch, tmp_path: Path) -> None:
+    seen = _run_capture(monkeypatch)
+    with pytest.raises(RuntimeError, match="cannot be bound"):
+        Systemd(tmp_path).start(_unit_job(), tmp_path / "a:b" / "private-tmp")
+    assert seen == []
+
+
+def test_a_failed_private_tmp_start_records_the_reason_in_the_event(board: Board) -> None:
+    job_id = board.add()
+    board.service.start_error = RuntimeError("private /tmp: user namespaces are off")
+    board.scan()
+    event = board.get(job_id).events[-1]
+    assert event["kind"] == "start_failed" and "user namespaces are off" in event["error"]
 
 
 # -- production adapter, with systemctl faked at the subprocess boundary ----------------------
