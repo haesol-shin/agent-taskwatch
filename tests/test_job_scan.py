@@ -1286,3 +1286,146 @@ def test_owner_land_resume_entries_are_distinct_and_preserve_evidence(
     assert second.events[0] == evidence
     assert second.land_state == first.land_state
     assert second.resume_stage == "land"
+
+
+def _stacked_board(board, *, follower_lands=True, base=True, approval=False):
+    make_repo(board.root, "stack")
+    first = board.add(target="stack", land=True, public_text=[{"id": "pr", "base": "HEAD"}])
+    second = board.add(
+        target="stack",
+        land=follower_lands,
+        public_text=[{"id": "pr", "base": f"@{board.get(first).receipt_key}"}]
+        if base
+        else [{"id": "pr", "base": "HEAD"}],
+        predecessors=[first],
+        approval_required=approval,
+        **({"base": f"@{board.get(first).receipt_key}"} if base else {}),
+    )
+    board.set(first, stage="land", unit="prior", last_progress_at=board.clock)
+    board.service.states["prior"] = "active"
+    return first, second
+
+
+@pytest.mark.parametrize(
+    "stage,lands,base,starts",
+    [
+        ("land", True, True, True),
+        ("check", True, True, False),
+        ("user_wait", True, True, False),
+        ("cancelled", True, True, False),
+        ("land", False, True, False),
+        ("land", True, False, False),
+    ],
+)
+def test_stacked_start_only_for_an_accepted_landing_base(board, stage, lands, base, starts):
+    first, second = _stacked_board(board, follower_lands=lands, base=base)
+    board.set(first, stage=stage)
+    launched = board.scan()
+    assert (second in launched) is starts
+    follower = board.get(second)
+    assert follower.stage == ("work" if starts else "queued")
+    if not starts:
+        assert follower.wait_reason == f"predecessor:{first}"
+
+
+@pytest.mark.parametrize("workspace_state", ["", "prepared", "active"])
+def test_stacked_start_after_merge_waits_for_install_unless_base_is_pinned(
+    board, monkeypatch, workspace_state
+):
+    first, second = _stacked_board(board)
+    board.set(second, workspace_state=workspace_state)
+    state = {"S": "a" * 40, "install": {"status": "started"}}
+    board.set(first, land_state=state)
+    if workspace_state:
+        assert board.scan() == [second]
+        assert board.get(second).stage == "work"
+        return
+    for _ in range(MAX_RECOVERIES + 1):
+        assert board.scan() == []
+    follower = board.get(second)
+    assert (follower.stage, follower.attempt, follower.recoveries) == ("queued", 0, 0)
+    assert follower.wait_reason == f"predecessor:{first}"
+    board.set(
+        first,
+        stage="user_wait",
+        unit="",
+        land_state={**state, "install": {"status": "failed"}},
+    )
+    assert board.scan() == []
+    board.set(first, stage="land", unit="prior", land_state=state)
+    assert board.scan() == []
+    assert board.get(second).attempt == board.get(second).recoveries == 0
+    board.set(
+        first,
+        stage="deliver_pending",
+        unit="",
+        land_state={**state, "install": {"status": "succeeded"}},
+    )
+    monkeypatch.setattr(job_scan, "deliver_job", lambda jobs, config, job, now: job)
+    assert board.scan() == [second]
+    assert board.get(second).stage == "work"
+
+
+def test_stacked_start_keeps_approval_and_other_predecessor_gates(board):
+    first, second = _stacked_board(board, approval=True)
+    other = board.add()
+    board.set(second, predecessors=(first, other))
+    assert second not in board.scan()
+    assert board.get(second).stage == "queued"
+    board.set(second, approval_required=False)
+    assert second not in board.scan()
+    assert board.get(second).wait_reason == f"predecessor:{other}"
+
+
+def test_land_wait_releases_slot_and_repository_until_predecessor_delivery(board, monkeypatch):
+    first, second = _stacked_board(board)
+    assert board.scan() == [second]
+    board.set(second, workspace_state="active")
+    board.set(first, stage="user_wait")
+    board.finish_step(second, "check")
+    assert board.scan() == [second]
+    board.finish_step(second, "land")
+    assert board.scan() == []
+    waiting = board.get(second)
+    assert (waiting.stage, waiting.unit, waiting.wait_reason) == (
+        "land",
+        "",
+        f"predecessor:{first}",
+    )
+    assert not waiting.land_state
+    assert any(e.get("kind") == "land_waiting" for e in waiting.events)
+    board.set(first, stage="land", unit="", ended_at=0)
+    assert board.scan() == [first]
+    assert board.get(first).land_state["repository_key"]
+    board.finish_step(first, "deliver_pending")
+    monkeypatch.setattr(job_scan, "deliver_job", lambda jobs, config, job, now: job)
+    assert board.scan() == [second]
+    assert board.get(second).stage == "land" and board.get(second).unit
+
+
+@pytest.mark.parametrize("waiting", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_predecessor_cancelled_parks_started_follower_after_confirmed_stop(
+    board, monkeypatch, waiting, missing
+):
+    first, second = _stacked_board(board)
+    board.scan()
+    board.set(second, workspace_state="active")
+    if waiting:
+        board.finish_step(second, "land")
+        board.scan()
+    board.set(first, stage="cancelled")
+    if missing:
+        load = board.jobs.load
+        monkeypatch.setattr(
+            board.jobs, "load", lambda: {k: v for k, v in load().items() if k != first}
+        )
+    unit = board.get(second).unit
+    board.service.stop_ok = False
+    board.scan()
+    follower = board.get(second)
+    assert (follower.stage, follower.wait_reason) == ("user_wait", "predecessor_cancelled")
+    assert follower.unit == unit
+    board.service.stop_ok = True
+    board.scan()
+    assert board.get(second).unit == ""

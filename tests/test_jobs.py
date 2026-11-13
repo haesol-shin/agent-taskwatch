@@ -859,3 +859,19 @@ def test_public_text_ref_still_matches_a_finished_nonlanding_predecessor(tmp_pat
         20,
     )
     assert second.public_text[0]["base"] == git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_receipt_base_adds_its_predecessor_once(tmp_path, explicit):
+    jobs = Jobs(tmp_path / "root")
+    first = jobs.submit(_code_payload(tmp_path, "parent"), 10)
+    second = jobs.submit(
+        _code_payload(
+            tmp_path,
+            "child",
+            base="@parent",
+            predecessors=[first.id] if explicit else [],
+        ),
+        20,
+    )
+    assert jobs.load()[second.id].predecessors == (first.id,)

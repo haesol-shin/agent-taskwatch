@@ -526,3 +526,13 @@ def test_cached_quiet_completion_does_not_hide_later_storage_corruption(tmp_path
             clock=lambda: now[0],
             sleep=sleep,
         )
+
+
+def test_land_wait_is_visible_as_blocked_behind_owner_attention(tmp_path):
+    root, jobs, prior = _waiting(tmp_path)
+    child = jobs.submit(payload(tmp_path, receipt="child") | {"predecessors": [prior.id]}, 3)
+    jobs.save(replace(child, stage="land", wait_reason=f"predecessor:{prior.id}", unit=""), 4)
+    code, text = job_watch.needs(root)
+    assert code == 0 and "BLOCKED" in text and f"job {child.id} land behind" in text
+    jobs.save(replace(prior, stage="land"), 5)
+    assert child.id not in job_watch.needs(root)[1]

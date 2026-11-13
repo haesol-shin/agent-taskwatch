@@ -618,6 +618,8 @@ def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix
         if pred.review != "code" or pred.review_target is not None:
             raise ValueError(f"base {base} is not a code job that builds a branch")
         data["base"] = pred.branch or f"{prefix}{pred.id[:8]}"
+        if pred.id not in predecessors:
+            predecessors.append(pred.id)
         data["base_predecessor"] = pred.id
         if pred.land:
             from .job_env import job_environment

@@ -237,6 +237,8 @@ class _Scan:
         self.all = self.jobs.load()
         self.order = [job.id for job in sorted(self.all.values(), key=_rank)]
         for identifier in self.order:
+            self._follow(self.all[identifier])
+        for identifier in self.order:
             self._tend(self.all[identifier])
         for identifier in self.order:
             self._gate(self.all[identifier])
@@ -249,6 +251,14 @@ class _Scan:
             if _is_pending(job) and not (job.stage == "queued" and job.approval_required):
                 self._admit(job)
         return self.launched
+
+    def _follow(self, job: JobState) -> None:
+        if (
+            job.stage in SLOT_STAGES
+            and job.base_predecessor
+            and self._stage(job.base_predecessor) in {"cancelled", "missing"}
+        ):
+            self._park(job, "predecessor_cancelled")
 
     def _gate(self, job: JobState) -> None:
         """Ask the owner only once every predecessor is `done`, so the brief exists first."""
@@ -399,7 +409,9 @@ class _Scan:
         """A step ended and its service is dead: start the next step, or wait out a rate limit.
 
         A job cooling down gives its slot back but keeps its target."""
-        if job.retry_not_before > self.now:
+        if job.stage == "land" and (waiting := self._predecessor_wait(job)):
+            self._save(self._event(replace(job, unit="", wait_reason=waiting), "land_waiting"))
+        elif job.retry_not_before > self.now:
             self._save(self._event(replace(job, unit=""), "cooling", until=job.retry_not_before))
         else:
             self._launch(job, job.stage)
@@ -410,21 +422,40 @@ class _Scan:
         reason = self._blocker(job)
         if reason is None:
             self._launch(job, _launch_stage(job))
-        elif job.stage == "queued" and job.wait_reason != reason:
+        elif job.stage in {"queued", "land"} and job.wait_reason != reason:
             self._save(replace(job, wait_reason=reason))
 
     def _blocker(self, job: JobState) -> str | None:
         if job.unit:
             return "unit"
-        for pred in job.predecessors:
-            if pred not in self.all or self.all[pred].stage not in DONE_STAGES:
-                return f"predecessor:{pred}"
+        if waiting := self._predecessor_wait(job):
+            return waiting
         if job.retry_not_before > self.now:
             return "cooling"
         slots, targets = self._busy(job)
         if _shared_target(job) and job.target in targets:
             return "target"
         return "slot" if slots >= self.config.slots else None
+
+    def _predecessor_wait(self, job: JobState) -> str | None:
+        for identifier in job.predecessors:
+            prior = self.all.get(identifier)
+            if prior is not None and (
+                prior.stage in DONE_STAGES
+                or (
+                    _launch_stage(job) != "land"
+                    and identifier == job.base_predecessor
+                    and job.land
+                    and prior.land
+                    and (
+                        job.workspace_state in {"prepared", "active"}
+                        or (prior.stage == "land" and not prior.land_state.get("S"))
+                    )
+                )
+            ):
+                continue
+            return f"predecessor:{identifier}"
+        return None
 
     def _busy(self, job: JobState) -> tuple[int, set[str]]:
         """Occupied slots, and the targets other jobs hold: a running service holds both, a job

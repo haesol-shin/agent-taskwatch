@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Changed
+- Landing code jobs with a receipt base start on the predecessor's accepted result while it waits to merge, then wait without execution resources before their own landing. A moved main replays only the successor's diff and requires fresh checks and review; conflicts and cancelled predecessors stop for owner attention ([chains](docs/configuration.md#chains-and-gates), [landing](docs/configuration.md#automatic-landing)).
 - Each job step starts with a private `/tmp` backed by a `private-tmp` folder in the job folder (`PrivateUsers=yes` and `BindPaths`), so a fixed `/tmp/<name>` write goes to disk, stays per job and is deleted when the step ends. The unit uses `--service-type=exec`, so a refused namespace or bind fails the start itself. Set `"private_tmp": false` in `jobs-config.json` on a host without user namespaces; a refused start records `start_failed` with the reason and a hint naming that key ([configuration](docs/configuration.md#private-tmp)).
 - A code job may set `spec_mode` to `task_file` when a reviewed task file already settled the plan: submit then requires only four spec headings, and the reviewer may answer five `design_check` keys `na` with the reason `settled by the task file`. The default `full` and existing records are unchanged ([task-file mode](docs/spec-template.md#task-file-mode)).
 

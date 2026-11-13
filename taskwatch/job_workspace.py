@@ -108,9 +108,17 @@ def _base(job: JobState, env: Mapping[str, str]) -> tuple[str, str]:
 def verified_predecessor_base(
     target: str, predecessor: JobState, env: Mapping[str, str]
 ) -> str | None:
-    """Resolve a landed predecessor only after readiness, tree and install verification."""
+    """Resolve an accepted tip, or a landed base after tree and install verification."""
     if not predecessor.land:
         return None
+    if predecessor.stage == "land" and not predecessor.land_state.get("S"):
+        if repository_key(target, env) != repository_key(predecessor.target, env):
+            raise WorkspaceError("base predecessor belongs to a different repository")
+        tip = _resolve(target, env, f"refs/heads/{predecessor.branch}")
+        reviewed = predecessor.reviews[-1].get("fingerprint") if predecessor.reviews else None
+        if tip is None or tip != reviewed:
+            raise WorkspaceError("base predecessor tip differs from its accepted review")
+        return tip
     state = predecessor.land_state
     sha, tree = state.get("S", ""), state.get("T", "")
     if (
