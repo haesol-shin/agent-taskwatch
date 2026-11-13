@@ -642,6 +642,36 @@ def test_host_install_command_is_optional_argv(tmp_path, command):
 
 
 @pytest.mark.parametrize(
+    "hooks",
+    [
+        [],
+        {"forge.invalid/owner/repo": None},
+        {"forge.invalid/owner/repo": []},
+        {"forge.invalid/owner/repo": ["wrapper"]},
+        {"forge.invalid/owner/repo": ["sh", "-c", "install {sha}"]},
+        {"forge.invalid/owner/repo": ["wrapper", "{other}"]},
+        {"https://forge.invalid/owner/repo": ["wrapper", "{sha}"]},
+        {"forge.invalid/owner/repo.git": ["wrapper", "{sha}"]},
+        {"forge.invalid/owner/repo/extra": ["wrapper", "{sha}"]},
+        {"forge.invalid/owner/..": ["wrapper", "{sha}"]},
+        {
+            "forge.invalid/Owner/Repo": ["wrapper", "{sha}"],
+            "forge.invalid/owner/repo": ["other", "{sha}"],
+        },
+    ],
+)
+def test_repository_install_commands_reject_invalid_entries_at_load(tmp_path, hooks):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["install_commands"] = hooks
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="install_commands"):
+        load_job_config(root)
+
+
+@pytest.mark.parametrize(
     "extra,mode,command",
     [
         ({}, "rpc", None),

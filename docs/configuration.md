@@ -22,7 +22,7 @@ All keys shown above except `max_reviews` are required. The three numeric settin
 
 `max_reviews` limits the reviews of one cycle; see [Review limit](#review-limit).
 
-`install_command` is optional and defaults to `null`; [Automatic landing](#automatic-landing) owns its host-only argv contract, frozen identity and explicit retry rules.
+`install_command` is optional and defaults to `null`; optional `install_commands` selects hooks by repository identity instead. [Host install command](#host-install-command) owns their host-only argv contract, selection, frozen identity and explicit retry rules.
 
 Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run independent reviews with a different command prefix. Like `omp_command`, it must be a nonempty list of nonempty strings. When omitted, RPC reviews use `omp_command`. With the default `review_mode` (`"rpc"`), review commands receive `--mode rpc --no-ui`. The `init` draft omits this optional key. Work and fix select their command through [Worker execution](#worker-execution).
 
@@ -372,15 +372,21 @@ The checked `text_contract: 2` marker is generated after work/check/review, not 
 
 #### Host install command
 
-The optional host `jobs-config.json` key `install_command` defaults to `null` (disabled). When enabled it is a nonempty argv list of nonempty strings, not a shell command or per-job executable override. Include `{sha}` for the full observed squash commit S; optional `{target}` expands to the persisted absolute repository target, which is also the working directory. For example, a host-trusted wrapper can be configured as:
+The optional host `jobs-config.json` key `install_commands` is an object from repository identity (`host/owner/name`, as printed by `forge.Repository`) to a nonempty argv list of nonempty strings. Keys are case-insensitive, must contain exactly a host, owner and repository without a URL scheme or `.git` suffix, and cannot duplicate another key after case folding. Each entry uses the same argv validation as `install_command`; invalid identities, null entries and invalid argv are configuration errors at load time. An empty object is valid and disables installation for every repository.
 
 ```json
-"install_command": ["approved-installer", "--sha", "{sha}", "--target", "{target}"]
+"install_commands": {
+  "forge.invalid/owner/tool": ["approved-installer", "--sha", "{sha}", "--target", "{target}"]
+}
 ```
 
-A recognizable pinned source is an argv element that is a `git+https` or `git+ssh` URL ending `@{sha}`, or an HTTPS GitHub archive URL containing `{sha}`. Its host, owner and repository must match the transaction origin and its expanded pin must be S, otherwise execution is rejected. Any other argv is a host-trusted wrapper: its contract is to verify the target's origin and exact S before installation, never install a mutable checkout. Selection follows argv shape, not a mode flag. taskwatch does not prove wrapper correctness or infer it from the executable's name.
+When `install_commands` is an object, landing selects only the transaction repository's entry; no entry freezes installation as `disabled`, with no fallback to `install_command`. This explicit opt-in replaces host-wide selection, including for plain wrappers whose source cannot be recognized. Omitting the mapping or setting it to `null` retains the legacy host-wide `install_command` list, which defaults to `null` (disabled); the generated `init` configuration sets `install_commands` to `null`. Existing frozen land records retain their command and hash; introducing the mapping must preserve their selected argv, or those transactions stop as `land_hook_changed`.
 
-The hook identity, expanded argv and hash are frozen for the transaction, including when the hook is disabled. A changed or disabled host configuration parks as `land_hook_changed`; resume cannot adopt a replacement. Restore the frozen configuration or cancel. Execution uses the job environment, noninteractive stdin, captured exit/log and an independent 300 second timeout, with no implicit shell. This is separate from L5's CI deadline.
+Both forms are host configuration, not a shell command or per-job executable override. Include `{sha}` for the full observed squash commit S; optional `{target}` expands to the persisted absolute repository target, which is also the working directory. A legacy wrapper configuration is `"install_command": ["approved-installer", "--sha", "{sha}", "--target", "{target}"]`.
+
+A recognizable pinned source is an argv element that is a `git+https` or `git+ssh` URL ending `@{sha}`, or an HTTPS GitHub archive URL containing `{sha}`. Its host, owner and repository must match the transaction origin and its expanded pin must be S, otherwise execution is rejected. Any other argv is a host-trusted wrapper: its contract is to verify the target's origin and exact S before installation, never install a mutable checkout. Source verification follows argv shape, not a mode flag. taskwatch does not prove wrapper correctness or infer it from the executable's name.
+
+Only the selected hook identity, expanded argv and hash are frozen for the transaction, including when the hook is disabled. Changing another repository's entry does not affect it. A change to the selected argv, including enabling or disabling it, parks as `land_hook_changed`; resume cannot adopt a replacement. Restore the frozen selection or cancel. Execution uses the job environment, noninteractive stdin, captured exit/log and an independent 300 second timeout, with no implicit shell. This is separate from L5's CI deadline.
 
 #### Lifecycle L1 through L8
 

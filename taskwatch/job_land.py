@@ -176,9 +176,7 @@ class Transaction:
             if self.state["repo"] != asdict(repo):
                 raise LandStop("land_pr_mismatch", "repository identity or capabilities changed")
         else:
-            hook = (
-                list(self.ctx.config.install_command) if self.ctx.config.install_command else None
-            )
+            hook = selected_install_command(self.ctx.config, repo)
             self.save(
                 identity=identity,
                 phase="accepted",
@@ -459,9 +457,7 @@ class Transaction:
             raise LandStop(
                 "land_hook_changed", "current install configuration is unreadable"
             ) from exc
-        configured = (
-            list(current_config.install_command) if current_config.install_command else None
-        )
+        configured = selected_install_command(current_config, self.repo)
         if digest(configured) != hook["command_hash"]:
             raise LandStop("land_hook_changed", "restore frozen install configuration or cancel")
         if hook["status"] in {"succeeded", "disabled"}:
@@ -528,6 +524,15 @@ class Transaction:
 
 class FreshnessRequeued(Exception):
     pass
+
+
+def selected_install_command(config, repo):
+    command = (
+        config.install_command
+        if config.install_commands is None
+        else config.install_commands.get(repo.identity.lower())
+    )
+    return list(command) if command else None
 
 
 def install_argv(command, sha, target, repo):
