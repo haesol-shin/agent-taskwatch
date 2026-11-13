@@ -84,6 +84,8 @@ P0 and P1 block. P2 and P3 do not. A rule break is P0 only when it is about runt
 - `portability`: the paths, layout, tools and accounts the change assumes about other users.
 - `choices`: the writer's choices that the owner did not ask for, including those the spec leaves unlisted. For a design job, judge each `decided` item of `choices.json` against the four tests in `docs/jobs/design.md`, and report one that passes all four as a missing pick.
 
+When the review message says `Spec mode: task_file`, the spec has only four headings because a reviewed task file settled the rest. `root_cause`, `one_home` and `choices` are answered as above from evidence in the result. `alternatives`, `overlaps`, `needed_now`, `repeated_judgment` and `portability` may be `na` with the reason `settled by the task file: <the task-file item that settles it>`; the item makes each reason differ from the key before it. If the result shows one of them was not settled, answer it as above. Every key is still present and nothing about the reporting bar changes.
+
 You may judge a writer's choice. You may not override an owner decision: when a quoted owner decision covers the choice, answer `ok` and state any concern as P3. When the decision rests on a premise you can show is false, report it as a P2 finding with the rule `premise` (category `evidence`) for the owner, not as a blocker. A writer's choice is P1 only when you show that it contradicts the intent, the approval scope or a verified fact; otherwise it is P2, and the fix is a spec revision.
 
 ## Brief
