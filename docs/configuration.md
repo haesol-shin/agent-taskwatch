@@ -372,7 +372,7 @@ The checked `text_contract: 2` marker is generated after work/check/review, not 
 
 #### Host install command
 
-The optional host `jobs-config.json` key `install_commands` is an object from repository identity (`host/owner/name`, as printed by `forge.Repository`) to a nonempty argv list of nonempty strings. Keys are case-insensitive, must contain exactly a host, owner and repository without a URL scheme or `.git` suffix, and cannot duplicate another key after case folding. Each entry uses the same argv validation as `install_command`; invalid identities, null entries and invalid argv are configuration errors at load time. An empty object is valid and disables installation for every repository.
+The optional host `jobs-config.json` key `install_commands` is an object from repository identity (`host/owner/name`, as printed by `forge.Repository`) to a nonempty argv list of nonempty strings. Keys are case-insensitive in the host, owner and repository parts, must contain exactly a host, owner and repository without a URL scheme or `.git` suffix, and cannot duplicate another key after case folding. Each entry uses the same argv validation as `install_command`; invalid identities, null entries and invalid argv are configuration errors at load time. An empty object is valid and disables installation for every repository.
 
 ```json
 "install_commands": {
@@ -380,7 +380,7 @@ The optional host `jobs-config.json` key `install_commands` is an object from re
 }
 ```
 
-When `install_commands` is an object, landing selects only the transaction repository's entry; no entry freezes installation as `disabled`, with no fallback to `install_command`. This explicit opt-in replaces host-wide selection, including for plain wrappers whose source cannot be recognized. Omitting the mapping or setting it to `null` retains the legacy host-wide `install_command` list, which defaults to `null` (disabled); the generated `init` configuration sets `install_commands` to `null`. Existing frozen land records retain their command and hash; introducing the mapping must preserve their selected argv, or those transactions stop as `land_hook_changed`.
+When `install_commands` is an object, landing selects only the transaction repository's entry; no entry freezes installation as `disabled`, with no fallback to `install_command`. This explicit opt-in replaces host-wide selection, including for plain wrappers whose source cannot be recognized. Omitting the mapping or setting it to `null` retains the legacy host-wide `install_command` list, which defaults to `null` (disabled); the generated `init` configuration omits both `install_command` and `install_commands`. Existing frozen land records retain their command and hash; introducing the mapping must preserve their selected argv, or those transactions stop as `land_hook_changed`.
 
 Both forms are host configuration, not a shell command or per-job executable override. Include `{sha}` for the full observed squash commit S; optional `{target}` expands to the persisted absolute repository target, which is also the working directory. A legacy wrapper configuration is `"install_command": ["approved-installer", "--sha", "{sha}", "--target", "{target}"]`.
 

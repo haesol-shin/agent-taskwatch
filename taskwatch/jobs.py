@@ -221,7 +221,7 @@ def _install_commands(value: object) -> Mapping[str, tuple[str, ...]] | None:
     commands = {}
     for key, command in value.items():
         try:
-            host = key.split("/", 1)[0]
+            host = key.split("/", 1)[0].lower()
             identity = "/".join(forge.parse_origin(f"https://{key}", (host,))).lower()
             if identity != key.lower() or identity in commands:
                 raise ValueError("noncanonical or duplicate repository identity")
