@@ -671,6 +671,25 @@ def test_repository_install_commands_reject_invalid_entries_at_load(tmp_path, ho
         load_job_config(root)
 
 
+def test_repository_install_commands_fold_the_whole_identity_case(tmp_path):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["install_commands"] = {"Forge.Invalid/Owner/Repo": ["wrapper", "{sha}"]}
+    path.write_text(json.dumps(config), encoding="utf-8")
+    loaded = load_job_config(root).install_commands
+    assert loaded == {"forge.invalid/owner/repo": ("wrapper", "{sha}")}
+
+
+def test_init_omits_the_optional_install_keys(tmp_path):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    written = json.loads((root / "taskwatch" / "jobs-config.json").read_text(encoding="utf-8"))
+    assert "install_command" not in written
+    assert "install_commands" not in written
+
+
 @pytest.mark.parametrize(
     "extra,mode,command",
     [

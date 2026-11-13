@@ -332,6 +332,7 @@ def _init(root: Path, unit_dir: Path | None) -> dict:
     data.pop("language")
     data.pop("review_mode")
     data.pop("install_command")
+    data.pop("install_commands")
     data.pop("worker_mode")
     data.pop("worker_command")
     data.pop("private_tmp")
