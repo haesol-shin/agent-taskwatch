@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -206,6 +206,7 @@ class Transaction:
     def base_guard(self):
         main = self.fetch_main()
         if main != self.state["B"] and not self.predecessor_base(main):
+            self.replay(main)
             raise LandStop("land_base_moved", "fresh default branch differs from accepted base")
         if self.state.get("M") and self.state["M"] != main:
             raise LandStop("land_base_moved", "default branch changed during landing")
@@ -228,6 +229,89 @@ class Transaction:
             ):
                 return True
         return False
+
+    def replay(self, main):
+        job = self.current()
+        prior = self.ctx.jobs.load().get(job.base_predecessor)
+        state = prior.land_state if prior else {}
+        entry = resume_entry(job)
+        count = sum(
+            event.get("type") == "land_replay" and event.get("entry") == entry
+            for event in job.events
+        )
+        if (
+            prior is None
+            or prior.stage not in {"deliver_pending", "done"}
+            or state.get("tree_verified") is not True
+            or state.get("repository_key") != self.state["repository_key"]
+            or state.get("install", {}).get("status") not in {"succeeded", "disabled"}
+            or not state.get("S")
+            or any(self.state.get(key) for key in ("H", "push_intent", "S"))
+            or count >= 2
+        ):
+            return
+        try:
+            self.git("merge-base", "--is-ancestor", state["S"], main)
+            tree = self.git(
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                f"--merge-base={job.base}",
+                main,
+                self.state["R"],
+            ).splitlines()[0]
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode == 1 and exc.stdout:
+                raise LandStop("land_replay_conflict", "stack replay conflicts with main") from None
+            return
+        if tree == self.git("rev-parse", f"{main}^{{tree}}"):
+            return
+        commit = self.git(
+            "commit-tree",
+            tree,
+            "-p",
+            main,
+            stdin=job_text.squash_message(self.title, self.commit),
+        )
+        self.save(
+            replay={
+                "base": job.base,
+                "onto": main,
+                "from": self.state["R"],
+                "tree": tree,
+                "commit": commit,
+            }
+        )
+        self.finish_replay()
+
+    def finish_replay(self):
+        from .job_runner import _apply, _event, _requeue
+
+        replay = self.state["replay"]
+        job = self.current()
+        head = self.git("-C", job.workspace, "rev-parse", "HEAD")
+        if (
+            self.git("-C", job.workspace, "status", "--porcelain")
+            or head not in {replay["from"], replay["commit"]}
+            or job.base != replay["base"]
+        ):
+            raise LandStop("land_review_stale", "workspace changed during stack replay")
+        if head != replay["commit"]:
+            self.git("-C", job.workspace, "reset", "--hard", replay["commit"])
+        _apply(
+            self.ctx,
+            lambda j: {
+                **_requeue(replace(j, recoveries=0)),
+                "base": replay["onto"],
+                "public_text": [{**j.public_text[0], "base": replay["onto"]}],
+                "land_state": {},
+                "recoveries": 0,
+                "reviews_used": 0,
+                "review_cycle_start": len(j.reviews),
+                "events": _event(j, type="land_replay", entry=resume_entry(j), **replay),
+            },
+        )
+        raise FreshnessRequeued
 
     def push_target(self):
         urls = self.git("remote", "get-url", "--push", "--all", "origin").splitlines()
@@ -490,6 +574,8 @@ class Transaction:
             raise LandStop("land_install_failed", outcome["error"])
 
     def run(self):
+        if self.state.get("replay"):
+            self.finish_replay()
         self.initialize()
         if (
             not self.state.get("S")

@@ -219,7 +219,10 @@ def _items(rows: dict[str, dict]) -> list[_Item]:
             items.append(
                 _Item((ident, stage, job.get("wait_reason", ""), entry), "NEEDS YOU", ident)
             )
-        elif stage == "queued" and (blocker := _blocker(job, rows)):
+        elif (
+            stage == "queued"
+            or (stage == "land" and job.get("wait_reason", "").startswith("predecessor:"))
+        ) and (blocker := _blocker(job, rows)):
             items.append(_Item((ident, stage, blocker, entry), "BLOCKED", ident, blocker))
         elif stage == "done":
             items.append(_Item((ident, stage, "", entry), _SECTIONS[3], ident))
@@ -461,7 +464,7 @@ def _lines(root: Path, rows: dict[str, dict], item: _Item) -> list[str]:
     cmd = f"taskwatch --root {_line(root)}"
     job_type = job_type_label(job)
     if item.section == "BLOCKED":
-        return [f"job {job.id} queued behind {item.blocker}"]
+        return [f"job {job.id} {job.stage} behind {item.blocker}"]
     review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
     if item.section == "GATE":
         return _gate_lines(root, rows, job, job_type, cmd)

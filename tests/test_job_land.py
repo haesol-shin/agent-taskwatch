@@ -1638,3 +1638,156 @@ def test_missing_pr_reconciliation_never_creates_before_rechecking_moved_base(ma
     lab.park("land_base_moved")
     assert len(lab.forge()["created"]) == 1 and not lab.forge()["pulls"]
     assert lab.writes() == ["pr create"] and lab.hook_calls() == []
+
+
+def _accepted_stack(make):
+    first = make()
+    first.accept()
+    second = make(share=first, receipt="k2", base="@k1", public_base="@k1")
+    second.accept()
+    assert second.get().base == first.get().reviews[-1]["fingerprint"]
+    cleaned_forge(second)
+    return first, second
+
+
+def _land_direct(lab, expected=0):
+    lab.config = load_job_config(lab.root)
+    assert lab.run("land") == expected
+    return lab.get()
+
+
+def _move_main(lab, name="external.txt", text="external\n"):
+    git(lab.repo, "fetch", "origin")
+    git(lab.repo, "reset", "--hard", "origin/main")
+    (lab.repo / name).write_text(text, encoding="utf-8")
+    git(lab.repo, "add", name)
+    git(lab.repo, "commit", "-m", "fix(x): change main\n\n- Keep independent work")
+    git(lab.repo, "push", "origin", "main")
+    return git(lab.repo, "rev-parse", "HEAD")
+
+
+def test_stacked_tree_preserved_publishes_only_after_parent_lands(make):
+    first, second = _accepted_stack(make)
+    tree = git(second.tree, "rev-parse", "HEAD^{tree}")
+    # Model the predecessor's live land service without starting another land process.
+    first.jobs.save(
+        replace(first.get(), unit="prior", ended_at=0, last_progress_at=time.time()), time.time()
+    )
+    service = SimpleNamespace(
+        status=lambda unit: "active" if unit == "prior" else "inactive",
+        stop=lambda unit: False,
+    )
+    scan_jobs(second.jobs, load_job_config(second.root), now=time.time(), service=service)
+    assert second.get().unit == ""
+    assert second.get().wait_reason == f"predecessor:{first.job.id}"
+    cleaned_forge(second)
+    assert _land_direct(first).stage == "deliver_pending"
+    squash = first.land()["S"]
+    assert _land_direct(second).stage == "deliver_pending"
+    state = second.land()
+    assert git(second.bare, "rev-parse", f"{state['H']}^") == squash
+    assert git(second.bare, "rev-parse", f"{state['H']}^{{tree}}") == tree
+    assert state["T"] == tree and state["pr"]["number"] == 18
+    assert second.writes() == ["pr create", "pr merge"] * 2
+
+
+def test_stacked_replay_rechecks_only_child_diff_on_moved_main(make):
+    first, second = _accepted_stack(make)
+    _land_direct(first)
+    main = _move_main(first)
+    before = second.writes()
+    old = second.get()
+    job = _land_direct(second)
+    assert job.stage == job.resume_stage == "check"
+    assert job.base == job.public_text[0]["base"] == main
+    assert job.reviews_used == job.recoveries == job.review_inflight == 0
+    assert job.review_cycle_start == len(old.reviews)
+    assert not job.land_state and second.writes() == before
+    assert git(second.tree, "rev-parse", "HEAD^") == main
+    assert (second.tree / "external.txt").read_text() == "external\n"
+    assert (second.tree / "k1.txt").read_text() == "one\n"
+    assert (second.tree / "k2.txt").read_text() == "one\n"
+    assert git(second.tree, "diff", "--name-only", main, "HEAD") == "k2.txt"
+    replay = next(e for e in job.events if e.get("type") == "land_replay")
+    assert git(second.tree, "rev-parse", "HEAD") == replay["commit"]
+    assert second.run("check") == 0
+    second.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
+    assert second.run("review") == 0
+    _land_direct(second)
+    assert second.get().stage == "deliver_pending"
+    assert second.land()["M"] == main and second.land()["R"] == replay["commit"]
+    assert second.writes() == ["pr create", "pr merge"] * 2
+
+
+def test_stacked_replay_conflict_keeps_workspace_and_publication_untouched(make):
+    first, second = _accepted_stack(make)
+    _land_direct(first)
+    _move_main(first, "k2.txt", "different\n")
+    head = git(second.tree, "rev-parse", "HEAD")
+    before = second.writes()
+    job = _land_direct(second, expected=1)
+    assert (job.stage, job.wait_reason) == ("user_wait", "land_replay_conflict")
+    assert git(second.tree, "rev-parse", "HEAD") == head
+    assert "replay" not in job.land_state and "H" not in job.land_state
+    assert job.base == second.get().reviews[-1]["texts"]["pr"]["base"]
+    assert second.writes() == before
+
+
+@pytest.mark.parametrize("when", ["before:reset", "after:reset"])
+def test_stacked_replay_restart_reuses_saved_commit(make, when):
+    first, second = _accepted_stack(make)
+    _land_direct(first)
+    main = _move_main(first)
+    second.trap(when)
+    second.scan_once()
+    second.service.wait()
+    intent = second.land()["replay"]
+    assert second.get().stage == "land"
+    assert git(second.tree, "rev-parse", "HEAD") == (
+        intent["from"] if when == "before:reset" else intent["commit"]
+    )
+    job = second.drive(lambda j: j.stage == "check", rounds=1)
+    assert job.base == main and not job.land_state
+    assert git(second.tree, "rev-parse", "HEAD") == intent["commit"]
+    events = [e for e in job.events if e.get("type") == "land_replay"]
+    assert len(events) == 1 and events[0]["commit"] == intent["commit"]
+    assert second.writes() == ["pr create", "pr merge"]
+
+
+@pytest.mark.parametrize("owner_input", [False, True])
+def test_stacked_replay_restart_budget_requires_a_new_owner_entry(make, owner_input):
+    first, second = _accepted_stack(make)
+    _land_direct(first)
+    _move_main(first)
+    job = second.get()
+    events = (*job.events, *({"type": "land_replay", "entry": 0} for _ in range(2)))
+    if owner_input:
+        events = (*events, {"type": "resume"})
+    second.jobs.save(replace(job, events=events), time.time())
+    job = _land_direct(second, expected=0 if owner_input else 1)
+    assert job.stage == ("check" if owner_input else "user_wait")
+    if not owner_input:
+        assert job.wait_reason == "land_base_moved"
+    assert second.writes() == ["pr create", "pr merge"]
+
+
+@pytest.mark.parametrize("tree_changed", [False, True])
+def test_stacked_predecessor_fixed_uses_final_tree_at_landing(make, tree_changed):
+    first, second = _accepted_stack(make)
+    if tree_changed:
+        (first.tree / "k1.txt").write_text("revised\n", encoding="utf-8")
+        git(first.tree, "add", "k1.txt")
+        git(first.tree, "commit", "-m", "fix(x): revise\n\n- Preserve corrected input")
+    else:
+        git(first.tree, "commit", "--allow-empty", "-m", "fix(x): explain\n\n- Explain input")
+    assert first.run("check") == 0
+    first.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
+    assert first.run("review") == 0
+    _land_direct(first)
+    job = _land_direct(second)
+    assert job.stage == ("check" if tree_changed else "deliver_pending")
+    if tree_changed:
+        assert (second.tree / "k1.txt").read_text() == "revised\n"
+        assert (second.tree / "k2.txt").read_text() == "one\n"
+    else:
+        assert second.land()["M"] == first.land()["S"]

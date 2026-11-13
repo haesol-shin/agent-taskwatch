@@ -596,3 +596,36 @@ def test_public_text_receipt_base_resolves_with_the_job_base(tmp_path, remote):
         public_text=[{"id": "result", "base": "HEAD"}],
     )
     assert "public_text" not in job_workspace.prepare(pinned, ENV, jobs)
+
+
+@pytest.mark.parametrize("damage", ["none", "tip", "review", "repository"])
+def test_accepted_tip_pins_workspace_and_public_text_together(tmp_path, remote, damage):
+    jobs, prior = _landed_predecessor(tmp_path, remote)
+    accepted = prior.land_state["S"]
+    git(remote.target, "branch", prior.branch, accepted)
+    prior = replace(prior, stage="land", land_state={}, reviews=({"fingerprint": accepted},))
+    jobs.save(prior, 2001)
+    successor = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="child",
+        base="@predecessor",
+        land=True,
+        public_text=[{"id": "pr", "base": "@predecessor"}],
+    )
+    if damage == "tip":
+        git(remote.target, "branch", "-f", prior.branch, "HEAD")
+    elif damage == "review":
+        jobs.save(replace(prior, reviews=()), 2002)
+    elif damage == "repository":
+        successor = replace(successor, target=str(remote.other))
+    if damage != "none":
+        with pytest.raises(job_workspace.WorkspaceError, match="predecessor"):
+            job_workspace.prepare(successor, ENV, jobs)
+        return
+    prepared = job_workspace.prepare(successor, ENV, jobs)
+    assert prepared["base"] == prepared["public_text"][0]["base"] == accepted
+    pinned = replace(successor, **prepared)
+    path = tmp_path / "child-worktree"
+    job_workspace.create(pinned, path, JobConfig(), ENV, jobs)
+    assert git(path, "rev-parse", "HEAD") == accepted
