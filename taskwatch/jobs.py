@@ -134,6 +134,8 @@ class JobState:
     texts: Mapping[str, Mapping] = field(default_factory=dict)
     land: bool = False
     land_state: Mapping = field(default_factory=dict)
+    # Code jobs: "full" answers every spec heading, "task_file" only SPEC_TASK_FILE_HEADINGS.
+    spec_mode: str = "full"
     # Attempts already present when upgrading pre-print records remain RPC.
     legacy_worker_attempt: int = 0
 
@@ -431,6 +433,7 @@ _OPTIONAL_FIELDS = {
     "max_reviews",
     "public_text",
     "land",
+    "spec_mode",
 }
 UNIT_FILES = ("title.txt", "body.md", "commit.txt")
 # Optional public_text key: the repository requires the squash commit body to be blank.
@@ -455,6 +458,14 @@ SPEC_HEADINGS = (
     "Units",
     "Public text",
 )
+# A spec_mode "task_file" job comes from a task file that already settled the rest.
+SPEC_MODES = ("full", "task_file")
+SPEC_TASK_FILE_HEADINGS = (
+    "Purpose and cause",
+    "Owner decisions and asks",
+    "Writes outside the workspace",
+    "Public text",
+)
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _HEADING_LINE = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 
@@ -468,10 +479,10 @@ def spec_sections(text: str) -> dict[str, str]:
     return sections
 
 
-def spec_problems(text: str) -> list[str]:
+def spec_problems(text: str, mode: str = "full") -> list[str]:
     sections = spec_sections(text)
     problems = []
-    for name in SPEC_HEADINGS:
+    for name in SPEC_TASK_FILE_HEADINGS if mode == "task_file" else SPEC_HEADINGS:
         body = sections.get(name)
         if body is None:
             problems.append(f"missing heading: {name}")
@@ -484,10 +495,18 @@ def spec_problems(text: str) -> list[str]:
     return problems
 
 
-def _spec_template(spec: str) -> None:
-    problems = spec_problems(Path(spec).read_text(encoding="utf-8"))
+def _spec_template(spec: str, mode: str) -> None:
+    problems = spec_problems(Path(spec).read_text(encoding="utf-8"), mode)
     if problems:
         raise ValueError(f"the spec does not follow docs/spec-template.md: {'; '.join(problems)}")
+
+
+def _spec_mode_field(data: dict, review_only: bool) -> None:
+    if "spec_mode" in data and (data["review"] != "code" or review_only):
+        raise ValueError("spec_mode applies only to code jobs that build a result")
+    data.setdefault("spec_mode", "full")
+    if data["spec_mode"] not in SPEC_MODES:
+        raise ValueError(f"spec_mode must be one of: {', '.join(SPEC_MODES)}")
 
 
 def _land_field(data: dict, review_only: bool) -> None:
@@ -519,12 +538,13 @@ def _submission(payload: dict) -> dict:
     data["target"] = str(Path(data["target"]).resolve(strict=True))
     if not Path(data["target"]).is_dir():
         raise ValueError("target must be a directory")
+    _spec_mode_field(data, review_only)
     if review_only:
         _review_fields(data)
     else:
         _work_fields(data)
         if data["review"] in SPEC_REVIEWS:
-            _spec_template(data["spec"])
+            _spec_template(data["spec"], data["spec_mode"])
     if "base" in data:
         _base_field(data, review_only)
     if "public_text" in data:
@@ -926,6 +946,8 @@ def _validate_controls(job: dict) -> None:
     for key in ("base", "base_note", "branch", "workspace_state", "branch_state"):
         if not isinstance(job.get(key, ""), str):
             raise RecordError(f"jobs.jsonl: invalid {key}")
+    if job.get("spec_mode", "full") not in SPEC_MODES:
+        raise RecordError("jobs.jsonl: invalid spec_mode")
     if job["resume_stage"] not in STAGES:
         raise RecordError("jobs.jsonl: invalid resume stage")
     if type(job.get("expected_wait_seconds")) is not int or job["expected_wait_seconds"] < 0:

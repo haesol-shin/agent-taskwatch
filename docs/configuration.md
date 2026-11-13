@@ -269,9 +269,11 @@ Neither is mandatory for an untouched initial result.
 
 The exception does not include the original prompt, copied inputs, `WORKFLOW.md`, reviews, snapshots, logs, sessions or global state. Review-only jobs receive no worker-owned file exception. Preparing declared public text grants no authority to publish it. Any action outside the recorded scope and named file exceptions still requires the existing wait-before-action approval procedure.
 
-`inputs`, `predecessors`, `expected_wait_seconds`, `approval_required`, `max_reviews`, and `land` are optional. Every other example field is required. Each entry of `predecessors` is an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored record keeps the resolved job ids. Derive the receipt key from the approval message and its job number. A repeated key returns the original job even if other arguments differ. The command records the caller's approval assertion; it cannot authenticate the conversation.
+`inputs`, `predecessors`, `expected_wait_seconds`, `approval_required`, `max_reviews`, `land`, and `spec_mode` are optional. Every other example field is required. Each entry of `predecessors` is an existing job's id or `receipt_key` (id first, else `receipt_key`); the stored record keeps the resolved job ids. Derive the receipt key from the approval message and its job number. A repeated key returns the original job even if other arguments differ. The command records the caller's approval assertion; it cannot authenticate the conversation.
 
 `max_reviews` is the review limit of this job. When it is absent the job takes the host setting; see [Review limit](#review-limit).
+
+`spec_mode` is `full` (the default, also for records without the field) or `task_file`, frozen in the job record. Only a code job that builds a result accepts it. `task_file` reduces the spec check to four headings and relaxes five `design_check` answers; [Task-file mode](spec-template.md#task-file-mode) owns the rule.
 
 A job with `predecessors` gets one block per predecessor in the work and review messages: its id, job type label (`research` for `review: source`, `design`, `implement` for `review: code`, `review` for a `review_target`), stage, result location (the output files in its workspace, or for a code job the branch `<branch_prefix><first 8 of the id>` in its target), result fingerprint and the path of its `brief.md`. The block is read only: nothing is copied, so input hashes and the review basis do not change, and the spec still says how to use the result.
 

@@ -4,6 +4,10 @@ Copy this file and fill it in as the spec of every job whose `review` is `code` 
 
 The reviewer finds your answer by heading. Headings 1, 2, 3, 4, 6, 7, 9 and 10 map to the reviewer's `design_check` keys `root_cause`, `alternatives`, `one_home`, `overlaps`, `needed_now`, `repeated_judgment`, `portability` and `choices`. Heading 11 is compared with the approval scope.
 
+### Task-file mode
+
+A code job may be submitted with `"spec_mode": "task_file"` when a reviewed task file already settled the options, homes, overlaps, need and units. The spec then needs only these four headings, answered by the same `n/a: <reason>` rule; the other nine may be absent: Purpose and cause, Owner decisions and asks, Writes outside the workspace, Public text. The reviewer answers `root_cause`, `one_home` and `choices` from the result, and may answer the other five `design_check` keys `na` with the reason `settled by the task file: <item>` ([C-18](review/common.md)). `spec_mode` defaults to `full`, which is this whole template. A job whose cause or options are still open is a design job, not a task-file job. Only a code job that builds a result accepts the field.
+
 ## Purpose and cause
 
 <!-- The cause of the problem. How you verified that it exists today (command, file:line, date). If it is already fixed, why the change is still needed. -->

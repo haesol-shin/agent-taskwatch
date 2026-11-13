@@ -1,13 +1,20 @@
 """The spec template check at submit, and the design_check shape of the verdict line."""
 
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
 
 from taskwatch.executor import DESIGN_KEYS, _design_check, _finding_lines, _verdict_line
-from taskwatch.job_runner import run_job
-from taskwatch.jobs import SPEC_HEADINGS, Jobs, spec_sections
+from taskwatch.job_runner import Ctx, _review_message, run_job
+from taskwatch.jobs import (
+    SPEC_HEADINGS,
+    SPEC_TASK_FILE_HEADINGS,
+    Jobs,
+    decode_job,
+    spec_sections,
+)
 from tests.spec_fixture import VALID_SPEC
 from tests.test_job_runner import BRIEF, CHOICES, Env
 from tests.test_jobs import payload
@@ -18,8 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # --- the spec template ---------------------------------------------------------------------
 
 
-def submit(tmp_path: Path, spec: str, review: str = "code"):
-    data = {**payload(tmp_path), "review": review}
+def submit(tmp_path: Path, spec: str, review: str = "code", **extra):
+    data = {**payload(tmp_path), "review": review, **extra}
     if review == "design":
         data["outputs"] = ["design.md", "choices.json"]
     Path(data["spec"]).write_text(spec, encoding="utf-8")
@@ -88,6 +95,82 @@ def test_the_template_file_and_the_check_name_the_same_headings():
     text = (ROOT / "docs" / "spec-template.md").read_text(encoding="utf-8")
     assert tuple(spec_sections(text).keys()) == SPEC_HEADINGS
     assert len(SPEC_HEADINGS) == 13
+
+
+# --- the task-file spec mode ---------------------------------------------------------------
+
+TASK_FILE_SPEC = "# Spec\n\n" + "".join(
+    f"## {heading}\n\nn/a: synthetic fixture\n\n" for heading in SPEC_TASK_FILE_HEADINGS
+)
+
+
+def test_the_spec_mode_defaults_to_full_and_the_full_template_still_applies(tmp_path):
+    with pytest.raises(ValueError, match="missing heading: Options and common practice"):
+        submit(tmp_path, TASK_FILE_SPEC)
+    assert submit(tmp_path, VALID_SPEC).spec_mode == "full"
+
+
+def test_a_task_file_job_needs_only_its_four_headings_and_keeps_the_mode(tmp_path):
+    job = submit(tmp_path, TASK_FILE_SPEC, spec_mode="task_file")
+    assert job.spec_mode == "task_file"
+    assert Jobs(tmp_path / "root").load()[job.id].spec_mode == "task_file"
+    assert decode_job(job.to_json()).spec_mode == "task_file"
+    older = {k: v for k, v in job.to_json().items() if k != "spec_mode"}
+    assert decode_job(older).spec_mode == "full"
+
+
+@pytest.mark.parametrize("heading", SPEC_TASK_FILE_HEADINGS)
+def test_a_task_file_spec_missing_a_required_heading_is_refused(tmp_path, heading):
+    text = TASK_FILE_SPEC.replace(f"## {heading}\n", "## Renamed\n")
+    with pytest.raises(ValueError, match=f"missing heading: {heading}"):
+        submit(tmp_path, text, spec_mode="task_file")
+    assert Jobs(tmp_path / "root").load() == {}
+
+
+def test_a_task_file_heading_still_needs_a_reason_for_na(tmp_path):
+    heading = "## Public text\n\n"
+    text = TASK_FILE_SPEC.replace(f"{heading}n/a: synthetic fixture", f"{heading}n/a")
+    with pytest.raises(ValueError, match="needs a reason.*Public text"):
+        submit(tmp_path, text, spec_mode="task_file")
+
+
+@pytest.mark.parametrize("review", ["design", "source"])
+def test_spec_mode_is_refused_for_other_reviews(tmp_path, review):
+    with pytest.raises(ValueError, match="spec_mode applies only to code jobs"):
+        submit(tmp_path, VALID_SPEC, review, spec_mode="task_file")
+
+
+def test_spec_mode_is_refused_for_a_review_only_job(tmp_path):
+    data = payload(tmp_path)
+    data = {k: v for k, v in data.items() if k not in {"outputs", "check_command", "checklist"}}
+    data.pop("progress")
+    data.update(review="code", review_target={"files": ["spec.md"]}, spec_mode="task_file")
+    (tmp_path / "source" / "spec.md").write_text("plain\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="spec_mode applies only to code jobs"):
+        Jobs(tmp_path / "root").submit(data, 10)
+
+
+@pytest.mark.parametrize("value", ["", "Task_File", None, 1, ["full"]])
+def test_an_unknown_spec_mode_is_refused(tmp_path, value):
+    with pytest.raises(ValueError, match="spec_mode must be one of: full, task_file"):
+        submit(tmp_path, VALID_SPEC, spec_mode=value)
+
+
+def test_the_review_message_states_a_task_file_mode_only(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    for mode, stated in (("full", False), ("task_file", True)):
+        job = dataclasses.replace(env.get(), spec_mode=mode)
+        ctx = Ctx(env.jobs, env.config, job, env.folder(), tmp_path / "ws")
+        text = _review_message(ctx, (), False, tmp_path / "rr")
+        assert ("Spec mode: task_file" in text) is stated
+
+
+def test_a_task_file_design_check_may_answer_five_keys_na_with_their_own_reason():
+    settled = ("alternatives", "overlaps", "needed_now", "repeated_judgment", "portability")
+    check = {key: dict(value) for key, value in DESIGN_CHECK.items()}
+    for key in settled:
+        check[key] = {"answer": "na", "evidence": f"settled by the task file: item for {key}"}
+    assert _design_check(with_check(check), [])["portability"]["answer"] == "na"
 
 
 # --- the design_check ----------------------------------------------------------------------

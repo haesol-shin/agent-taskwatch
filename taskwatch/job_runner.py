@@ -761,6 +761,15 @@ def _review_message(
         f"Spec: {job.spec}",
         f"Approval source: {job.approval_source}",
         f"Approval scope: {job.approval_scope}",
+        *(
+            [
+                "Spec mode: task_file. The spec holds only Purpose and cause, Owner decisions and "
+                "asks, Writes outside the workspace and Public text; the task file settled the "
+                "rest. Apply C-18 for task_file."
+            ]
+            if job.spec_mode == "task_file"
+            else []
+        ),
         *_subject_lines(ctx),
         *_text_lines(job, review_root),
         "If you delegate to subagents, wait until each one finished.",
