@@ -165,6 +165,7 @@ class JobConfig:
     worker_mode: str = "rpc"
     worker_command: tuple[str, ...] | None = None
     private_tmp: bool = True
+    install_commands: Mapping[str, tuple[str, ...]] | None = None
 
 
 COMMIT_RULES = ("bullet_one_line",)
@@ -210,6 +211,29 @@ def _install_command(value: object) -> tuple[str, ...] | None:
     return tuple(value)
 
 
+def _install_commands(value: object) -> Mapping[str, tuple[str, ...]] | None:
+    from . import forge
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("install_commands must be an object of repository identities to argv")
+    commands = {}
+    for key, command in value.items():
+        try:
+            host = key.split("/", 1)[0]
+            identity = "/".join(forge.parse_origin(f"https://{key}", (host,))).lower()
+            if identity != key.lower() or identity in commands:
+                raise ValueError("noncanonical or duplicate repository identity")
+            argv = _install_command(command)
+            if argv is None:
+                raise ValueError("entry must be a nonempty argv")
+        except (ValueError, forge.ForgeError) as exc:
+            raise ValueError(f"invalid install_commands entry {key!r}: {exc}") from exc
+        commands[identity] = argv
+    return MappingProxyType(commands)
+
+
 def load_job_config(root: Path) -> JobConfig:
     path = root / "taskwatch" / "jobs-config.json"
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -224,6 +248,7 @@ def load_job_config(root: Path) -> JobConfig:
         "worker_mode",
         "worker_command",
         "install_command",
+        "install_commands",
         "private_tmp",
     } != {
         "version",
@@ -295,6 +320,7 @@ def load_job_config(root: Path) -> JobConfig:
         worker_mode,
         tuple(obj["worker_command"]) if "worker_command" in obj else None,
         private_tmp,
+        _install_commands(obj["install_commands"]) if "install_commands" in obj else None,
     )
 
 

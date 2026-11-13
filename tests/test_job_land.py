@@ -1409,6 +1409,9 @@ def test_install_reloads_host_config_instead_of_using_the_runner_startup_copy(ma
     job = lab.put("land", land_state={"S": "a" * 40, "install": frozen})
     ctx = Ctx(lab.jobs, startup, job, lab.folder(), lab.tree)
     transaction = job_land.Transaction(ctx, -1)
+    transaction.repo = job_land.forge.Repository(
+        "forge.invalid", "sample", "project", "main", True, False
+    )
     # Model a host edit during CI: the runner's startup config still contains the old hook.
     lab.configure(install_command=None)
 
@@ -1418,6 +1421,64 @@ def test_install_reloads_host_config_instead_of_using_the_runner_startup_copy(ma
     assert stopped.value.reason == "land_hook_changed"
     assert lab.hook_calls() == []
     assert lab.land()["install"]["status"] == "not_started"
+
+
+@pytest.mark.parametrize("selection", ["selected", "missing", "empty", "legacy", "migrated"])
+def test_repository_hook_freezes_and_installs_only_the_selected_entry(make, monkeypatch, selection):
+    lab = make()
+    key = "forge.invalid/Sample/Project"
+    hooks = {key: lab.install_argv} if selection == "selected" else {}
+    if selection == "missing":
+        hooks = {"forge.invalid/other/project": lab.install_argv}
+    if selection not in {"legacy", "migrated"}:
+        lab.configure(install_commands=hooks)
+    lab.accept()
+    job = lab.put("land")
+    startup = load_job_config(lab.root)
+    ctx = Ctx(lab.jobs, startup, job, lab.folder(), lab.tree)
+    repo = job_land.forge.Repository("forge.invalid", "Sample", "Project", "main", True, False)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        transaction = job_land.Transaction(ctx, lock.fileno())
+        monkeypatch.setattr(transaction.api, "inspect_repository", lambda: repo)
+        transaction.initialize()
+        enabled = selection in {"selected", "legacy", "migrated"}
+        frozen = transaction.state["install"]
+        assert frozen["status"] == ("not_started" if enabled else "disabled")
+        assert frozen["command"] == (lab.install_argv if enabled else None)
+        if selection == "migrated":
+            hooks = {key: lab.install_argv}
+        if selection != "legacy":
+            # An unrelated repository edit cannot invalidate this transaction.
+            lab.configure(install_commands={**hooks, "forge.invalid/other/repo": ["x", "{sha}"]})
+        transaction.save(S="a" * 40)
+        transaction.install()
+    assert lab.land()["install"]["status"] == ("succeeded" if enabled else "disabled")
+    assert [call["argv"] for call in lab.hook_calls()] == (
+        [["install", "a" * 40, str(lab.repo)]] if enabled else []
+    )
+
+
+@pytest.mark.parametrize("replacement", ["changed", "removed", "added"])
+def test_selected_repository_hook_change_stops_before_install(make, monkeypatch, replacement):
+    lab = make()
+    key = "forge.invalid/sample/project"
+    hooks = {} if replacement == "added" else {key: lab.install_argv}
+    lab.configure(install_commands=hooks)
+    lab.accept()
+    job = lab.put("land")
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    repo = job_land.forge.Repository("forge.invalid", "sample", "project", "main", True, False)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        transaction = job_land.Transaction(ctx, lock.fileno())
+        monkeypatch.setattr(transaction.api, "inspect_repository", lambda: repo)
+        transaction.initialize()
+        updated = {} if replacement == "removed" else {key: ["replacement", "{sha}"]}
+        lab.configure(install_commands=updated)
+        transaction.save(S="a" * 40)
+        with pytest.raises(job_land.LandStop) as stopped:
+            transaction.install()
+    assert stopped.value.reason == "land_hook_changed"
+    assert lab.hook_calls() == []
 
 
 @pytest.mark.parametrize(
