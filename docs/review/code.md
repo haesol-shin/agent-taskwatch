@@ -4,9 +4,16 @@ Use this file with the common guidelines when the deliverable is a code change.
 
 ## What to review
 
-**K-1.** Review in this order, and finish each stage before the next: the spec and the project rules; correctness and failure modes; consistency of docs, messages, and tests; code quality last.
+**K-1.** Read the intent, the spec, and the project rules first; they frame every stage. Then review in this order, and finish each stage before the next: design, which is the fit with the existing architecture, the state and data model, and the interfaces; correctness and failure modes; consistency of docs, messages, and tests; code quality last. Answer each design dimension with evidence:
 
-**K-2.** Start from the patch. Read the changed code with its callers and the tests that cover it. Read the spec, contract, or user-facing document that describes the changed behavior; search the docs and tests for the changed symbols, messages, and error codes to find it. A dispatch point outside the diff still has to be read before you treat the producing side as correct.
+- **Complexity and overdesign.** Which abstraction, option, or layer does the change add that no requirement in the spec needs?
+- **Data lifetime and persistence.** Which value must survive a restart, a retry, a cancel, or a second process, and where is it stored and read back?
+- **Failure modes.** Which timeout, retry, cancel, or cleanup path does the change add or reach, and what does the code do on each?
+- **Performance on realistic sizes.** What does the change repeat per item, frame, or call, and what does it cost at the sizes the spec names?
+- **Test validity.** Which defect of the design would pass every test the change adds, and which test would catch it?
+- **Extensibility where the spec asks for it.** Where the spec says a new kind or backend comes later, how many files does adding one touch?
+
+**K-2.** Start from the patch. Read the changed code with its callers and the tests that cover it. Read the spec, contract, or user-facing document that describes the changed behavior; search the docs and tests for the changed symbols, messages, and error codes to find it. A dispatch point outside the diff still has to be read before you treat the producing side as correct. When a port or interface changes, read every implementation of it, not only the one the patch edits.
 
 **K-3.** Keep going after the first blocker. Report every finding that meets the reporting bar.
 
@@ -44,7 +51,7 @@ Use this file with the common guidelines when the deliverable is a code change.
 
 **K-10.** Docs, error messages, and tests that still describe the old behavior are findings when the change left them that way.
 
-**K-11.** If the assignment includes test or CI output, a failure caused by the change is a finding. In the verdict, say which tests and commands you ran, or that tests were not checked.
+**K-11.** If the assignment includes test or CI output, a failure caused by the change is a finding. In the verdict, say which tests and commands you ran, or that tests were not checked. When the change adds a restart, cancel, or streaming path that the repository can run, run it or reproduce it; the code alone does not show the path works.
 
 ## Public text
 

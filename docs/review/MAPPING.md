@@ -19,7 +19,7 @@ Launch-path rules (verdict format, who counts rounds, tool restrictions, where i
 | Procedure 1: take the patch from the diff or the pull request diff | K-2 (start from the patch). Which command gets it: launch layer |
 | Procedure 2: read the files that govern the change; search docs and tests for the changed symbols, messages, error codes | K-2, C-16 |
 | Procedure 3: read the modified files in full, with callers and covering tests | K-2 |
-| Procedure 4a-c: review in the order spec and policy, correctness, consistency | K-1, K-10 |
+| Procedure 4a-c: review in the order spec and policy, correctness, consistency | K-1, K-10. Changed: K-1 reads the spec and policy first, then judges design before correctness |
 | Procedure 4d: code quality last; minimal edits; single responsibility and one rule in one place; comments say why; one short changelog line per user-visible change | K-6 |
 | Procedure 4d: a written project standard wins where it is more specific | K-6, README project rules |
 | Procedure 4d: the dated personal attribution of the four quality points | Personal; stays out |
@@ -86,4 +86,4 @@ The default role is a subset of the edited role. Where the two disagree, the edi
 
 The rules that were already in this folder keep their ids. The mapping above added or widened these: K-2 (start from the patch, governing documents, search for changed symbols), K-4 (no unstated assumption), K-6 (changelog line), K-11 (say which tests ran), C-10 (the assignment gives the round and prior findings), C-15 (write modes, temporary copy), and C-17 (finding content, finding headings and rule ids).
 
-K-15 to K-18 are new: they cover the public text of a pull request, which is reviewed with the diff it describes. C-18 and K-19 are new: C-18 answers the design questions for a code or design review, and K-19 compares what a change writes outside the workspace with the approval scope. C-1 and the third bullet of K-4 changed so that only an owner decision is outside review.
+K-15 to K-18 are new: they cover the public text of a pull request, which is reviewed with the diff it describes. C-18 and K-19 are new: C-18 answers the design questions for a code or design review, and K-19 compares what a change writes outside the workspace with the approval scope. C-1 and the third bullet of K-4 changed so that only an owner decision is outside review. K-1 orders design before correctness and lists the design dimensions; K-2 reads every implementation of a port or interface the change alters; K-11 runs or reproduces a restart, cancel, or streaming path the change adds; and C-8 names a data lifetime, persistence, or concurrency violation as a P1 example.
