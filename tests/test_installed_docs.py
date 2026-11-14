@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import posixpath
-import re
 import tomllib
 from pathlib import Path
 
+from taskwatch import review_docs
+
 ROOT = Path(__file__).resolve().parents[1]
-LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 
 
 def data_files(root: Path = ROOT) -> dict[str, list[str]]:
@@ -32,17 +32,11 @@ def install_map(root: Path, data: dict[str, list[str]]) -> dict[str, str]:
 
 def linked_targets(text: str) -> list[str]:
     """The local paths the Markdown links of a document name, without their anchors."""
-    targets: list[str] = []
-    for raw in LINK.findall(text):
-        target = raw.strip()
-        if target.startswith("<") and target.endswith(">"):
-            target = target[1:-1].strip()
-        target = target.split()[0] if target else ""
-        local = target.split("#", 1)[0]
-        if not local or target.startswith(("http://", "https://", "mailto:")):
-            continue
-        targets.append(local)
-    return targets
+    return [
+        local
+        for target in review_docs.link_targets(text)
+        if (local := review_docs.local_target(target))
+    ]
 
 
 def missing_targets(root: Path, data: dict[str, list[str]]) -> list[str]:
@@ -98,3 +92,11 @@ def test_a_target_installed_at_the_linked_path_passes(tmp_path: Path):
     )
     data = {"share/docs": ["docs/*.md"], "share/docs/guides": ["docs/guides/*.md"]}
     assert missing_targets(tmp_path, data) == []
+
+
+def test_the_job_copy_takes_exactly_the_installed_files():
+    installed = set(install_map(ROOT, data_files()))
+    assert all(path.startswith("share/") for path in installed)
+    expected = {path.split("/", 1)[1] for path in installed}
+    copied = {relative.as_posix() for _, relative in review_docs.shipped_files(ROOT / "docs")}
+    assert copied == expected

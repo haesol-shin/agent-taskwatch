@@ -222,7 +222,8 @@ def test_review_command_receives_the_job_guideline_copy_and_review(review):
         if "argv" in x
     )
     folder = review.jobs.folder(review.get())
-    assert argv[:4] == ["--docs", str(folder / "review-docs"), "--review", "source"]
+    guides = folder / "review-docs" / "agent-taskwatch" / "review"
+    assert argv[:4] == ["--docs", str(guides), "--review", "source"]
 
 
 # --- scheduling and delivery ----------------------------------------------------------------

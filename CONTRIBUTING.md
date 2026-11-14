@@ -22,6 +22,8 @@ uv run python scripts/check_review_docs.py
 
 CI runs the same commands. A pull request must pass all of them.
 
+CI also installs the package into a temporary prefix and runs the same script with `--tree <prefix>/share`: every relative link of a shipped document must resolve inside the installed tree, so a guide that names a file the install lacks fails before merge.
+
 ## Code style
 
 CI enforces the Ruff rules `E`, `F`, `I`, `C901` (max complexity 15) and line length 100. The rest is the recommended style:

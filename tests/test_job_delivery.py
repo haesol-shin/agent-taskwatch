@@ -15,7 +15,7 @@ from taskwatch import job_delivery
 from taskwatch.fingerprint import files_fingerprint
 from taskwatch.job_cli import main as cli_main
 from taskwatch.job_env import job_environment
-from taskwatch.job_runner import _basis, _fingerprint
+from taskwatch.job_runner import _basis, _fingerprint, _guidelines
 from taskwatch.job_scan import scan_jobs
 from taskwatch.jobs import Jobs, JobState, load_job_config
 from tests.git_fixture import make_repo
@@ -205,8 +205,7 @@ def finished_job(board: Board, **changes: object) -> JobState:
         fingerprint=fingerprint,
         basis=basis,
         guideline_hashes={
-            str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in (folder / "review-docs").iterdir()
+            str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in _guidelines(job, folder)
         },
         **changes,
     )

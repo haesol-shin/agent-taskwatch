@@ -238,7 +238,7 @@ def test_pipeline_from_work_to_deliver_pending(env):
     assert env.prompts()[0].startswith("ORIGINAL PROMPT TEXT\nline two")
     assert "msg-1" in env.prompts()[0] and "task-1" in env.prompts()[0]
     assert (env.folder() / "WORKFLOW.md").is_file()
-    assert (env.folder() / "review-docs" / "source.md").is_file()
+    assert (env.folder() / "review-docs" / "agent-taskwatch" / "review" / "source.md").is_file()
 
     assert env.run("check") == 0
     job = env.get()
@@ -832,7 +832,7 @@ def test_code_job_uses_worktree_and_committed_fingerprint(tmp_path, monkeypatch)
     assert env.run("check") == 0
     job = env.get()
     assert job.stage == "review" and job.fingerprint == head_sha(worktree)
-    assert (env.folder() / "review-docs" / "code.md").is_file()
+    assert (env.folder() / "review-docs" / "agent-taskwatch" / "review" / "code.md").is_file()
     (worktree / "out.txt").write_text("ok\nmore\n", encoding="utf-8")
     assert env.run("check") == 0
     job = env.get()
@@ -901,11 +901,39 @@ def test_missing_input_hash_match_stops_job(env):
 def test_changed_review_profile_stops_job(env):
     env.scenario([work_turn()])
     assert env.run("work") == 0
-    profile = env.folder() / "review-docs" / "common.md"
+    profile = env.folder() / "review-docs" / "agent-taskwatch" / "review" / "common.md"
     profile.write_text(profile.read_text() + "\nedited\n", encoding="utf-8")
     assert env.run("check") == 1
     job = env.get()
     assert (job.stage, job.wait_reason) == ("user_wait", "inputs_invalid")
+
+
+def test_a_guide_link_without_a_target_stops_before_the_review(env):
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    guide = env.folder() / "review-docs" / "agent-taskwatch" / "review" / "common.md"
+    broken = guide.read_text(encoding="utf-8") + "\n[gone](../gone.md)\n"
+    guide.write_text(broken, encoding="utf-8")
+    assert env.run("check") == 1
+    job = env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "inputs_invalid")
+    assert "../gone.md" in job.error
+
+
+def test_a_record_of_the_flat_guide_copy_keeps_the_same_basis(env):
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    job = env.get()
+    folder = env.folder()
+    legacy = {
+        str(folder / "review-docs" / Path(path).name): digest
+        for path, digest in job.guideline_hashes.items()
+    }
+    env.jobs.save(replace(job, guideline_hashes=legacy), time.time())
+    assert env.run("check") == 0
+    current = env.get()
+    assert current.stage == "review"
+    assert set(current.guideline_hashes) == set(job.guideline_hashes)
 
 
 def test_messages_list_each_predecessor_result_without_copying_it(tmp_path, monkeypatch):

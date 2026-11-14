@@ -29,6 +29,7 @@ from . import (
     job_text,
     job_workspace,
     review_delta,
+    review_docs,
     review_print,
     source_check,
 )
@@ -57,7 +58,6 @@ from .jobs import (
     progress_fingerprint,
 )
 from .rate_limit import RateLimit, print_rate_limit, scrub
-from .review_docs import docs_dir, profile_names
 
 STEPS = frozenset({"work", "fix", "check", "review", "land"})
 PRECHECK_LOG = "precheck.log"
@@ -257,10 +257,18 @@ def _context(jobs: Jobs, config: JobConfig, job: JobState) -> Ctx:
     ctx = Ctx(jobs, config, replace(job, workspace=str(workspace), **described), folder, workspace)
     hashes = _prepare(ctx)
     recorded = job.guideline_hashes
-    if recorded is not None and recorded != hashes:
+    if recorded is not None and recorded != hashes and not _same_guides(recorded, hashes):
         raise InputsChanged("a copied review profile does not match its recorded hash")
     _apply(ctx, lambda j: {"workspace": str(workspace), "guideline_hashes": hashes, **described})
     return ctx
+
+
+def _same_guides(recorded: Mapping[str, str], current: Mapping[str, str]) -> bool:
+    """A record written before the job copy kept the installed shape names the guide files one
+    folder up. The same names with the same hashes are the same basis."""
+    return {Path(path).name: digest for path, digest in recorded.items()} == {
+        Path(path).name: digest for path, digest in current.items()
+    }
 
 
 def _workspace(
@@ -292,7 +300,7 @@ def _workspace(
 
 
 def _docs_source(folder: str = "review") -> Path:
-    source = docs_dir(folder)
+    source = review_docs.docs_dir(folder)
     if source is None:
         raise StepError(f"{folder} documents were not found")
     return source
@@ -307,16 +315,18 @@ def _layer(name: str) -> str:
 
 
 def _guidelines(job: JobState, folder: Path) -> tuple[Path, ...]:
-    """The job's own copy of the review profile, so a basis cannot drift while it runs."""
-    names = profile_names(job.review, job.outputs)
+    """The job's own copy of the shipped documents, in the installed shape, so a relative link of
+    a guide resolves inside the job folder and the basis cannot drift while the job runs."""
+    names = review_docs.profile_names(job.review, job.outputs)
     target = folder / "review-docs"
-    target.mkdir(parents=True, exist_ok=True)
-    source = None
-    for name in names:
-        if not (target / name).is_file():
-            source = source or _docs_source()
-            shutil.copyfile(source / name, target / name)
-    return tuple(target / name for name in names)
+    try:
+        guides = review_docs.copy_docs(target)
+    except (OSError, review_docs.DocsError) as exc:
+        raise InputsChanged(f"the review documents cannot be copied: {exc}") from exc
+    problems = review_docs.link_problems(target)
+    if problems:
+        raise InputsChanged("the review documents are incomplete: " + "; ".join(problems))
+    return tuple(guides / name for name in names)
 
 
 def _write_durable(path: Path, text: str) -> None:
@@ -922,14 +932,14 @@ def _schema_path(ctx: Ctx) -> Path:
 
 
 def _command(ctx: Ctx, review_root: Path | None = None) -> tuple[str, ...]:
-    """The review step may use its own command. {guidelines} and {review} name the job copy and
-    the review profile, {schema} the verdict schema file, {output} the file of the last message
-    (print mode)."""
+    """The review step may use its own command. {guidelines} names the review folder of the job's
+    document copy, {review} the review profile, {schema} the verdict schema file, {output} the
+    file of the last message (print mode)."""
     config = ctx.config
     if ctx.stage != "review" or config.review_command is None:
         return config.omp_command
     fields = {
-        "{guidelines}": str(ctx.folder / "review-docs"),
+        "{guidelines}": str(review_docs.guide_dir(ctx.folder / "review-docs")),
         "{review}": ctx.job.review,
         "{schema}": str(_schema_path(ctx)),
     }

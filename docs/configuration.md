@@ -28,7 +28,7 @@ All keys shown above except `max_reviews` are required. The three numeric settin
 
 Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run independent reviews with a different command prefix. Like `omp_command`, it must be a nonempty list of nonempty strings. When omitted, RPC reviews use `omp_command`. With the default `review_mode` (`"rpc"`), review commands receive `--mode rpc --no-ui`. The `init` draft omits this optional key. Work and fix select their command through [Worker execution](#worker-execution).
 
-In `review_command` (and only there), an argument that is exactly `{guidelines}` becomes the job's own copy of the review guidelines, and exactly `{review}` becomes the job's `review` value. That lets the review command be the [reviewer launcher](review-launch.md), which reads the agent definition and those guidelines when the review starts:
+In `review_command` (and only there), an argument that is exactly `{guidelines}` becomes the review folder of the job's own copy of the shipped documents, and exactly `{review}` becomes the job's `review` value. The copy keeps the installed shape, so a relative link of a guide such as `../checks.md` resolves inside the job folder, and a copy with a link that names no file stops the job before a review starts. That lets the review command be the [reviewer launcher](review-launch.md), which reads the agent definition and those guidelines when the review starts:
 
 ```json
 "review_command": ["python3", "-m", "taskwatch.reviewer_launch", "--agent", "/srv/example/reviewer.md",

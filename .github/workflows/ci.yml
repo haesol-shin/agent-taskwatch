@@ -19,6 +19,8 @@ jobs:
       - run: uv run ruff format --check
       - run: uv run pytest
       - run: uv run python scripts/check_review_docs.py
+      - run: uv pip install --prefix "$RUNNER_TEMP/installed" .
+      - run: uv run python scripts/check_review_docs.py --tree "$RUNNER_TEMP/installed/share"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
