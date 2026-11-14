@@ -108,9 +108,28 @@ def test_the_list_has_a_section_per_kind_of_need(ledger: Ledger) -> None:
     )
     cancelled = ledger.add(stage="cancelled")
     blocked = ledger.add(stage="queued", submit={"predecessors": [cancelled]})
-    review = {"verdict": "FAIL", "findings": [{"severity": "P1", "rule": "K-9", "finding": "F1"}]}
+    review = {
+        "round": 1,
+        "verdict": "FAIL",
+        "findings": [{"severity": "P1", "rule": "K-9", "finding": "F1"}],
+    }
+    repeat = {
+        "round": 3,
+        "verdict": "FAIL",
+        "findings": [
+            {
+                "severity": "P1",
+                "rule": "K-9",
+                "finding": "F1",
+                "repeat_of": "r1.F1",
+                "repeat_reason": "same defect",
+            }
+        ],
+    }
     stuck = ledger.add(
-        stage="user_wait", wait_reason="review_exhausted", reviews=(review, review, review)
+        stage="user_wait",
+        wait_reason="review_exhausted",
+        reviews=(review, {**review, "round": 2}, repeat),
     )
     ledger.add(stage="work")
     code, text = ledger.list()
@@ -124,7 +143,7 @@ def test_the_list_has_a_section_per_kind_of_need(ledger: Ledger) -> None:
     assert f"  decisions: 2   then: {approve}" in lines
     assert any(
         line.startswith(f"job {stuck} research user_wait review_exhausted  round 3; open P1 1")
-        and line.endswith("repeated rules: K-9")
+        and line.endswith("repeated findings: r3.F1")
         for line in lines
     )
     assert f"job {blocked} queued behind cancelled job {cancelled}" in lines

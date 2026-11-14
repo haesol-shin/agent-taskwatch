@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -402,7 +402,8 @@ def _approval_text(ctx: Ctx) -> str:
             "\nNo directory deletion or writes to any other job-folder file are authorized."
             "\nKeep all listed files outside the workspace; never copy them into it."
             "\nWrite findings when repairing review findings, and root-cause evidence for"
-            " repeated rules; neither is required for an untouched initial result."
+            " a finding the review marked as a repeat; neither is required for an untouched"
+            " initial result."
             "\nDeclared public-text files are local preparation only, not publication authority."
         )
     return text
@@ -469,7 +470,8 @@ Work inputs:
   result.
 - When a review sends you back to fix findings, record each one in
   `{ctx.folder / job_findings.FINDINGS_FILE}` before you finish, as the fix message shows.
-  A rule that repeats also needs a section in `{ctx.folder / job_findings.NOTE_FILE}`.
+  A finding the review marks as a repeat also needs a section in
+  `{ctx.folder / job_findings.NOTE_FILE}`.
 - While working, run only the tests that cover what you changed. The full suite runs once for
   the committed result: the End command with `--run-command` is that run, and a passing one is
   reused instead of run again while the result, intent, spec and guidelines do not change.
@@ -714,8 +716,17 @@ def _text_since(ctx: Ctx, last: Mapping, review_root: Path) -> list[str]:
     return lines
 
 
+def _earlier_ids(prior: Sequence[Mapping]) -> list[str]:
+    """Every finding id the earlier reviews of the job recorded, oldest first."""
+    return [
+        job_findings.finding_id(review, finding)
+        for review in prior
+        for finding in review.get("findings", ())
+    ]
+
+
 def _finding_notes(ctx: Ctx, last: Mapping) -> list[str]:
-    """The worker's record of the last findings, and the root-cause notes of repeated rules."""
+    """The worker's record of the last findings, and the root-cause note of each repeated one."""
     job = ctx.job
     lines = []
     status = job_findings.status_lines(job, ctx.folder)
@@ -723,15 +734,14 @@ def _finding_notes(ctx: Ctx, last: Mapping) -> list[str]:
         lines += ["Worker record of the last findings; accept or reject each not_fixed reason:"]
         lines += status
     sections = job_findings.notes(ctx.folder)
-    for rule in sorted({f["rule"] for f in last.get("findings", [])} & sections.keys()):
-        note = "; ".join(f"{label} {text}" for label, text in sections[rule].items())
-        lines.append(f"Root-cause note for {rule}: {note}")
-    recurred = job.checks[-1].get("recurred", {}) if job.checks else {}
-    for rule, prevention in recurred.items():
-        lines.append(
-            f"Rule {rule} repeated after a note named this prevention: {prevention}. "
-            "Answer whether it was applied."
-        )
+    repeated = [
+        job_findings.finding_id(last, finding)
+        for finding in last.get("findings", ())
+        if finding.get("repeat_of")
+    ]
+    for key in sorted(set(repeated) & sections.keys()):
+        note = "; ".join(f"{label} {text}" for label, text in sections[key].items())
+        lines.append(f"Root-cause note for {key}: {note}")
     return lines
 
 
@@ -740,6 +750,8 @@ def _prior_lines(
 ) -> list[str]:
     job = ctx.job
     last = prior[-1]
+    ids = _earlier_ids(prior)
+    listed = [f"Earlier finding ids: {', '.join(ids)}"] if ids else []
     if job.review_target is not None or not job_findings.accepted(last):
         # Nothing was fixed between these rounds: the last answer could not be accepted.
         problems = "; ".join(last["problems"]) or "none recorded"
@@ -748,6 +760,7 @@ def _prior_lines(
             f"This is round {len(prior) + 1}. The last answer was not accepted: {problems}.",
             "Review the whole target again and answer in full.",
         ]
+        lines += listed
         previous = job_findings.last_failed(prior)
         if previous is not None:
             lines += [
@@ -774,7 +787,13 @@ def _prior_lines(
         if scope is not None and scope.stat:
             lines += ["git diff --stat of the delta:", scope.stat]
     lines += text
-    return [*lines, *_finding_notes(ctx, last), "Findings of the last review:", last["body"]]
+    return [
+        *lines,
+        *_finding_notes(ctx, last),
+        *listed,
+        "Findings of the last review:",
+        last["body"],
+    ]
 
 
 def _review_message(
@@ -1359,32 +1378,22 @@ def _public_texts(ctx: Ctx, problems: list[str]) -> dict[str, dict]:
         return {}
 
 
-def _finding_problems(ctx: Ctx, fingerprint: str, texts: dict) -> tuple[list[str], dict]:
+def _finding_problems(ctx: Ctx, fingerprint: str, texts: dict) -> list[str]:
     """Before a re-review: the worker's record of each finding of the last failed review, which
-    holds across a resume, and repeated rules."""
+    holds across a resume."""
     job = ctx.job
     review = job_findings.last_failed(job.reviews)
     if job.review_target is not None:
-        return [], {}
+        return []
     repo = ctx.workspace if job.review == "code" else None
     problems = job_findings.bot_worker_problems(job, ctx.folder, fingerprint, texts, repo, ctx.env)
     if review is None or review.get("bot_observation"):
-        return problems, {}
+        return problems
     problems += job_findings.worker_problems(ctx.folder, review, fingerprint, texts, repo, ctx.env)
-    earlier = [r for r in job.reviews if r["seq"] < review["seq"]]
-    rows = ctx.jobs.state.read_records(job_findings.INDEX)
-    repeated = job_findings.repeated_rules(job, earlier, review, rows)
-    problems += job_findings.note_problems(ctx.folder, repeated)
-    # The note a rule had before this review was written; the rule broke it again.
-    before = [c for c in job.checks if c["seq"] < review["seq"]]
-    noted = before[-1].get("noted", {}) if before else {}
-    return problems, {
-        "noted": job_findings.named_preventions(ctx.folder, repeated),
-        "recurred": {rule: noted[rule] for rule in repeated if rule in noted},
-    }
+    return problems
 
 
-def _shape(ctx: Ctx, problems: list[str]) -> tuple[str, str, dict, dict]:
+def _shape(ctx: Ctx, problems: list[str]) -> tuple[str, str, dict]:
     """The shape checks of a result: files, texts, fingerprint and finding records.
 
     The check step and `shape_problems` both call it, so the agent runs the rules the runner
@@ -1401,9 +1410,8 @@ def _shape(ctx: Ctx, problems: list[str]) -> tuple[str, str, dict, dict]:
         basis = _basis(job, ctx.folder)
     except (ValueError, OSError) as exc:
         problems.append(str(exc))
-    found, notes = _finding_problems(ctx, fingerprint, texts)
-    problems += found
-    return fingerprint, basis, texts, notes
+    problems += _finding_problems(ctx, fingerprint, texts)
+    return fingerprint, basis, texts
 
 
 def shape_problems(
@@ -1525,7 +1533,7 @@ def _check_step(ctx: Ctx) -> int:
     seq = len(job.checks) + len(job.reviews) + 1
     run, problems = _command_run(ctx, seq)
     # After the command: it may have changed or removed what the checks require.
-    fingerprint, basis, texts, notes = _shape(ctx, problems)
+    fingerprint, basis, texts = _shape(ctx, problems)
     record = {
         "seq": seq,
         "at": _now(),
@@ -1537,7 +1545,6 @@ def _check_step(ctx: Ctx) -> int:
         "texts": texts,
         # The exact reply bytes the reviewer will judge; a later record change requeues.
         "bot_dispositions": tuple(job_findings.bot_dispositions(job, ctx.folder)),
-        **notes,
         **_source_record(ctx),
     }
 
@@ -1646,7 +1653,6 @@ def _rereview_scope(ctx: Ctx, base: str) -> review_delta.Scope | None:
         fingerprint=job.fingerprint,
         approval_scope=job.approval_scope,
         prior=prior,
-        checks=job.checks,
         roots=(str(ctx.workspace), job.target),
     )
 
@@ -1765,7 +1771,13 @@ def _read_reply(job: JobState, body: str, record: dict) -> None:
     """
     verdict, blocking = _verdict_line(body)
     record.update(verdict=verdict, blocking=blocking)
-    record["findings"] = _finding_lines(body, verdict)
+    earlier = [
+        job_findings.finding_id(review, finding)
+        for review in job.reviews
+        if isinstance(review, Mapping)
+        for finding in review.get("findings", ())
+    ]
+    record["findings"] = _finding_lines(body, verdict, earlier)
     if verdict == "PASS":
         record["problems"] += [
             f"finding {f['finding']} needs a summary: a PASS shows its {f['severity']} "
@@ -1894,8 +1906,9 @@ def _review_route(job: JobState, record: dict, digest: str = "") -> dict:
     """The outcome of a completed review attempt.
 
     A review is rerun directly while the cycle has one left, and a fix follows only a read
-    FAIL: a malformed or infrastructure answer never starts a model fix. The same rule in two
-    consecutive substantive rounds stops for a root-cause note before anything else runs."""
+    FAIL: a malformed or infrastructure answer never starts a model fix. A substantive round
+    whose finding names an earlier defect stops for a root-cause note before anything else
+    runs."""
     now = _now()
     events = _event(job, type="review", ok=record["ok"], verdict=record["verdict"])
     changes = {
@@ -1911,23 +1924,22 @@ def _review_route(job: JobState, record: dict, digest: str = "") -> dict:
     message = "; ".join(record["problems"])
     exhausted = job.reviews_used >= job.max_reviews
     cycle = [*job.reviews, record][job.review_cycle_start :]
-    rules, rounds = job_findings.consecutive_rules(cycle)
-    if rules:
+    repeats = job_findings.repeated_findings(cycle)
+    if repeats:
         events.append(
             {
                 "at": now,
                 "type": "user_wait",
                 "reason": "root_cause_required",
-                "rules": rules,
-                "rounds": rounds,
+                "repeats": repeats,
                 "note_digest": digest,
                 "exhausted": exhausted,
             }
         )
         text = (
-            f"root cause required: {', '.join(rules)} broke in review rounds {rounds[0]} and "
-            f"{rounds[1]}. Write a section per rule in {job_findings.NOTE_FILE} (Cause:, "
-            "Missed by:, Prevention:) that explains this recurrence, then resume."
+            f"root cause required: {', '.join(repeats)} repeats an earlier finding. Write a "
+            f"section per id in {job_findings.NOTE_FILE} (Cause:, Missed by:, Prevention:) that "
+            "explains this recurrence, then resume."
         )
         if exhausted:
             text += " The review limit is also reached."

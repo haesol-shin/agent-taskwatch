@@ -9,16 +9,19 @@ Each finding has a heading `### F<n>` and one JSON line
 {"finding": "F<n>", "severity": "P0".."P3", "category": "<C-9 category>",
  "rule": "<rule id>", "location": "<where>", "summary": "<one sentence>"}.
 `summary` is optional here; a PASS needs one on every P2 or P3 finding (the runner checks it).
-The two sets of ids must match. Only these lines are read, never the free text.
+`repeat_of` names an earlier finding of the same job, and `repeat_reason` says why; they come
+together. The two sets of ids must match. Only these lines are read, never the free text.
 """
 
 import json
 import re
+from collections.abc import Collection
 
 SEVERITIES = ("P0", "P1", "P2", "P3")
 MAX_SUMMARY_CHARS = 160
 CATEGORIES = ("intent", "evidence", "behavior", "clarity", "other")
 _HEADING = re.compile(r"^###\s+(F\d+)\b", re.MULTILINE)
+_FINDING_ID = re.compile(r"r\d+\.F\d+")
 
 
 def _json_lines(body: str, key: str) -> list[dict]:
@@ -49,8 +52,22 @@ def _verdict_line(body: str) -> tuple[str, bool]:
     return verdict, blocking
 
 
-def _finding_lines(body: str, verdict: str) -> list[dict]:
-    """The finding lines, validated against the headings and the verdict."""
+def _repeat_fields(obj: dict, ident: str, earlier: Collection[str]) -> dict:
+    """The optional repeat marker of a finding; it names an earlier finding and says why."""
+    repeat_of, repeat_reason = obj.get("repeat_of"), obj.get("repeat_reason")
+    if repeat_of is None and repeat_reason is None:
+        return {}
+    if not isinstance(repeat_of, str) or _FINDING_ID.fullmatch(repeat_of) is None:
+        raise ValueError(f"finding {ident} needs repeat_of like r1.F2")
+    if repeat_of not in earlier:
+        raise ValueError(f"finding {ident}: repeat_of {repeat_of} is not an earlier finding")
+    if not isinstance(repeat_reason, str) or not repeat_reason.strip() or "\n" in repeat_reason:
+        raise ValueError(f"finding {ident} needs a one-line repeat_reason")
+    return {"repeat_of": repeat_of, "repeat_reason": repeat_reason.strip()}
+
+
+def _finding_lines(body: str, verdict: str, earlier: Collection[str] = ()) -> list[dict]:
+    """The finding lines, validated against the headings, the verdict and the earlier findings."""
     findings = []
     for obj in _json_lines(body, "finding"):
         ident = obj.get("finding")
@@ -79,6 +96,7 @@ def _finding_lines(body: str, verdict: str) -> list[dict]:
                     f"{MAX_SUMMARY_CHARS} characters"
                 )
             finding["summary"] = summary
+        finding.update(_repeat_fields(obj, ident, earlier))
         findings.append(finding)
     ids = [f["finding"] for f in findings]
     if len(set(ids)) != len(ids):

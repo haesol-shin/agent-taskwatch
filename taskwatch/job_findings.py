@@ -1,7 +1,8 @@
 """Finding records: the worker's status file, the index across jobs, and the repeat triggers.
 
-A finding has a rule id, so two findings are of the same kind when `rule` and the job `target`
-match; `other` is never a kind. Nothing here reads free text or calls a model.
+A repeat is the reviewer's judgment, carried by `repeat_of` on a finding. A shared rule id is
+not a repeat: the same rule can break on a new defect, and the same defect can come back under
+another id. Nothing here reads free text or calls a model.
 """
 
 import hashlib
@@ -18,7 +19,6 @@ from .state import State
 FINDINGS_FILE = "findings.json"
 NOTE_FILE = "root-cause.md"
 INDEX = "findings.jsonl"
-WINDOW = 10
 NOTE_LABELS = ("Cause:", "Missed by:", "Prevention:")
 # The one problem of a review whose verdict was read and is a FAIL.
 FAIL_PROBLEM = "the reviewer did not pass the result"
@@ -56,20 +56,18 @@ def last_failed(reviews: Sequence[Mapping]) -> Mapping | None:
     return None
 
 
-def _rules(review: Mapping) -> set[str]:
-    return {f["rule"] for f in review.get("findings", ()) if f["rule"] != "other"}
-
-
-def consecutive_rules(cycle: Sequence[Mapping]) -> tuple[list[str], list[int]]:
-    """Rules the newest review of the cycle shares with the substantive review before it, and
-    the two rounds. Rule ids only: no prose, category or location is compared."""
-    if not cycle or not substantive(cycle[-1]):
-        return [], []
-    for earlier in reversed(cycle[:-1]):
-        if substantive(earlier):
-            shared = sorted(_rules(cycle[-1]) & _rules(earlier))
-            return (shared, [earlier["round"], cycle[-1]["round"]]) if shared else ([], [])
-    return [], []
+def repeated_findings(cycle: Sequence[Mapping]) -> list[str]:
+    """Ids of the newest substantive review's findings that name an earlier finding of the job
+    as the same unresolved defect. The reviewer sets `repeat_of`; a shared rule id is not a
+    repeat."""
+    latest = next((review for review in reversed(cycle) if substantive(review)), None)
+    if latest is None:
+        return []
+    return [
+        finding_id(latest, finding)
+        for finding in latest.get("findings", ())
+        if finding.get("repeat_of")
+    ]
 
 
 def note_digest(folder: Path) -> str:
@@ -82,13 +80,15 @@ def note_digest(folder: Path) -> str:
 
 def stop_problems(folder: Path, stop: Mapping) -> list[str]:
     """What a resume after a root-cause stop still needs: a note changed since the stop and
-    complete for every rule that triggered it."""
+    complete for every finding id the stop recorded. A stop from before finding ids were kept
+    recorded rule ids instead; those notes stay acceptable."""
     problems = []
     if note_digest(folder) == stop.get("note_digest", ""):
         problems.append(
-            f"{NOTE_FILE} has not changed since the stop: analyse why the rule repeated"
+            f"{NOTE_FILE} has not changed since the stop: analyse why the finding repeated"
         )
-    return problems + note_problems(folder, stop.get("rules", []))
+    keys = stop.get("repeats") or stop.get("rules") or ()
+    return problems + note_problems(folder, keys)
 
 
 # --- the worker's record -------------------------------------------------------------------
@@ -241,26 +241,8 @@ def worker_problems(
     return problems
 
 
-def repeated_rules(
-    job: JobState, earlier: Sequence[Mapping], latest: Mapping, rows: Sequence[Mapping]
-) -> list[str]:
-    """Rules of the latest review that an earlier round or one of the last jobs also broke."""
-    seen = {f["rule"] for review in earlier for f in review.get("findings", [])}
-    order: list[str] = []
-    by_job: dict[str, set[str]] = {}
-    for row in rows:
-        if row.get("target") == job.target and row.get("job") != job.id:
-            if row["job"] not in by_job:
-                order.append(row["job"])
-            by_job.setdefault(row["job"], set()).add(row["rule"])
-    for other in order[-WINDOW:]:
-        seen |= by_job[other]
-    rules = {f["rule"] for f in latest.get("findings", []) if f["rule"] != "other"}
-    return sorted(rules & seen)
-
-
 def notes(folder: Path) -> dict[str, dict[str, str]]:
-    """`## <rule>` sections of the root-cause note, each with its labeled lines."""
+    """`## <finding id>` sections of the root-cause note, each with its labeled lines."""
     try:
         text = (folder / NOTE_FILE).read_text(encoding="utf-8")
     except OSError:
@@ -278,28 +260,18 @@ def notes(folder: Path) -> dict[str, dict[str, str]]:
     return sections
 
 
-def note_problems(folder: Path, rules: Sequence[str]) -> list[str]:
+def note_problems(folder: Path, keys: Sequence[str]) -> list[str]:
     sections = notes(folder)
     problems = []
-    for rule in rules:
-        section = sections.get(rule)
+    for key in keys:
+        section = sections.get(key)
         if section is None:
-            problems.append(f"{NOTE_FILE} needs a section `## {rule}`: the rule repeated")
+            problems.append(f"{NOTE_FILE} needs a section `## {key}`: the finding repeated")
             continue
         for label in NOTE_LABELS:
             if not section.get(label):
-                problems.append(f"{NOTE_FILE} section `## {rule}` needs a `{label}` line")
+                problems.append(f"{NOTE_FILE} section `## {key}` needs a `{label}` line")
     return problems
-
-
-def named_preventions(folder: Path, rules: Sequence[str]) -> dict[str, str]:
-    """The prevention a note names for each rule; `accepted: <reason>` names none."""
-    found = {}
-    for rule in rules:
-        text = notes(folder).get(rule, {}).get("Prevention:", "")
-        if text and not text.lower().startswith("accepted:"):
-            found[rule] = text
-    return found
 
 
 def bot_text(body: str) -> dict:

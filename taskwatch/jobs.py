@@ -38,7 +38,7 @@ REVIEWS = frozenset({"code", "design", "source"})
 # Records written before the field was renamed used `kind` with four values.
 _OLD_KINDS = {"code": "code", "design": "design", "document": "source", "research": "source"}
 MIN_REVIEWS = 1
-MAX_REVIEWS = 3
+MAX_REVIEWS = 5
 DEFAULT_MAX_REVIEWS = 3
 MAX_RECOVERIES = 3
 

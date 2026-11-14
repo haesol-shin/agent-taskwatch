@@ -43,6 +43,8 @@ FINDING = {
     "location": "out.txt:1",
     "summary": "The output is terse.",
     "detail": "Line one.\n{not a verdict}",
+    "repeat_of": "",
+    "repeat_reason": "",
 }
 
 
@@ -77,6 +79,26 @@ def test_schema_enums_are_the_parser_enums():
     assert set(SCHEMA["properties"]["design_check"]["properties"]) == set(DESIGN_KEYS)
     # every field of a finding line the parser reads is a field of the schema
     assert {"finding", "severity", "category", "rule", "location", "summary"} <= set(finding)
+    assert {"repeat_of", "repeat_reason"} <= set(SCHEMA["$defs"]["finding"]["required"])
+
+
+def test_every_schema_object_requires_all_its_properties():
+    """A strict output schema rejects a property that is not required; empty means none."""
+    missing = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key in node.get("properties", {}):
+                if key not in node.get("required", []):
+                    missing.append(f"{path}.{key}")
+            for key, value in node.items():
+                walk(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{path}[{index}]")
+
+    walk(SCHEMA, "$")
+    assert missing == []
 
 
 def test_a_schema_valid_answer_renders_into_what_the_parser_accepts():
@@ -95,7 +117,15 @@ def test_a_schema_valid_answer_renders_into_what_the_parser_accepts():
 def test_an_empty_summary_and_a_null_design_check_are_left_out_of_the_lines():
     body = review_print.render({**ANSWER, "findings": [{**FINDING, "summary": " "}]})
     assert "design_check" not in body and "summary" not in body
+    assert "repeat_of" not in body and "repeat_reason" not in body
     assert _finding_lines(body, "FAIL")[0]["finding"] == "F1"
+
+
+def test_a_repeat_in_print_mode_reaches_the_finding_line():
+    finding = {**FINDING, "repeat_of": "r1.F2", "repeat_reason": "the same defect"}
+    body = review_print.render({**ANSWER, "findings": [finding]})
+    parsed = _finding_lines(body, "FAIL", ["r1.F2"])[0]
+    assert (parsed["repeat_of"], parsed["repeat_reason"]) == ("r1.F2", "the same defect")
 
 
 @pytest.mark.parametrize(

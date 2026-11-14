@@ -457,6 +457,16 @@ def test_a_private_tmp_that_is_not_a_boolean_is_a_config_error(tmp_path, value):
         load_job_config(root)
 
 
+def test_four_and_five_reviews_are_allowed_for_the_host_and_a_job(tmp_path):
+    root = tmp_path / "root"
+    jobs = Jobs(root)
+    for value in (4, 5):
+        job = jobs.submit({**payload(tmp_path, f"job{value}"), "max_reviews": value}, value)
+        assert job.max_reviews == value
+    host_config(root, max_reviews=5)
+    assert load_job_config(root).max_reviews == 5
+
+
 def test_max_reviews_is_per_job_over_host_over_built_in_and_frozen_at_submit(tmp_path):
     root = tmp_path / "root"
     jobs = Jobs(root)
@@ -472,7 +482,7 @@ def test_max_reviews_is_per_job_over_host_over_built_in_and_frozen_at_submit(tmp
     assert stored == {"a": 3, "b": 2, "c": 1}  # a later host change leaves a stored job alone
 
 
-BAD_COUNTS = [True, None, "2", 2.0, 0, 4, -1, [2]]
+BAD_COUNTS = [True, None, "2", 2.0, 0, 6, -1, [2]]
 
 
 @pytest.mark.parametrize("value", BAD_COUNTS)

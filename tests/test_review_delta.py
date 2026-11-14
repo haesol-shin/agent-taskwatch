@@ -28,8 +28,8 @@ def lines(n: int, tag: str = "a") -> str:
     return "".join(f"{tag}{i}\n" for i in range(n))
 
 
-def review(fingerprint: str, base: str, *findings: dict) -> dict:
-    return {"fingerprint": fingerprint, "base": base, "findings": list(findings)}
+def review(fingerprint: str, base: str, *findings: dict, round: int = 1) -> dict:
+    return {"fingerprint": fingerprint, "base": base, "round": round, "findings": list(findings)}
 
 
 def finding(rule: str = "K-4", severity: str = "P1", location: str = "a.py:1") -> dict:
@@ -44,7 +44,7 @@ class Round:
         self.base = git(self.repo, "rev-parse", "HEAD")
         self.first = commit(self.repo, {"a.py": lines(20)}, "feat: first")
 
-    def decide(self, fix: dict[str, str], *, scope: str = "", prior=None, checks=(), base=None):
+    def decide(self, fix: dict[str, str], *, scope: str = "", prior=None, base=None):
         head = commit(self.repo, fix, "fix: second")
         return review_delta.decide(
             self.repo,
@@ -53,7 +53,6 @@ class Round:
             fingerprint=head,
             approval_scope=scope,
             prior=prior or [review(self.first, self.base)],
-            checks=list(checks),
         )
 
 
@@ -116,7 +115,6 @@ def test_f2_400_lines_is_a_full_review_even_when_it_is_under_half(tmp_path):
         fingerprint=head,
         approval_scope="",
         prior=[review(first, base)],
-        checks=[],
     )
     assert scope.lines > 400 and scope.ratio is not None and scope.ratio < 0.5
     assert scope.mode == "full" and scope.reasons[0].startswith("F2:")
@@ -157,23 +155,24 @@ def test_f6_a_path_the_approval_scope_names_is_a_full_review(rnd):
     )
 
 
-def test_f7_a_rule_that_came_back_is_a_full_review(rnd):
+def test_f7_a_reviewer_marked_repeat_is_a_full_review(rnd):
+    repeat = {
+        **finding("K-8", location="a.py:9"),
+        "repeat_of": "r1.F1",
+        "repeat_reason": "the same defect",
+    }
     again = [
         review(rnd.first, rnd.base, finding("K-7", location="a.py:1")),
-        review(rnd.first, rnd.base, finding("K-7", location="a.py:9")),
+        review(rnd.first, rnd.base, repeat, round=2),
     ]
     scope = rnd.decide({"a.py": lines(20).replace("a3", "x")}, prior=again)
-    assert scope.mode == "full" and any(r.startswith("F7:") and "K-7" in r for r in scope.reasons)
-    noted = other(rnd, "noted").decide(
-        {"a.py": lines(20).replace("a5", "x")}, checks=[{"recurred": {"K-9": "p"}}]
-    )
-    assert noted.mode == "full" and "K-9" in noted.reasons[-1]
+    assert scope.mode == "full" and any(r.startswith("F7:") and "r2.F1" in r for r in scope.reasons)
 
 
-def test_f7_the_catch_all_rule_other_is_not_a_repeat(rnd):
+def test_f7_a_shared_rule_without_repeat_of_is_not_a_repeat(rnd):
     again = [
-        review(rnd.first, rnd.base, finding("other")),
-        review(rnd.first, rnd.base, finding("other")),
+        review(rnd.first, rnd.base, finding("K-7", location="a.py:1")),
+        review(rnd.first, rnd.base, finding("K-7", location="a.py:9"), round=2),
     ]
     assert rnd.decide({"a.py": lines(20).replace("a3", "x")}, prior=again).mode == "delta"
 
@@ -273,7 +272,6 @@ def test_a_rebase_onto_newer_work_changes_the_effective_base_and_is_f3(tmp_path)
         fingerprint=head,
         approval_scope="",
         prior=[review(first, base)],
-        checks=[],
     )
     assert scope.mode == "full" and any(r.startswith("F3:") for r in scope.reasons)
 
@@ -299,7 +297,6 @@ def test_f6_an_absolute_path_in_the_approval_scope_is_read_under_the_work_folder
         fingerprint=commit(rnd.repo, fix, "fix: x"),
         approval_scope=text,
         prior=[review(rnd.first, rnd.base)],
-        checks=[],
         roots=(str(rnd.repo),),
     )
     assert scope.mode == "full" and any(r.startswith("F6:") for r in scope.reasons)
@@ -322,7 +319,6 @@ def test_f6_a_directory_or_the_root_in_the_approval_scope_is_full(tmp_path, name
         fingerprint=head,
         approval_scope=scope_text,
         prior=[review(rnd.first, rnd.base)],
-        checks=[],
         roots=roots,
     )
     assert scope.mode == "full" and any(r.startswith("F6:") for r in scope.reasons)
@@ -338,7 +334,6 @@ def test_f6_a_bare_word_outside_a_root_is_not_a_path(rnd):
         fingerprint=head,
         approval_scope="Edit src only if needed",
         prior=[review(rnd.first, rnd.base)],
-        checks=[],
         roots=(str(rnd.repo),),
     )
     assert not any(r.startswith("F6:") for r in scope.reasons)
