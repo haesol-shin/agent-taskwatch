@@ -342,6 +342,7 @@ def _init(root: Path, unit_dir: Path | None) -> dict:
     data.pop("review_bot_wait")
     data.pop("worker_mode")
     data.pop("worker_command")
+    data.pop("worker_roles")
     data.pop("private_tmp")
     data.pop("check_slots")
     if not config.exists():

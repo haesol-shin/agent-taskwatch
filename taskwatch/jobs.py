@@ -44,6 +44,8 @@ MAX_RECOVERIES = 3
 
 DEFAULT_BRANCH_PREFIX = "taskwatch/"
 _PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*(/[A-Za-z0-9][A-Za-z0-9_-]*)*[/-]?")
+# An omp model role, as the host and a job name it: a selector, never a model or command.
+WORKER_ROLE = re.compile(r"@[a-z][a-z0-9_-]*")
 
 
 def _freeze(value):
@@ -138,6 +140,9 @@ class JobState:
     spec_mode: str = "full"
     # Attempts already present when upgrading pre-print records remain RPC.
     legacy_worker_attempt: int = 0
+    # The omp model role the job's work and fix launch with, frozen at submit. Empty keeps the
+    # host command as written.
+    worker_role: str = ""
 
     def __post_init__(self) -> None:
         for item in fields(self):
@@ -166,6 +171,7 @@ class JobConfig:
     install_command: tuple[str, ...] | None = None
     worker_mode: str = "rpc"
     worker_command: tuple[str, ...] | None = None
+    worker_roles: tuple[str, ...] | None = None
     private_tmp: bool = True
     install_commands: Mapping[str, tuple[str, ...]] | None = None
     review_bots: Mapping[str, tuple[str, ...]] | None = None
@@ -281,6 +287,17 @@ def _check_slots(value: object) -> int:
     return value
 
 
+def _worker_roles(value: object) -> tuple[str, ...] | None:
+    """The roles a job may name; absent and empty both allow none."""
+    if value is None:
+        return None
+    _strings(value, "worker_roles")
+    for role in value:
+        if not WORKER_ROLE.fullmatch(role):
+            raise ValueError(f"worker_roles entries must match {WORKER_ROLE.pattern}: {role}")
+    return tuple(value)
+
+
 def load_job_config(root: Path) -> JobConfig:
     path = root / "taskwatch" / "jobs-config.json"
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -294,6 +311,7 @@ def load_job_config(root: Path) -> JobConfig:
         "max_reviews",
         "worker_mode",
         "worker_command",
+        "worker_roles",
         "install_command",
         "install_commands",
         "private_tmp",
@@ -371,6 +389,7 @@ def load_job_config(root: Path) -> JobConfig:
         install,
         worker_mode,
         tuple(obj["worker_command"]) if "worker_command" in obj else None,
+        _worker_roles(obj.get("worker_roles")),
         private_tmp,
         _install_commands(obj["install_commands"]) if "install_commands" in obj else None,
         _review_bots(obj.get("review_bots")),
@@ -416,6 +435,7 @@ class Jobs:
             data = _submission(payload)
             host = _host_config(self.state.root)
             data.setdefault("max_reviews", host.max_reviews)
+            _worker_role_allowed(data, host)
             _resolve_receipt_tokens(data, existing, host.branch_prefix)
             _public_text_base(data, existing)
             data.update(id=uuid.uuid4().hex, last_progress_at=now)
@@ -487,6 +507,7 @@ _OPTIONAL_FIELDS = {
     "public_text",
     "land",
     "spec_mode",
+    "worker_role",
 }
 UNIT_FILES = ("title.txt", "body.md", "commit.txt")
 # Optional public_text key: the repository requires the squash commit body to be blank.
@@ -603,6 +624,8 @@ def _submission(payload: dict) -> dict:
     if "public_text" in data:
         _public_text_field(data, review_only)
     _land_field(data, review_only)
+    if "worker_role" in data:
+        _worker_role_field(data, review_only)
     data.setdefault("predecessors", [])
     _strings(data["predecessors"], "predecessors")
     _controls(data)
@@ -645,6 +668,27 @@ def _host_config(root: Path) -> JobConfig:
         return load_job_config(root)
     except FileNotFoundError:
         return JobConfig()
+
+
+def _worker_role_field(data: dict, review_only: bool) -> None:
+    role = data["worker_role"]
+    if not isinstance(role, str) or not WORKER_ROLE.fullmatch(role):
+        raise ValueError(f"worker_role must match {WORKER_ROLE.pattern}")
+    if review_only:
+        raise ValueError("worker_role applies only to a job with a work stage")
+
+
+def _worker_role_allowed(data: dict, host: JobConfig) -> None:
+    """A role is a selector the host allows and only an RPC worker can use."""
+    role = data.get("worker_role", "")
+    if not role:
+        return
+    if host.worker_mode != "rpc":
+        raise ValueError("worker_role needs host worker_mode rpc")
+    if host.worker_roles is None:
+        raise ValueError("worker_role needs host worker_roles")
+    if role not in host.worker_roles:
+        raise ValueError(f"worker_role {role} is not in the host worker_roles")
 
 
 def _resolve_receipt_tokens(data: dict, existing: Mapping[str, JobState], prefix: str) -> None:
@@ -1003,6 +1047,9 @@ def _validate_controls(job: dict) -> None:
             raise RecordError(f"jobs.jsonl: invalid {key}")
     if job.get("spec_mode", "full") not in SPEC_MODES:
         raise RecordError("jobs.jsonl: invalid spec_mode")
+    role = job.get("worker_role", "")
+    if not isinstance(role, str) or (role and not WORKER_ROLE.fullmatch(role)):
+        raise RecordError("jobs.jsonl: invalid worker_role")
     if job["resume_stage"] not in STAGES:
         raise RecordError("jobs.jsonl: invalid resume stage")
     if type(job.get("expected_wait_seconds")) is not int or job["expected_wait_seconds"] < 0:

@@ -752,6 +752,100 @@ def test_print_still_validates_unused_omp_argv(tmp_path, command):
         load_job_config(root)
 
 
+@pytest.mark.parametrize(
+    "roles,loaded",
+    [(None, None), ([], ()), (["@strong", "@task"], ("@strong", "@task"))],
+)
+def test_host_worker_roles_load_and_an_absent_or_empty_list_allows_none(tmp_path, roles, loaded):
+    root = tmp_path / "root"
+    host_config(root, worker_roles=roles)
+    assert load_job_config(root).worker_roles == loaded
+
+
+@pytest.mark.parametrize(
+    "roles,error",
+    [
+        ("@strong", "worker_roles must be a list"),
+        ({"@strong": 1}, "worker_roles must be a list"),
+        ([1], "worker_roles needs nonempty strings"),
+        (["strong"], "worker_roles entries must match"),
+        (["@Strong"], "worker_roles entries must match"),
+        (["@1x"], "worker_roles entries must match"),
+    ],
+)
+def test_host_worker_roles_reject_invalid_entries_at_load(tmp_path, roles, error):
+    root = tmp_path / "root"
+    host_config(root, worker_roles=roles)
+    with pytest.raises(ValueError, match=error):
+        load_job_config(root)
+
+
+def test_init_omits_the_optional_worker_roles_key(tmp_path):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    written = json.loads((root / "taskwatch" / "jobs-config.json").read_text(encoding="utf-8"))
+    assert "worker_roles" not in written
+
+
+def test_submission_freezes_an_allowed_worker_role(tmp_path):
+    root = tmp_path / "root"
+    path = host_config(root, worker_roles=["@strong", "@task"])
+    jobs = Jobs(root)
+    job = jobs.submit(_code_payload(tmp_path, "msg:1", worker_role="@strong"), 10)
+    assert job.worker_role == "@strong"
+    assert jobs.load()[job.id].worker_role == "@strong"
+    plain = jobs.submit(_code_payload(tmp_path, "msg:2"), 20)
+    assert plain.worker_role == ""
+    # A later host change does not reinterpret a job that exists.
+    data = {**json.loads(path.read_text(encoding="utf-8")), "worker_roles": []}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert jobs.load()[job.id].worker_role == "@strong"
+
+
+@pytest.mark.parametrize(
+    "host,error",
+    [
+        ({}, "worker_role needs host worker_roles"),
+        ({"worker_roles": ["@task"]}, "not in the host worker_roles"),
+        ({"worker_roles": []}, "not in the host worker_roles"),
+        (
+            {
+                "worker_mode": "print",
+                "worker_command": ["worker.invalid"],
+                "worker_roles": ["@strong"],
+            },
+            "worker_role needs host worker_mode rpc",
+        ),
+    ],
+)
+def test_submission_refuses_a_worker_role_the_host_does_not_allow(tmp_path, host, error):
+    root = tmp_path / "root"
+    host_config(root, **host)
+    jobs = Jobs(root)
+    with pytest.raises(ValueError, match=error):
+        jobs.submit(_code_payload(tmp_path, "msg:1", worker_role="@strong"))
+    assert jobs.load() == {}
+
+
+@pytest.mark.parametrize("role", ["strong", "@", "@Strong", "@1x", "@str ong", 1, None, ["@a"]])
+def test_submission_rejects_a_worker_role_that_is_not_a_role_name(tmp_path, role):
+    root = tmp_path / "root"
+    host_config(root, worker_roles=["@strong"])
+    with pytest.raises(ValueError, match="worker_role must match"):
+        Jobs(root).submit(_code_payload(tmp_path, "msg:1", worker_role=role))
+
+
+def test_submission_rejects_a_worker_role_without_a_work_stage(tmp_path):
+    data = payload(tmp_path)
+    for key in ("outputs", "check_command", "checklist", "progress"):
+        del data[key]
+    data.update(review_target={"files": ["intent.md"]}, worker_role="@strong")
+    root = tmp_path / "root"
+    host_config(root, worker_roles=["@strong"])
+    with pytest.raises(ValueError, match="worker_role applies only to a job with a work stage"):
+        Jobs(root).submit(data)
+
+
 def test_submission_rejects_a_directory_output_of_the_target_only_for_a_code_job(tmp_path):
     repo = make_repo(tmp_path)
     (repo / "docs").mkdir()

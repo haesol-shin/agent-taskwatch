@@ -1036,6 +1036,23 @@ def _converse(
     return reply
 
 
+def _role_command(command: tuple[str, ...], role: str) -> tuple[str, ...]:
+    """The host command with its model selector set to the job's role.
+
+    Only the value after `--model` changes, so the rest of the host command keeps its meaning;
+    a command without the flag gets one appended.
+    """
+    argv = list(command)
+    if "--model" in argv:
+        index = argv.index("--model") + 1
+        if index < len(argv):
+            argv[index] = role
+        else:
+            argv.append(role)
+        return tuple(argv)
+    return (*argv, "--model", role)
+
+
 def _worker_identity(ctx: Ctx) -> tuple[str, tuple[str, ...]]:
     for event in reversed(ctx.job.events):
         if event.get("type") == "worker_launch" and event.get("attempt") == ctx.job.attempt:
@@ -1044,6 +1061,8 @@ def _worker_identity(ctx: Ctx) -> tuple[str, tuple[str, ...]]:
     command = ctx.config.omp_command if mode == "rpc" else ctx.config.worker_command
     if not command:
         raise StepError("worker_mode print needs worker_command")
+    if mode == "rpc" and ctx.job.worker_role:
+        command = _role_command(command, ctx.job.worker_role)
     program = command[0]
     if "/" in program:
         executable = str((ctx.workspace / program).absolute())

@@ -21,6 +21,7 @@ from taskwatch.jobs import JobConfig, Jobs, JobState
 from taskwatch.rate_limit import RateLimit
 from tests.git_fixture import make_repo
 from tests.spec_fixture import VALID_SPEC
+from tests.test_jobs import host_config
 from tests.verdicts import CODE_PASS
 
 FAKE = Path(__file__).with_name("fake_omp.py")
@@ -1106,6 +1107,83 @@ def test_work_fix_and_review_each_bind_their_own_launch_model(env):
         "alpha/one",
         "gamma/three",
         "gamma/three",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (("omp",), ("omp", "--model", "@strong")),
+        (("omp", "--model", "@task"), ("omp", "--model", "@strong")),
+        (("omp", "--model", "@task", "--flag"), ("omp", "--model", "@strong", "--flag")),
+        (("omp", "--model"), ("omp", "--model", "@strong")),
+    ],
+)
+def test_a_job_role_sets_only_the_model_selector(command, expected):
+    assert job_runner._role_command(command, "@strong") == expected
+
+
+def role_env(tmp_path, monkeypatch, role="@strong", **extra):
+    """A job whose host allows one role; its command is the fake omp."""
+    host_config(tmp_path / "root", worker_roles=[role])
+    return Env(tmp_path, monkeypatch, worker_role=role, **extra)
+
+
+def test_a_job_worker_role_is_appended_without_a_model_flag(tmp_path, monkeypatch):
+    env = role_env(tmp_path, monkeypatch)
+    set_roles(env, **{"@strong": "alpha/strong"})
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    launch = next(e for e in env.get().events if e["type"] == "worker_launch")
+    assert tuple(launch["command"]) == (sys.executable, str(FAKE), "--model", "@strong")
+    opened = launches(env)[0][2]
+    assert (opened["provider"], opened["modelId"]) == ("alpha", "strong")
+
+
+def test_a_job_worker_role_replaces_an_existing_model_value(tmp_path, monkeypatch):
+    env = role_env(tmp_path, monkeypatch)
+    on_model(env, "--model", "@task")
+    set_roles(env, **{"@task": "beta/task", "@strong": "alpha/strong"})
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    launch = next(e for e in env.get().events if e["type"] == "worker_launch")
+    assert tuple(launch["command"]) == (sys.executable, str(FAKE), "--model", "@strong")
+    opened = launches(env)[0][2]
+    assert (opened["provider"], opened["modelId"]) == ("alpha", "strong")
+
+
+def test_a_job_worker_role_leaves_the_review_command_unchanged(tmp_path, monkeypatch):
+    env = role_env(tmp_path, monkeypatch)
+    on_model(env, "--model", "@task")
+    set_roles(env, **{"@task": "beta/task", "@strong": "alpha/strong"})
+    env.scenario([work_turn(), {"reply": f"{PASS}\nNo findings."}])
+    assert env.run("work") == 0
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    review_argv = [entry["argv"] for entry in env.log() if "argv" in entry][-1]
+    assert review_argv == ["--model", "@task", "--mode", "rpc", "--no-ui"]
+    opened = launches(env)[1][2]
+    assert (opened["provider"], opened["modelId"]) == ("beta", "task")
+
+
+def test_a_new_attempt_keeps_the_worker_role_frozen_at_submit(tmp_path, monkeypatch):
+    env = role_env(tmp_path, monkeypatch)
+    set_roles(env, **{"@strong": "alpha/strong"})
+    env.scenario([{"die_after_content": True}, work_turn()])
+    assert env.run("work") == 1
+    # The host may stop allowing the role; the record keeps the one the job was submitted with.
+    path = tmp_path / "root" / "taskwatch" / "jobs-config.json"
+    data = {**json.loads(path.read_text(encoding="utf-8")), "worker_roles": []}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert env.run("work") == 0
+    assert env.get().worker_role == "@strong"
+    assert [entry["argv"] for entry in env.log() if "argv" in entry] == [
+        ["--model", "@strong", "--mode", "rpc", "--no-ui"],
+        ["--model", "@strong", "--mode", "rpc", "--no-ui"],
+    ]
+    assert [(run[2]["provider"], run[2]["modelId"]) for run in launches(env)] == [
+        ("alpha", "strong"),
+        ("alpha", "strong"),
     ]
 
 
