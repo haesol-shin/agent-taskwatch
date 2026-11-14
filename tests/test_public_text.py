@@ -478,3 +478,38 @@ def test_the_check_command_refuses_an_unknown_job(unit_env, capsys):
 def test_the_workflow_end_section_names_the_check_command(unit_env):
     end = (unit_env.folder() / "WORKFLOW.md").read_text(encoding="utf-8").split("## End")[1]
     assert "taskwatch.job_cli" in end and f"check {unit_env.job.id}" in end
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_bot_landing_copy_uses_only_bound_code_acceptance(unit_env, tmp_path, bound):
+    from taskwatch.job_text import reviewed_copy
+    from tests.verdicts import CODE_PASS
+
+    env = unit_env
+    env.commit("feat(x): add\n\nWhy.")
+    env.scenario([{"reply": CODE_PASS}])
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    job = env.get()
+    code = job.reviews[-1]
+    observation = {
+        **code,
+        "seq": code["seq"] + 1,
+        "round": 2,
+        "ok": False,
+        "verdict": "FAIL",
+        "bot_observation": True,
+        "accepted_review_seq": code["seq"] if bound else 999,
+        "reviewer": "bot:review-bot-example",
+    }
+    job = replace(
+        job,
+        land=True,
+        land_state={"bot": {"apps": ["review-bot-example"]}},
+        reviews=(*job.reviews, observation),
+    )
+    out = tmp_path / "copy"
+    result, _ = reviewed_copy(job, env.config.env, env.folder(), "pr", out)
+    assert result == (0 if bound else 3)
+    if bound:
+        assert (out / "body.md").read_text().startswith("body\n")

@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from . import choices
+from .activity import land_facts
 from .fingerprint import git_fingerprint, resolve_commit
 from .job_env import job_environment
 from .job_types import job_type_label
@@ -211,17 +212,46 @@ def read_worker_brief(jobs: Jobs, job: JobState) -> str:
         return ""
 
 
+def _base_review(job: JobState) -> Mapping:
+    """The review whose evidence the card reports: the shared accepted selection."""
+    if not job.reviews:
+        return {}
+    from .job_delivery import accepted_review
+
+    review = accepted_review(job)
+    return review if isinstance(review, Mapping) else {}
+
+
 def compose(jobs: Jobs, config: JobConfig, job: JobState) -> list[str]:
     """The full brief of a job: the runner's facts, the worker's sections, the review lists."""
-    review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
+    review = _base_review(job)
     worker = sections(read_worker_brief(jobs, job))
-    lines = _facts(jobs, config, job, review)
+    active = _active_bot_findings(job)
+    latest_round = review.get("round", len(job.reviews))
+    remaining = {
+        **review,
+        "findings": [
+            finding
+            for finding in review.get("findings", [])
+            if f"r{latest_round}.{finding['finding']}" not in active
+        ],
+    }
+    reported = {
+        **review,
+        "findings": [
+            *remaining["findings"],
+            *(finding for finding, _thread in active.values()),
+        ],
+    }
+    lines = _facts(jobs, config, job, reported)
     for name in ("Why", "What changed and why"):
         lines += _section(name, worker.get(name) or ["(none)"])
     lines += _section(
         "Decisions needed", _picks(job) or worker.get("Decisions needed") or ["(none)"]
     )
-    lines += _section("Remaining findings", _finding_lines(review))
+    finding_lines = _finding_lines(remaining) if remaining["findings"] else []
+    lines += _section("Remaining findings", finding_lines + _active_bot_lines(job) or ["none"])
+    lines += _bot_not_checked(job, config.language or "en")
     lines += [
         "Reviewer checked: " + (review.get("checked") or "(not recorded)"),
         "Reviewer did not check: " + (review.get("not_checked") or "(not recorded)"),
@@ -233,17 +263,17 @@ def compose(jobs: Jobs, config: JobConfig, job: JobState) -> list[str]:
 def card(jobs: Jobs, config: JobConfig, job: JobState) -> list[str]:
     """The message the owner reads: the worker's conclusion, a blank line, then only the lists
     that have content. `Changed` is the worker's `## Card` bullets; the other two come from the
-    last review: the `summary` of each P2 or P3 finding, and the items of `not_checked` split on
-    `; `."""
-    review = job.reviews[-1] if job.reviews and isinstance(job.reviews[-1], Mapping) else {}
+    accepted review: the `summary` of each P2 or P3 finding, and the items of `not_checked`
+    split on `; `."""
+    review = _base_review(job)
     own = sections(read_worker_brief(jobs, job)).get("Card", [])
     conclusion = [line for line in own if not line.startswith("-")]
     changed = [line for line in own if line.startswith("-")]
     labels = LABELS[config.language or "en"]
     lists = (
         [line[1:].strip() for line in changed],
-        [f["summary"] for f in _ranked(review) if _small(f)],
-        _items(review.get("not_checked")),
+        _small_problems(job, review, config.language or "en"),
+        _items(review.get("not_checked")) + _bot_not_checked(job, config.language or "en"),
     )
     # A job without a worker brief (a review-only job) has no conclusion: the verdict stands in.
     verdict = review.get("verdict") or "none"
@@ -285,6 +315,84 @@ def _small(finding: Mapping) -> bool:
     card, and a finding without a `summary` (an older record, a failed review) stays in the
     full brief, where its rule and location are."""
     return finding["severity"] in {"P2", "P3"} and bool(finding.get("summary"))
+
+
+def _active_bot_findings(job: JobState) -> dict[str, tuple[Mapping, Mapping]]:
+    """Resolve open bot findings and durable deferrals against their original round."""
+    bot = job.land_state.get("bot", {})
+    refs = set(bot.get("followup", {}).get("findings", []))
+    threads = {
+        thread["finding"]: thread
+        for thread in bot.get("threads", {}).values()
+        if thread.get("status") == "open"
+        or (thread.get("status") == "deferred" and thread.get("finding") in refs)
+    }
+    active = {}
+    for index, review in enumerate(job.reviews, 1):
+        for finding in review.get("findings", []):
+            ident = f"r{review.get('round', index)}.{finding['finding']}"
+            if ident in threads:
+                active[ident] = (finding, threads[ident])
+    return active
+
+
+def _small_problems(job: JobState, review: Mapping, language: str) -> list[str]:
+    active = _active_bot_findings(job)
+    round_number = review.get("round", len(job.reviews))
+    items = []
+    for finding in _ranked(review):
+        if _small(finding) and f"r{round_number}.{finding['finding']}" not in active:
+            items.append((finding["severity"], finding["summary"]))
+    followup = job.land_state.get("bot", {}).get("followup", {}).get("id", "")
+    for finding, thread in active.values():
+        if _small(finding):
+            status = thread["status"]
+            if language == "ko":
+                status = "보류" if status == "deferred" else "미해결"
+            reference = f" [{followup}]" if thread["status"] == "deferred" else ""
+            prefix = f"{finding['severity']} {status}{reference}: "
+            # Keep the identity visible even when the summary fills the entire bullet.
+            summary = _cut_to(finding["summary"], MAX_CARD_BULLET_CHARS - len(prefix))
+            items.append((finding["severity"], prefix + summary))
+    return [text for _, text in sorted(items, key=lambda item: item[0])]
+
+
+def _cut_to(text: str, length: int) -> str:
+    return text if len(text) <= length else text[: max(0, length - 1)] + "…"
+
+
+def _active_bot_lines(job: JobState) -> list[str]:
+    followup = job.land_state.get("bot", {}).get("followup", {}).get("id", "")
+    lines = []
+    for ident, (finding, thread) in _active_bot_findings(job).items():
+        location = thread["path"]
+        if thread.get("line") is not None:
+            location += f":{thread['line']}"
+        reference = f" [{followup}]" if thread["status"] == "deferred" else ""
+        lines.append(
+            f"- {ident} {finding['severity']} {thread['status']}{reference}: "
+            f"{finding.get('summary', '(not recorded)')} -- {location} {thread['url']}"
+        )
+    return lines
+
+
+def _bot_not_checked(job: JobState, language: str) -> list[str]:
+    bot = job.land_state.get("bot", {})
+    outcomes = bot.get("outcome", {})
+    lines = []
+    for slug, outcome in outcomes.items():
+        if outcome.startswith("fallback:"):
+            if language == "ko":
+                lines.append(f"리뷰 봇 {slug}: {outcome}; 승인된 자체 리뷰로 대체")
+            else:
+                lines.append(f"Review bot {slug}: {outcome}; using accepted own review")
+    if bot.get("apps"):
+        lines.append(
+            "봇의 마지막 확인과 병합 사이에 새 의견이 나타날 수 있음"
+            if language == "ko"
+            else "New bot feedback can appear between the final read and merge"
+        )
+    return lines
 
 
 def trailer(jobs: Jobs, job: JobState) -> list[str]:
@@ -345,7 +453,7 @@ def _facts(jobs: Jobs, config: JobConfig, job: JobState, review: Mapping) -> lis
         _result(job),
         _changed(job, config),
         f"Open findings: {count_findings(review)}{_snippets(checks)}",
-    ]
+    ] + [f"Land: {fact}" for fact in land_facts(job)]
 
 
 def _snippets(check: Mapping | None) -> str:

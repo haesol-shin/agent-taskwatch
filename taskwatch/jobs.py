@@ -168,6 +168,12 @@ class JobConfig:
     worker_command: tuple[str, ...] | None = None
     private_tmp: bool = True
     install_commands: Mapping[str, tuple[str, ...]] | None = None
+    review_bots: Mapping[str, tuple[str, ...]] | None = None
+    review_bot_wait: int = 600
+
+    def __post_init__(self) -> None:
+        if self.review_bots is not None:
+            object.__setattr__(self, "review_bots", _freeze(self.review_bots))
 
 
 COMMIT_RULES = ("bullet_one_line",)
@@ -236,6 +242,38 @@ def _install_commands(value: object) -> Mapping[str, tuple[str, ...]] | None:
     return MappingProxyType(commands)
 
 
+def _review_bots(value: object) -> Mapping[str, tuple[str, ...]] | None:
+    from . import forge
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("review_bots must be an object of repository identities to app slugs")
+    bots = {}
+    for key, apps in value.items():
+        try:
+            host = key.split("/", 1)[0].lower()
+            identity = "/".join(forge.parse_origin(f"https://{key}", (host,))).lower()
+            if identity != key.lower() or identity in bots:
+                raise ValueError("noncanonical or duplicate repository identity")
+            if not isinstance(apps, list) or not apps:
+                raise ValueError("entry must be a nonempty list of app slugs")
+            if any(
+                not isinstance(app, str) or not re.fullmatch(r"[a-z0-9-]+", app) for app in apps
+            ):
+                raise ValueError("app slugs must match [a-z0-9-]+")
+        except (ValueError, forge.ForgeError) as exc:
+            raise ValueError(f"invalid review_bots entry {key!r}: {exc}") from exc
+        bots[identity] = tuple(apps)
+    return MappingProxyType(bots)
+
+
+def _review_bot_wait(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("review_bot_wait must be a positive integer")
+    return value
+
+
 def load_job_config(root: Path) -> JobConfig:
     path = root / "taskwatch" / "jobs-config.json"
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -252,6 +290,8 @@ def load_job_config(root: Path) -> JobConfig:
         "install_command",
         "install_commands",
         "private_tmp",
+        "review_bots",
+        "review_bot_wait",
     } != {
         "version",
         "slots",
@@ -299,6 +339,7 @@ def load_job_config(root: Path) -> JobConfig:
     private_tmp = obj.get("private_tmp", True)
     if type(private_tmp) is not bool:
         raise ValueError("private_tmp must be true or false")
+    review_bot_wait = _review_bot_wait(obj.get("review_bot_wait", 600))
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -323,6 +364,8 @@ def load_job_config(root: Path) -> JobConfig:
         tuple(obj["worker_command"]) if "worker_command" in obj else None,
         private_tmp,
         _install_commands(obj["install_commands"]) if "install_commands" in obj else None,
+        _review_bots(obj.get("review_bots")),
+        review_bot_wait,
     )
 
 

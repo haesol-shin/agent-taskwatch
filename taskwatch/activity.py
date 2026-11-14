@@ -49,6 +49,14 @@ def land_facts(job: JobState) -> list[str]:
         facts.append("tree verified" if state.get("tree_verified") else "tree not verified")
     if install := state.get("install"):
         facts.append(f"install {_line(install.get('status', 'unknown'))}")
+    if bot := state.get("bot"):
+        for slug, outcome in bot.get("outcome", {}).items():
+            facts.append(f"bot {_line(slug)} {_line(outcome)}")
+        if followup := bot.get("followup"):
+            facts.append(
+                f"followup {_line(followup.get('id', ''))} "
+                f"({len(followup.get('findings', []))} findings)"
+            )
     if error := state.get("last_error"):
         facts.append(f"error {_line(error)}")
     return facts

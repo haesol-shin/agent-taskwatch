@@ -155,6 +155,48 @@ def _bool(value: object) -> bool:
     return value
 
 
+def _apps(value) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(app, str) or not re.fullmatch(r"[a-z0-9-]+", app) for app in value
+    ):
+        raise ForgeError("app slugs must match [a-z0-9-]+")
+    return tuple(value)
+
+
+def _bot_run(row: dict, head_sha: str) -> tuple[str, dict]:
+    if _sha(row.get("head_sha")) != head_sha:
+        raise Mismatch("check head differs")
+    app = _text(_object(row.get("app")).get("slug"))
+    _apps((app,))
+    status = _text(row.get("status"))
+    conclusion = row.get("conclusion")
+    if conclusion is not None:
+        conclusion = _text(conclusion)
+    if status not in {
+        "queued",
+        "in_progress",
+        "completed",
+        "waiting",
+        "requested",
+        "pending",
+    } or conclusion not in {
+        None,
+        "success",
+        "failure",
+        "neutral",
+        "cancelled",
+        "skipped",
+        "timed_out",
+        "action_required",
+        "stale",
+        "startup_failure",
+    }:
+        raise ForgeError("invalid check status or conclusion")
+    if (status == "completed") != (conclusion is not None):
+        raise ForgeError("inconsistent check status and conclusion")
+    return app, {"status": status, "conclusion": conclusion}
+
+
 def parse_origin(origin: str, authenticated_hosts: tuple[str, ...] = ()) -> tuple[str, str, str]:
     """Accept credential-free HTTPS or git SSH identities, never local/alias origins.
 
@@ -589,7 +631,12 @@ class GitHub:
         return attempts
 
     def _checks(
-        self, repo: Repository, head_sha: str, required: set, runs: list[dict]
+        self,
+        repo: Repository,
+        head_sha: str,
+        required: set,
+        runs: list[dict],
+        exclude_apps: tuple[str, ...] = (),
     ) -> list[CIEvidence]:
         rows = self._rows(
             repo,
@@ -602,6 +649,10 @@ class GitHub:
             if _sha(row.get("head_sha")) != head_sha:
                 raise Mismatch("check head differs")
             name, app = _text(row.get("name")), _int(_object(row.get("app")).get("id"))
+            is_required = (name, None) in required or (name, app) in required
+            if exclude_apps and not is_required:
+                if _text(_object(row.get("app")).get("slug")) in exclude_apps:
+                    continue
             check_id = _int(row.get("id"))
             run_id, attempt = attempts.get(check_id, (None, None))
             evidence.append(
@@ -613,7 +664,7 @@ class GitHub:
                     None,
                     _text(row.get("status")),
                     row.get("conclusion"),
-                    (name, None) in required or (name, app) in required,
+                    is_required,
                     attempt,
                     app,
                     run_id,
@@ -660,7 +711,7 @@ class GitHub:
             )
         return evidence
 
-    def inspect_ci(self, repo: Repository, number: int, head_sha: str) -> CI:
+    def inspect_ci(self, repo: Repository, number: int, head_sha: str, *, exclude_apps=()) -> CI:
         """Gate on CI.state after caller-owned registration grace, never on evidence count.
 
         All optional registered checks/statuses and qualifying workflows also block green.
@@ -668,10 +719,11 @@ class GitHub:
         Workflow requiredness is derived from its suite's required check contexts.
         """
         head_sha = _sha(head_sha)
+        exclude_apps = _apps(exclude_apps)
         pr = self.read_pull_request(repo, number, head_sha)
         required = self._required(repo)
         runs = self._workflow_runs(repo, pr)
-        evidence = self._checks(repo, head_sha, required, runs)
+        evidence = self._checks(repo, head_sha, required, runs, exclude_apps)
         evidence.extend(self._statuses(repo, head_sha, required))
         for row in runs:
             suite_id = _int(row.get("check_suite_id"))
@@ -711,6 +763,91 @@ class GitHub:
                     )
                 )
         return CI(head_sha, tuple(evidence))
+
+    def inspect_bot_runs(self, repo: Repository, head_sha: str, apps) -> dict[str, list[dict]]:
+        """Return every exact-head check for the requested app slugs, without supersession."""
+        head_sha = _sha(head_sha)
+        apps = _apps(apps)
+        result = {app: [] for app in apps}
+        rows = self._rows(
+            repo,
+            f"{self._path(repo)}/commits/{head_sha}/check-runs?filter=all&per_page=100",
+            "check_runs",
+        )
+        for row in rows:
+            app, run = _bot_run(row, head_sha)
+            if app in result:
+                result[app].append(run)
+        return result
+
+    def review_threads(self, repo: Repository, number: int, head_sha: str) -> list[dict]:
+        """Observe root comments in thread order; never silently truncate comments."""
+        number, head_sha = _int(number), _sha(head_sha)
+        query = (
+            "query($owner:String!,$name:String!,$cursor:String){"
+            "repository(owner:$owner,name:$name){nameWithOwner "
+            f"pullRequest(number:{number}){{number headRefOid "
+            "reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} "
+            "nodes{id isResolved isOutdated comments(first:100){"
+            "pageInfo{hasNextPage} nodes{databaseId url path line body "
+            "author{__typename login}}}}}}}}"
+        )
+        result, seen = [], set()
+        cursor = None
+        while True:
+            fields = {
+                "query": query,
+                "owner": repo.owner,
+                "name": repo.name,
+            }
+            if cursor is not None:
+                fields["cursor"] = cursor
+            data = _object(self._api(repo, "graphql", fields=fields))
+            if "errors" in data:
+                raise ForgeError("review threads query failed; output withheld")
+            repository = _object(_object(data.get("data")).get("repository"))
+            identity = _text(repository.get("nameWithOwner"))
+            if identity.lower() != f"{repo.owner}/{repo.name}".lower():
+                raise Mismatch("review threads repository differs")
+            pr = _object(repository.get("pullRequest"))
+            if _int(pr.get("number")) != number or _sha(pr.get("headRefOid")) != head_sha:
+                raise Mismatch("review threads pull request or head differs")
+            threads = _object(pr.get("reviewThreads"))
+            for node in _list(threads.get("nodes")):
+                result.append(self._review_thread(_object(node)))
+            page = _object(threads.get("pageInfo"))
+            if not _bool(page.get("hasNextPage")):
+                return result
+            cursor = _text(page.get("endCursor"))
+            if cursor in seen:
+                raise ForgeError("review thread pagination repeated a cursor")
+            seen.add(cursor)
+
+    @staticmethod
+    def _review_thread(node: dict) -> dict:
+        comments = _object(node.get("comments"))
+        if _bool(_object(comments.get("pageInfo")).get("hasNextPage")):
+            raise ForgeError("review thread has more than 100 comments")
+        roots = _list(comments.get("nodes"))
+        if not roots:
+            raise ForgeError("review thread has no root comment")
+        root = _object(roots[0])
+        author = _object(root.get("author"))
+        line = root.get("line")
+        if line is not None:
+            line = _int(line)
+        return {
+            "id": _text(node.get("id")),
+            "root_id": _int(root.get("databaseId")),
+            "url": _text(root.get("url")),
+            "path": _text(root.get("path")),
+            "line": line,
+            "author_type": _text(author.get("__typename")),
+            "author": _text(author.get("login")),
+            "body": _string(root.get("body")),
+            "resolved": _bool(node.get("isResolved")),
+            "outdated": _bool(node.get("isOutdated")),
+        }
 
     @staticmethod
     def _validate_run(repo: Repository, row: dict, head_sha: str):
