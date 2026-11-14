@@ -1568,7 +1568,7 @@ def test_ci_query_finishing_after_deadline_cannot_accept_green_or_spend_a_rerun(
 
     def observation():
         clock[0] = 111.0
-        return SimpleNamespace(state=observed, evidence=()), ()
+        return SimpleNamespace(state=observed, evidence=()), (), False
 
     transaction.observe_ci = observation
     monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
@@ -2076,6 +2076,62 @@ def test_bot_fallback_never_extends_deadline_or_skips_thread_gate(
     assert tx.state["bot"]["window_end"] == 600
 
 
+def test_an_app_added_after_green_starts_its_window(monkeypatch):
+    clock = [0]
+    tx = object.__new__(job_land.Transaction)
+    tx.repo = None
+    tx.state = {"H": "a" * 40, "bot": {"apps": [], "wait": 600, "outcome": {}}}
+    tx.review_bots = lambda: (APP,)
+    tx.save = lambda **changes: tx.state.update(changes)
+    tx.wait = lambda seconds: pytest.fail("a completed first check needs no wait")
+    tx.bot_findings = lambda: None
+    tx.api = SimpleNamespace(
+        inspect_bot_runs=lambda *args: {APP: [{"status": "completed", "conclusion": "success"}]}
+    )
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+    tx.bot()
+    assert tx.state["bot"]["head"] == "a" * 40
+    assert tx.state["bot"]["window_end"] == 600
+    assert tx.state["bot"]["outcome"] == {APP: "complete"}
+
+
+def test_a_selection_change_reuses_the_existing_bot_window(monkeypatch):
+    clock = [100]
+    tx = object.__new__(job_land.Transaction)
+    tx.repo = None
+    tx.state = {
+        "H": "a" * 40,
+        "bot": {"apps": [APP], "head": "a" * 40, "window_end": 600, "wait": 600, "outcome": {}},
+    }
+    tx.review_bots = lambda: (APP, "second-app")
+    tx.save = lambda **changes: tx.state.update(changes)
+    tx.wait = lambda seconds: pytest.fail("completed checks need no wait")
+    tx.bot_findings = lambda: None
+    tx.api = SimpleNamespace(
+        inspect_bot_runs=lambda *args: {
+            app: [{"status": "completed", "conclusion": "success"}] for app in args[2]
+        }
+    )
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+    tx.bot()
+    assert tx.state["bot"]["window_end"] == 600
+    assert tx.state["bot"]["outcome"] == {APP: "complete", "second-app": "complete"}
+
+
+def test_a_legacy_green_record_keeps_the_selection_it_observed():
+    tx = object.__new__(job_land.Transaction)
+    tx.state = {"ci_green": "a" * 64, "bot": {"apps": [APP], "threads": {}}}
+    tx.save = lambda **changes: tx.state.update(changes)
+    tx.migrate_green()
+    assert tx.state["ci_green"] == {"digest": "a" * 64, "bots": [APP]}
+    evidence = SimpleNamespace(state="success", evidence=())
+    with pytest.raises(job_land.LandStop) as stopped:
+        tx.green(evidence, (APP,), "saved green CI identity changed")
+    assert stopped.value.reason == "land_ci_failed"
+    tx.green(evidence, ("second-app",), "saved green CI identity changed")
+    assert tx.state["ci_green"]["bots"] == ["second-app"]
+
+
 @pytest.mark.parametrize("late", [False, True])
 def test_visible_high_blocks_even_on_fallback_or_final_reread(make, monkeypatch, late):
     with bot_lab(make, monkeypatch) as (lab, tx):
@@ -2247,6 +2303,23 @@ def test_a_bot_selection_change_reaches_a_job_already_landing(make, monkeypatch)
         tx.bot()
         assert tx.state["bot"]["apps"] == [APP]
         assert tx.state["bot"]["outcome"] == {APP: "fallback:not_success:action_required"}
+
+
+def test_a_bot_added_after_the_gate_is_observed_before_merge(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        seen = []
+
+        def current():
+            value = () if len(seen) < 2 else (APP,)
+            seen.append(value)
+            return value
+
+        tx.review_bots = current
+        tx.run()
+        assert seen == [(), (), (APP,), (APP,), (APP,)]
+        assert lab.get().stage == "deliver_pending"
+        assert lab.land()["bot"]["outcome"] == {APP: "complete"}
+        assert lab.writes() == ["pr create", "pr merge"]
 
 
 def test_resumed_budget_does_not_repark_retained_deferrals(make, monkeypatch):

@@ -294,7 +294,12 @@ def bot_text(body: str) -> dict:
 
 
 def bot_record(
-    job: JobState, review: Mapping, threads: Sequence[Mapping], now: float, offset: int = 0
+    job: JobState,
+    review: Mapping,
+    threads: Sequence[Mapping],
+    now: float,
+    offset: int = 0,
+    apps: Sequence[str] = (),
 ) -> dict:
     """An observation binds to code acceptance without spending an independent review."""
     record = {
@@ -309,6 +314,7 @@ def bot_record(
         "bot_observation": True,
         "accepted_review_seq": review["seq"],
         "reviewer": f"bot:{threads[0]['author']}",
+        "bot_apps": list(apps),
         "problems": [FAIL_PROBLEM],
         "findings": [],
     }
@@ -490,7 +496,7 @@ def bot_updates(
             }
     records = list(job.reviews)
     for offset, group in enumerate(changed.values()):
-        record = bot_record(job, review, group, now, offset)
+        record = bot_record(job, review, group, now, offset, bot.get("apps", ()))
         record["reviewed_head"] = reviewed_head(review) or review.get("fingerprint", "")
         records.append(record)
         for thread, finding in zip(group, record["findings"], strict=True):

@@ -666,7 +666,9 @@ class Transaction:
 
     def observe_ci(self):
         """Query head CI with the current review app selection and record both."""
+        self.migrate_green()
         apps = self.review_bots()
+        previous = tuple(self.state.get("ci_bots", self.state.get("bot", {}).get("apps", ())))
         self.sync_bots(apps)
         options = {"exclude_apps": apps} if apps else {}
         evidence = self.api.inspect_ci(
@@ -677,7 +679,16 @@ class Transaction:
         ):
             raise LandStop("land_ci_failed", "CI evidence head differs")
         self.save(ci_evidence=[asdict(e) for e in evidence.evidence], ci_bots=list(apps))
-        return evidence, apps
+        return evidence, apps, previous != tuple(apps)
+
+    def migrate_green(self):
+        """A pre-selection record used the frozen bot list; store that list with its digest."""
+        saved = self.state.get("ci_green")
+        if isinstance(saved, str):
+            bots = self.state.get("ci_bots")
+            if bots is None:
+                bots = self.state.get("bot", {}).get("apps", ())
+            self.save(ci_green={"digest": saved, "bots": list(bots)})
 
     def review_bots(self):
         """Read the repository's current app selection; it is configuration, not job state."""
@@ -726,7 +737,7 @@ class Transaction:
     def ci(self):
         bot = self.state.get("bot", {})
         if self.state.get("ci_green") and bot.get("apps") and bot.get("head") == self.state["H"]:
-            evidence, apps = self.observe_ci()
+            evidence, apps, _ = self.observe_ci()
             self.green(evidence, apps, "saved green CI identity changed")
             return
         entry = resume_entry(self.current())
@@ -745,7 +756,7 @@ class Transaction:
         while True:
             if time.time() >= self.state["ci_deadline"]:
                 raise LandStop("land_ci_failed", "CI observation deadline expired")
-            evidence, apps = self.observe_ci()
+            evidence, apps, _ = self.observe_ci()
             if time.time() >= self.state["ci_deadline"]:
                 raise LandStop("land_ci_failed", "CI observation deadline expired during query")
             if evidence.state == "success":
@@ -800,6 +811,16 @@ class Transaction:
             bot = self.sync_bots(self.review_bots())
             if not bot.get("apps"):
                 return
+            if bot.get("head") != self.state["H"] or "window_end" not in bot:
+                # CI can become green before any app is configured. That head still gets a
+                # bounded window; a later selection change reuses the existing end.
+                bot = {
+                    **bot,
+                    "head": self.state["H"],
+                    "window_end": time.time() + bot["wait"],
+                    "outcome": {},
+                }
+                self.save(bot=bot)
             runs = self.api.inspect_bot_runs(self.repo, self.state["H"], bot["apps"])
             outcomes = dict(bot.get("outcome", {}))
             for app in bot["apps"]:
@@ -927,8 +948,15 @@ class Transaction:
             raise LandStop("land_merge_failed", "direct mergeability is not proven")
         if not self.state.get("ci_green"):
             raise LandStop("land_ci_failed", "merge requires observed green CI")
-        evidence, apps = self.observe_ci()
+        evidence, apps, changed = self.observe_ci()
         self.green(evidence, apps, "green CI identity changed before merge")
+        if changed and self.state.get("bot", {}).get("apps"):
+            # A changed selection is not covered by the completed gate; run it in its window.
+            self.bot()
+            evidence, apps, again = self.observe_ci()
+            if again:
+                raise LandStop("land_interrupted", "review bot selection changed during the gate")
+            self.green(evidence, apps, "green CI identity changed before merge")
         self.bot_findings()
         subject = self.title + f" (#{pr.number})"
         problems = message_problems(
