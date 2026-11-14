@@ -12,7 +12,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import forge, job_text, job_workspace
+from . import forge, job_findings, job_text, job_workspace
 from .checks import message_problems
 from .jobs import _json_value
 
@@ -139,11 +139,13 @@ class Transaction:
         raise FreshnessRequeued
 
     def initialize(self):
+        from .job_delivery import accepted_review
+
         self.freshness()
         job = self.current()
         if not job.land or job.review != "code" or job.review_target is not None:
             raise LandStop("land_review_stale", "landing authority is absent")
-        review = job.reviews[-1]
+        review = accepted_review(job)
         texts = review.get("texts", {})
         if len(job.public_text) != 1 or len(texts) != 1:
             raise LandStop("land_review_stale", "landing needs one complete-result publication")
@@ -194,6 +196,14 @@ class Transaction:
                     "status": "not_started" if hook else "disabled",
                     "command": hook,
                     "command_hash": digest(hook),
+                },
+                bot={
+                    "apps": list(
+                        (self.ctx.config.review_bots or {}).get(repo.identity.lower(), ())
+                    ),
+                    "wait": self.ctx.config.review_bot_wait,
+                    "threads": {},
+                    "outcome": {},
                 },
             )
         self.repo = repo
@@ -405,7 +415,11 @@ class Transaction:
         return pr
 
     def observe_ci(self):
-        evidence = self.api.inspect_ci(self.repo, self.state["pr"]["number"], self.state["H"])
+        apps = self.state.get("bot", {}).get("apps", ())
+        options = {"exclude_apps": apps} if apps else {}
+        evidence = self.api.inspect_ci(
+            self.repo, self.state["pr"]["number"], self.state["H"], **options
+        )
         if evidence.head_sha != self.state["H"] or any(
             e.head_sha != self.state["H"] for e in evidence.evidence
         ):
@@ -414,6 +428,15 @@ class Transaction:
         return evidence
 
     def ci(self):
+        bot = self.state.get("bot", {})
+        if self.state.get("ci_green") and bot.get("apps") and bot.get("head") == self.state["H"]:
+            evidence = self.observe_ci()
+            if (
+                evidence.state != "success"
+                or digest([asdict(e) for e in evidence.evidence]) != self.state["ci_green"]
+            ):
+                raise LandStop("land_ci_failed", "saved green CI identity changed")
+            return
         entry = resume_entry(self.current())
         if not self.state.get("ci_started_at") or (
             self.state.get("last_error") == "land_ci_failed"
@@ -434,7 +457,16 @@ class Transaction:
             if time.time() >= self.state["ci_deadline"]:
                 raise LandStop("land_ci_failed", "CI observation deadline expired during query")
             if evidence.state == "success":
-                self.save(ci_green=digest([asdict(e) for e in evidence.evidence]))
+                changes = {"ci_green": digest([asdict(e) for e in evidence.evidence])}
+                bot = self.state.get("bot", {})
+                if bot.get("apps") and bot.get("head") != self.state["H"]:
+                    changes["bot"] = {
+                        **bot,
+                        "head": self.state["H"],
+                        "window_end": time.time() + bot["wait"],
+                        "outcome": {},
+                    }
+                self.save(**changes)
                 return
             if evidence.state == "missing":
                 remaining = self.state["ci_started_at"] + 15 - time.time()
@@ -468,6 +500,100 @@ class Transaction:
             self.save(rerun_round=frozen, phase="rerun")
             self.api.rerun_failed_run(self.repo, int(run_id), self.state["H"])
 
+    def bot(self):
+        bot = self.state.get("bot", {})
+        if not bot.get("apps"):
+            return
+        while True:
+            runs = self.api.inspect_bot_runs(self.repo, self.state["H"], bot["apps"])
+            outcomes = dict(bot.get("outcome", {}))
+            for app in bot["apps"]:
+                if app in outcomes:
+                    continue
+                rows = runs[app]
+                failed = next(
+                    (
+                        r
+                        for r in rows
+                        if r["status"] == "completed" and r["conclusion"] != "success"
+                    ),
+                    None,
+                )
+                if failed:
+                    outcomes[app] = f"fallback:not_success:{failed['conclusion']}"
+                elif rows and all(r["status"] == "completed" for r in rows):
+                    outcomes[app] = "complete"
+                elif time.time() >= bot["window_end"]:
+                    outcomes[app] = "fallback:timeout" if rows else "fallback:absent"
+            bot = {**bot, "outcome": outcomes}
+            self.save(bot=bot)
+            if all(app in outcomes for app in bot["apps"]):
+                break
+            self.wait(min(20, max(0, bot["window_end"] - time.time())))
+        self.bot_findings()
+
+    def bot_findings(self):
+        """Save observation, durable leftovers and any stop as one state transition."""
+        from .job_delivery import accepted_review
+        from .job_runner import StaleAttempt, _cas, _event
+
+        bot = self.state.get("bot", {})
+        if not bot.get("apps"):
+            return
+        visible = self.api.review_threads(self.repo, self.state["pr"]["number"], self.state["H"])
+        job = self.current()
+        review = accepted_review(job)
+        if not review.get("ok") or review.get("verdict") != "PASS":
+            raise LandStop("land_review_stale", "no bound accepted code review")
+        try:
+            records, threads = job_findings.bot_updates(
+                job, review, bot, visible, self.state["H"], time.time()
+            )
+        except ValueError as exc:
+            raise LandStop("land_interrupted", str(exc)) from exc
+        exhausted = job.reviews_used >= job.max_reviews
+        retained = set(bot.get("followup", {}).get("findings", ()))
+        low = []
+        for thread in threads.values():
+            # A resolution toggle is not a disposition for a tracked high finding.
+            if thread["severity"] in {"P0", "P1"}:
+                status = "open"
+            # A retained deferral outlives a resume that resets the review budget.
+            elif thread["finding"] in retained:
+                status = "deferred"
+            elif thread["resolved"]:
+                status = "closed"
+            elif exhausted:
+                status = "deferred"
+            else:
+                status = "open"
+            thread["status"] = status
+            if status == "deferred":
+                low.append(thread["finding"])
+        followup = {"id": f"bot-followup:{job.id}", "findings": low}
+        bot = {**bot, "threads": threads, "followup": followup}
+        state = {**self.state, "bot": bot}
+        stop = any(thread["status"] == "open" for thread in threads.values())
+        reason = "review_exhausted" if exhausted else "land_bot_findings"
+        changes = {"land_state": state, "reviews": records, "evidence_at": time.time()}
+        if stop:
+            changes.update(
+                stage="user_wait",
+                resume_stage="fix" if exhausted else "land",
+                wait_reason=reason,
+                ended_at=time.time(),
+                error="review bot findings require disposition; owner judges not_fixed reasons",
+                events=_event(job, type="user_wait", reason=reason),
+            )
+        if not _cas(self.ctx.jobs, self.ctx.job, {"land"}, lambda j: changes):
+            raise StaleAttempt
+        self.state = state
+        job_findings.sync_index(
+            self.ctx.jobs.state, self.ctx.jobs.load()[job.id], self.ctx.folder, time.time()
+        )
+        if stop:
+            raise BotParked
+
     def merge(self):
         # A lost merge acknowledgement is never authorization for another merge request.
         if self.state.get("merge_intent"):
@@ -498,6 +624,7 @@ class Transaction:
             or digest([asdict(e) for e in evidence.evidence]) != self.state["ci_green"]
         ):
             raise LandStop("land_ci_failed", "green CI identity changed before merge")
+        self.bot_findings()
         subject = self.title + f" (#{pr.number})"
         problems = message_problems(
             job_text.squash_message(subject, self.commit),
@@ -590,6 +717,7 @@ class Transaction:
         if not self.state.get("S"):
             if not self.state.get("merge_intent"):
                 self.ci()
+                self.bot()
             self.merge()
         self.verify_tree()
         self.install()
@@ -606,6 +734,10 @@ class Transaction:
                 "wait_reason": "",
             },
         )
+
+
+class BotParked(Exception):
+    pass
 
 
 class FreshnessRequeued(Exception):
@@ -672,6 +804,8 @@ def run_land(ctx):
             return 0
         except FreshnessRequeued:
             return 0
+        except BotParked:
+            return 1
         except (LandStop, forge.ForgeError, OSError, ValueError, subprocess.SubprocessError) as exc:
             reason = exc.reason if isinstance(exc, LandStop) else "land_interrupted"
             if isinstance(exc, forge.Mismatch):

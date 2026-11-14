@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1791,3 +1792,447 @@ def test_stacked_predecessor_fixed_uses_final_tree_at_landing(make, tree_changed
         assert (second.tree / "k2.txt").read_text() == "one\n"
     else:
         assert second.land()["M"] == first.land()["S"]
+
+
+# --- optional review-bot gate ----------------------------------------------------------------
+
+
+APP = "review-bot-example"
+
+
+def bot_thread(n=1, severity="P2", **changes):
+    return {
+        "id": f"thread-{n}",
+        "root_id": n,
+        "url": f"https://forge.invalid/review/{n}",
+        "path": "example.py",
+        "line": n,
+        "author_type": "Bot",
+        "author": APP,
+        "body": f"{severity}: Problem {n}",
+        "resolved": False,
+        "outdated": False,
+        **changes,
+    }
+
+
+@contextmanager
+def bot_lab(make, monkeypatch, *, exhausted=True):
+    monkeypatch.setattr(sys.modules[__name__], "ORIGIN", "https://forge.invalid/sample/project.git")
+    monkeypatch.setattr(
+        sys.modules[__name__], "FAKE_GH", FAKE_GH.replace("github.com", "forge.invalid")
+    )
+    monkeypatch.setattr(sys.modules[__name__], "SHIM", SHIM.replace("github.com", "forge.invalid"))
+    lab = make(window=60, install=None)
+    lab.configure(review_bots={"forge.invalid/sample/project": [APP]})
+    lab.accept()
+    job = lab.put("land")
+    lab.jobs.save(replace(job, reviews_used=job.max_reviews if exhausted else 1), time.time())
+    job = lab.get()
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.api.authenticated_hosts = ("forge.invalid",)
+        tx.api.inspect_bot_runs = lambda *args: {
+            APP: [{"status": "completed", "conclusion": "success"}]
+        }
+        tx.api.review_threads = lambda *args: []
+        yield lab, tx
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+@pytest.mark.parametrize("severity", ["P0", "P1", "P2", "P3"])
+def test_bot_priority_routes_without_spending_review_budget(make, monkeypatch, exhausted, severity):
+    with bot_lab(make, monkeypatch, exhausted=exhausted) as (lab, tx):
+        tx.api.review_threads = lambda *args: [bot_thread(severity=severity)]
+        if not exhausted or severity in {"P0", "P1"}:
+            with pytest.raises(job_land.BotParked):
+                tx.run()
+            job = lab.get()
+            assert (job.wait_reason, job.resume_stage) == (
+                ("review_exhausted", "fix") if exhausted else ("land_bot_findings", "land")
+            )
+            assert lab.writes() == ["pr create"]
+        else:
+            tx.run()
+            assert lab.get().stage == "deliver_pending"
+            assert lab.land()["bot"]["followup"]["findings"] == ["r2.F1"]
+        assert lab.get().reviews_used == (lab.get().max_reviews if exhausted else 1)
+
+
+def test_exhausted_low_observation_survives_restart_merge_and_one_delivery(
+    make, monkeypatch, capsys
+):
+    from taskwatch import brief, job_delivery
+
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.api.review_threads = lambda *args: [bot_thread(n) for n in range(1, 17)]
+        tx.run()
+        job = lab.get()
+        assert job.stage == "deliver_pending" and job.land_state["tree_verified"]
+        assert job_delivery.acceptance_current(lab.jobs, tx.ctx.config, job)
+        assert job_delivery.accepted_review(job)["verdict"] == "PASS"
+        assert len(job.land_state["bot"]["followup"]["findings"]) == 16
+        assert lab.reviewed_text()["body.md"].startswith("body\n")
+        # A fresh runner instance selects the same PASS after merge, not the last FAIL.
+        ctx = Ctx(lab.jobs, tx.ctx.config, lab.put("land"), lab.folder(), lab.tree)
+        restarted = job_land.Transaction(ctx, tx.lock_fd)
+        restarted.api.authenticated_hosts = ("forge.invalid",)
+        restarted.run()
+        full = "\n".join(brief.compose(lab.jobs, tx.ctx.config, lab.get()))
+        for n in range(1, 17):
+            assert f"https://forge.invalid/review/{n}" in full
+        capsys.readouterr()
+        assert cli_main(["--root", str(lab.root), "brief", job.id]) == 0
+        rendered = capsys.readouterr().out
+        for n in range(1, 17):
+            assert f"https://forge.invalid/review/{n}" in rendered
+        done = lab.finish()
+        assert done.stage == "done" and len(lab.cards()) == 1
+        assert f"bot-followup:{job.id}" in lab.cards()[0]["text"]
+        assert lab.writes() == ["pr create", "pr merge"]
+
+
+def test_mixed_exhaustion_retains_one_group_and_resolved_high_still_blocks(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        visible = [bot_thread(1, "P1"), *[bot_thread(n) for n in range(2, 18)]]
+        tx.api.review_threads = lambda *args: visible
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        original = lab.land()["bot"]["followup"]
+        assert len(original["findings"]) == 16
+        assert len(lab.get().reviews) == 2
+        lab.resume()
+        # U1 exhausted resume normally goes to fix; explicitly exercise a land restart.
+        job = lab.put("land")
+        tx.ctx = Ctx(lab.jobs, tx.ctx.config, job, lab.folder(), lab.tree)
+        visible[0]["resolved"] = True
+        with pytest.raises(job_land.BotParked):
+            tx.bot_findings()
+        assert lab.land()["bot"]["followup"] == original
+        assert len(lab.get().reviews) == 2
+        assert lab.writes() == ["pr create"]
+
+
+def test_late_finding_and_priority_promotion_replace_refs_without_duplicate_records(
+    make, monkeypatch
+):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.initialize()
+        tx.save(H="a" * 40, pr={"number": 17, "url": "https://forge.invalid/pr/17"})
+        visible = [bot_thread()]
+        tx.api.review_threads = lambda *args: visible
+        tx.bot_findings()
+        tx.bot_findings()
+        assert len(lab.get().reviews) == 2
+        visible.append(bot_thread(2))
+        tx.bot_findings()
+        assert lab.land()["bot"]["followup"]["findings"] == ["r2.F1", "r3.F1"]
+        visible[0]["body"] = "P1: Promoted"
+        with pytest.raises(job_land.BotParked):
+            tx.bot_findings()
+        assert lab.land()["bot"]["followup"]["findings"] == ["r3.F1"]
+        assert lab.land()["bot"]["threads"]["thread-1"]["severity"] == "P1"
+
+
+@pytest.mark.parametrize("damage", ["missing_review", "missing_thread"])
+def test_missing_followup_evidence_prevents_landing(make, monkeypatch, damage):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.initialize()
+        tx.save(H="a" * 40, pr={"number": 17})
+        tx.api.review_threads = lambda *args: [bot_thread()]
+        tx.bot_findings()
+        bot = tx.state["bot"]
+        if damage == "missing_thread":
+            tx.save(bot={**bot, "threads": {}})
+        else:
+            job = lab.get()
+            lab.jobs.save(replace(job, reviews=job.reviews[:1]), time.time())
+        with pytest.raises(job_land.LandStop, match="evidence is missing"):
+            tx.bot_findings()
+        assert "pr merge" not in lab.writes()
+
+
+def test_untracked_resolved_humans_and_lookalikes_are_not_findings(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.api.review_threads = lambda *args: [
+            bot_thread(1, "P1", resolved=True),
+            bot_thread(2, "P1", author_type="User"),
+            bot_thread(3, "P1", author=APP + "-lookalike"),
+        ]
+        tx.run()
+        assert lab.get().stage == "deliver_pending"
+        assert len(lab.get().reviews) == 1
+
+
+@pytest.mark.parametrize("apps", [[APP], [APP, APP]])
+@pytest.mark.parametrize("registration,completion", [(120, 120), (0, 580)])
+def test_bot_window_waits_for_late_registration_and_completes_early(
+    monkeypatch, registration, completion, apps
+):
+    clock = [0]
+    tx = object.__new__(job_land.Transaction)
+    tx.state = {
+        "H": "a" * 40,
+        "bot": {"apps": apps, "head": "a" * 40, "window_end": 600, "wait": 600, "outcome": {}},
+    }
+    tx.repo = None
+    observed = []
+    tx.save = lambda **changes: tx.state.update(changes)
+
+    def wait(seconds):
+        assert 0 < seconds <= 20
+        clock[0] += seconds
+
+    tx.wait = wait
+    tx.bot_findings = lambda: observed.append(clock[0])
+    tx.api = SimpleNamespace(
+        inspect_bot_runs=lambda *args: {
+            APP: (
+                []
+                if clock[0] < registration
+                else [
+                    {
+                        "status": "completed" if clock[0] >= completion else "in_progress",
+                        "conclusion": "success" if clock[0] >= completion else None,
+                    }
+                ]
+            )
+        }
+    )
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+    tx.bot()
+    assert observed == [completion]
+    assert tx.state["bot"]["outcome"] == {APP: "complete"}
+
+
+@pytest.mark.parametrize("apps", [[APP], [APP, APP]])
+@pytest.mark.parametrize(
+    "signal,expected,elapsed",
+    [
+        ([], "fallback:absent", 600),
+        ([{"status": "in_progress", "conclusion": None}], "fallback:timeout", 600),
+        ([{"status": "completed", "conclusion": "failure"}], "fallback:not_success:failure", 0),
+    ],
+)
+def test_bot_fallback_never_extends_deadline_or_skips_thread_gate(
+    monkeypatch, signal, expected, elapsed, apps
+):
+    clock = [0]
+    tx = object.__new__(job_land.Transaction)
+    tx.repo = None
+    tx.state = {
+        "H": "a" * 40,
+        "bot": {"apps": apps, "head": "a" * 40, "window_end": 600, "wait": 600, "outcome": {}},
+    }
+    tx.save = lambda **changes: tx.state.update(changes)
+
+    def wait(seconds):
+        assert 0 < seconds <= 20
+        clock[0] += seconds
+
+    tx.wait = wait
+    tx.api = SimpleNamespace(inspect_bot_runs=lambda *args: {APP: signal})
+    seen = []
+    tx.bot_findings = lambda: seen.append(clock[0])
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+    tx.bot()
+    tx.bot()
+    assert seen == [elapsed, elapsed]
+    assert tx.state["bot"]["outcome"] == {APP: expected}
+    assert tx.state["bot"]["window_end"] == 600
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_visible_high_blocks_even_on_fallback_or_final_reread(make, monkeypatch, late):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        calls = []
+
+        def threads(*args):
+            calls.append(1)
+            return [bot_thread(severity="P1")] if not late or len(calls) > 1 else []
+
+        tx.api.review_threads = threads
+        tx.api.inspect_bot_runs = lambda *args: {
+            APP: [{"status": "completed", "conclusion": "failure"}]
+        }
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        assert lab.writes() == ["pr create"]
+        assert lab.land()["bot"]["outcome"][APP] == "fallback:not_success:failure"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "code",
+        "output",
+        "text",
+        "basis",
+        "check",
+        "log",
+        "snapshot",
+        "binding",
+        "newer_fail",
+    ],
+)
+def test_deferred_observation_preserves_every_acceptance_freshness_guard(make, monkeypatch, change):
+    from taskwatch import job_delivery
+
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.api.review_threads = lambda *args: [bot_thread()]
+        tx.run()
+        job = lab.get()
+        if change == "code":
+            (lab.tree / "k1.txt").write_text("changed\n")
+        elif change == "output":
+            (lab.tree / "out.txt").write_text("changed\n")
+        elif change == "text":
+            lab.write_text("body.md", "changed\n")
+        elif change == "basis":
+            Path(job.intent).write_text("changed\n")
+        elif change == "check":
+            lab.jobs.save(
+                replace(job, checks=(*job.checks[:-1], {**job.checks[-1], "ok": False})),
+                time.time(),
+            )
+        elif change == "log":
+            Path(job.checks[-1]["log"]).write_text("changed\n")
+        elif change == "snapshot":
+            snapshot = Path(job.reviews[0]["snapshot"]) / "pr" / "body.md"
+            snapshot.chmod(0o600)
+            snapshot.write_text("changed\n")
+        elif change == "binding":
+            lab.jobs.save(
+                replace(
+                    job,
+                    reviews=(*job.reviews[:-1], {**job.reviews[-1], "accepted_review_seq": 999}),
+                ),
+                time.time(),
+            )
+        elif change == "newer_fail":
+            lab.jobs.save(
+                replace(
+                    job,
+                    reviews=(
+                        *job.reviews,
+                        {**job.reviews[0], "seq": 99, "round": 3, "ok": False, "verdict": "FAIL"},
+                    ),
+                ),
+                time.time(),
+            )
+        job = lab.get()
+        assert not job_delivery.acceptance_current(lab.jobs, tx.ctx.config, job)
+        stopped = job_delivery.deliver_job(lab.jobs, tx.ctx.config, job, time.time())
+        assert stopped.wait_reason == "land_review_stale" and lab.cards() == []
+
+
+def test_bot_followup_save_failure_cannot_merge(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.api.review_threads = lambda *args: [bot_thread()]
+        save = lab.jobs.save
+
+        def fail_observation(job, now):
+            if len(job.reviews) > 1:
+                raise OSError("synthetic storage failure")
+            save(job, now)
+
+        monkeypatch.setattr(lab.jobs, "save", fail_observation)
+        with pytest.raises(OSError, match="storage failure"):
+            tx.run()
+        assert lab.writes() == ["pr create"]
+        assert len(lab.get().reviews) == 1
+
+
+def test_existing_transaction_without_bot_state_keeps_legacy_behavior(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.initialize()
+        tx.state.pop("bot")
+        tx.save()
+        tx.api.inspect_bot_runs = lambda *args: pytest.fail("legacy bot query")
+        tx.api.review_threads = lambda *args: pytest.fail("legacy thread query")
+        tx.run()
+        assert "bot" not in lab.land() and lab.get().stage == "deliver_pending"
+
+
+def test_bot_selection_and_deadline_stay_frozen_across_restart_and_config_edit(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.initialize()
+        tx.base_guard()
+        tx.head()
+        tx.pull_request()
+        tx.ci()
+        frozen = tx.state["bot"]
+        lab.configure(
+            review_bots={"forge.invalid/sample/project": ["other-app"]}, review_bot_wait=42
+        )
+        ctx = Ctx(lab.jobs, load_job_config(lab.root), lab.get(), lab.folder(), lab.tree)
+        restarted = job_land.Transaction(ctx, tx.lock_fd)
+        restarted.api.authenticated_hosts = ("forge.invalid",)
+        restarted.initialize()
+        # Bot wait is independent of the earlier CI observation deadline.
+        restarted.save(ci_deadline=time.time() - 1)
+        restarted.ci()
+        assert restarted.state["bot"] == frozen
+
+
+def test_resumed_budget_does_not_repark_retained_deferrals(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        tx.api.review_threads = lambda *args: [bot_thread()]
+        tx.run()
+        assert lab.get().stage == "deliver_pending"
+        # A resume resets the budget; the retained low finding stays deferred, not blocking.
+        job = lab.put("land", reviews_used=0)
+        tx.ctx = Ctx(lab.jobs, tx.ctx.config, job, lab.folder(), lab.tree)
+        tx.state = job.land_state
+        tx.bot_findings()
+        assert lab.land()["bot"]["followup"]["findings"] == ["r2.F1"]
+        assert lab.land()["bot"]["threads"]["thread-1"]["status"] == "deferred"
+        assert len(lab.get().reviews) == 2
+
+
+def test_manual_resolution_closes_a_low_thread_and_landing_continues(make, monkeypatch):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        visible = [bot_thread()]
+        tx.api.review_threads = lambda *args: visible
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        assert lab.get().wait_reason == "land_bot_findings"
+        visible[0]["resolved"] = True
+        job = lab.put("land")
+        tx.ctx = Ctx(lab.jobs, tx.ctx.config, job, lab.folder(), lab.tree)
+        tx.state = job.land_state
+        tx.bot_findings()
+        threads = lab.land()["bot"]["threads"]
+        assert threads["thread-1"]["status"] == "closed"
+        assert threads["thread-1"]["resolved"] is True
+        assert lab.land()["bot"]["followup"]["findings"] == []
+
+
+def test_resolution_never_closes_a_high_finding_or_a_retained_deferral(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        visible = [bot_thread(1, "P1"), bot_thread(2)]
+        tx.api.review_threads = lambda *args: visible
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        assert lab.land()["bot"]["followup"]["findings"] == ["r2.F2"]
+        visible[0]["resolved"] = True
+        visible[1]["resolved"] = True
+        visible.append(bot_thread(3, "P3"))
+        job = lab.put("land", reviews_used=0)
+        tx.ctx = Ctx(lab.jobs, tx.ctx.config, job, lab.folder(), lab.tree)
+        tx.state = job.land_state
+        with pytest.raises(job_land.BotParked):
+            tx.bot_findings()
+        assert lab.land()["bot"]["threads"]["thread-3"]["status"] == "open"
+        visible[2]["resolved"] = True
+        job = lab.put("land", reviews_used=0)
+        tx.ctx = Ctx(lab.jobs, tx.ctx.config, job, lab.folder(), lab.tree)
+        tx.state = job.land_state
+        with pytest.raises(job_land.BotParked):
+            tx.bot_findings()
+        threads = lab.land()["bot"]["threads"]
+        assert threads["thread-1"]["status"] == "open"
+        assert threads["thread-2"]["status"] == "deferred"
+        assert threads["thread-3"]["status"] == "closed"
+        assert lab.land()["bot"]["followup"]["findings"] == ["r2.F2"]

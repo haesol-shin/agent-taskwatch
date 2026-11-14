@@ -194,6 +194,11 @@ def _lines(path: Path) -> list[str]:
 
 
 def _accepted(job: JobState) -> Mapping | None:
+    if job.land and job.land_state.get("bot", {}).get("apps"):
+        from .job_delivery import accepted_review
+
+        record = accepted_review(job)
+        return record if record.get("ok") and record.get("verdict") == "PASS" else None
     accepted = [r for r in job.reviews if isinstance(r, Mapping) and r.get("ok")]
     return accepted[-1] if accepted else None
 

@@ -875,3 +875,58 @@ def test_receipt_base_adds_its_predecessor_once(tmp_path, explicit):
         20,
     )
     assert jobs.load()[second.id].predecessors == (first.id,)
+
+
+def test_review_bot_config_defaults_normalization_and_immutability(tmp_path):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert "review_bots" not in config and "review_bot_wait" not in config
+    assert load_job_config(root).review_bots is None
+    assert load_job_config(root).review_bot_wait == 600
+    config.update(review_bots={"Forge.Invalid/Owner/Repo": ["review-app"]}, review_bot_wait=42)
+    path.write_text(json.dumps(config), encoding="utf-8")
+    loaded = load_job_config(root)
+    assert loaded.review_bots == {"forge.invalid/owner/repo": ("review-app",)}
+    assert loaded.review_bot_wait == 42
+    with pytest.raises(TypeError):
+        loaded.review_bots["forge.invalid/owner/repo"] = ()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        {"forge.invalid/owner/repo": []},
+        {"forge.invalid/owner/repo": "review-app"},
+        {"forge.invalid/owner/repo": ["Review-App"]},
+        {"forge.invalid/owner/repo": ["bad_slug"]},
+        {"forge.invalid/owner/repo": [None]},
+        {"forge.invalid/owner/repo.git": ["review-app"]},
+        {"https://forge.invalid/owner/repo": ["review-app"]},
+        {"forge.invalid/owner/..": ["review-app"]},
+        {"Forge.Invalid/Owner/Repo": ["review-app"], "forge.invalid/owner/repo": ["other"]},
+    ],
+)
+def test_review_bot_config_rejects_invalid_mapping(tmp_path, value):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["review_bots"] = value
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="review_bots"):
+        load_job_config(root)
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "600", None])
+def test_review_bot_wait_rejects_nonpositive_noninteger_values(tmp_path, value):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["review_bot_wait"] = value
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="review_bot_wait"):
+        load_job_config(root)

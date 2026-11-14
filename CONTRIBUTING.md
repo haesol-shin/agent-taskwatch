@@ -64,6 +64,7 @@ The pull request body is the evidence for merging this change now: tests run, CI
   - Every pull request is squash merged, so `main` has one commit per pull request. Write the squash subject as the pull request title plus `(#number)` and the body by the commit form above, replacing GitHub's commit list. Merge commits and rebase merging are off: a pull request is one change, and its step commits stay on the pull request page.
   - Split a large change into pull requests that can each be reviewed and merged on their own ([Google, Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
   - Merge only after the maintainer approves the current head, and pin it: `gh pr merge <number> --match-head-commit <approved SHA>`. A new commit after approval needs a new approval.
+  - Follow the [review-bot severity policy](docs/configuration.md#review-bots-policy) for teammate PRs too, including bot-only reviews. While review opportunities remain, address all priorities; at the agreed limit, retain lower-priority leftovers in one linked followup and name them in the PR handoff. The maintainer approves reasons for leaving bot findings unfixed. Contributors do not need taskwatch.
 
 ## Using AI tools
 

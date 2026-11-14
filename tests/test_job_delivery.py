@@ -663,3 +663,53 @@ def test_literal_json_in_a_configured_sender_is_not_a_placeholder(board: Board):
     done = board.get(job.id)
     assert done.stage == "done"
     assert done.deliveries[-1]["message_id"] == "inline-message"
+
+
+@pytest.mark.parametrize(
+    "control",
+    [
+        "bound",
+        "missing_binding",
+        "wrong_binding",
+        "false_marker",
+        "name_only",
+        "foreign_app",
+        "no_config",
+        "newer_fail",
+        "no_pass",
+    ],
+)
+def test_bot_observations_cannot_replace_actual_code_review(board, control):
+    job = finished_job(board)
+    code = {**job.reviews[-1], "round": 1}
+    observation = {
+        **code,
+        "seq": 3,
+        "round": 2,
+        "ok": False,
+        "verdict": "FAIL",
+        "bot_observation": True,
+        "accepted_review_seq": code["seq"],
+        "reviewer": "bot:review-bot-example",
+    }
+    records = [code, observation]
+    bot = {"apps": ["review-bot-example"]}
+    if control == "missing_binding":
+        observation.pop("accepted_review_seq")
+    elif control == "wrong_binding":
+        observation["accepted_review_seq"] = 999
+    elif control == "false_marker":
+        observation["bot_observation"] = False
+    elif control == "name_only":
+        observation.pop("bot_observation")
+    elif control == "foreign_app":
+        observation["reviewer"] = "bot:other-example"
+    elif control == "no_config":
+        bot = {}
+    elif control == "newer_fail":
+        records.append({**code, "seq": 4, "ok": False, "verdict": "FAIL"})
+    elif control == "no_pass":
+        records = [observation]
+    job = replace(job, land=True, review="code", reviews=tuple(records), land_state={"bot": bot})
+    selected = job_delivery.accepted_review(job)
+    assert bool(selected.get("ok") and selected.get("verdict") == "PASS") == (control == "bound")

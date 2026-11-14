@@ -673,3 +673,86 @@ def test_a_review_without_findings_writes_no_index_line(unit_env):
     assert unit_env.problems() == []
     assert unit_env.run("review") == 0
     assert not Path(unit_env.jobs.state.dir / "findings.jsonl").exists() or not index_rows(unit_env)
+
+
+@pytest.mark.parametrize(
+    ("body", "severity", "parser"),
+    [
+        (
+            "<!-- P0: hidden -->\n<details><summary>P1: hidden</summary>x</details>\nP3: low",
+            "P3",
+            "prefix",
+        ),
+        *[(f"\n  P{n}: problem\nMore text", f"P{n}", "prefix") for n in range(4)],
+        *[
+            (s, "P2", "default")
+            for s in ("", "P4: bad", "P9: bad", "P1 bad", "First line\nP1: later", "p1: lower")
+        ],
+    ],
+)
+def test_bot_priority_uses_only_first_visible_line(body, severity, parser):
+    parsed = job_findings.bot_text(body)
+    assert (parsed["severity"], parsed["parser"]) == (severity, parser)
+
+
+def test_bot_parser_cleans_before_capping_and_digest_tracks_hidden_tail():
+    text = "<!--" + "x" * 2200 + "-->\nP1: `" + "a" * 2200
+    parsed = job_findings.bot_text(text)
+    assert parsed["severity"] == "P1" and parsed["body"].startswith("P1: '")
+    assert len(parsed["body"]) == 2000
+    assert parsed["digest"] != job_findings.bot_text(text + "tail")["digest"]
+
+
+def test_deferred_index_is_not_closed_by_unjudged_worker_claim(unit_env):
+    failed_review(unit_env, line("F1"))
+    env = unit_env
+    job = replace(
+        env.get(),
+        land_state={"bot": {"followup": {"id": "bot-followup:synthetic", "findings": ["r1.F1"]}}},
+    )
+    write_entries(env, [{"id": "r1.F1", "status": "not_fixed", "reason": "claim"}])
+    job_findings.sync_index(env.jobs.state, job, env.folder(), 2000)
+    assert index_rows(env)[-1]["status"] == "deferred"
+
+
+def test_multi_app_observations_keep_attribution_binding_and_root_order(unit_env):
+    from tests.test_job_land import bot_thread
+
+    job = unit_env.get()
+    accepted = {"seq": 1, "round": 1, "ok": True, "verdict": "PASS"}
+    job = replace(job, reviews=(accepted,))
+    bot = {"apps": ["review-bot-example", "second-app"], "threads": {}}
+    roots = [bot_thread(1), bot_thread(2, author="second-app"), bot_thread(3)]
+    records, threads = job_findings.bot_updates(job, accepted, bot, roots, "a" * 40, 1000)
+    assert [r["reviewer"] for r in records[1:]] == ["bot:review-bot-example", "bot:second-app"]
+    assert [r["accepted_review_seq"] for r in records[1:]] == [1, 1]
+    assert [r["round"] for r in records[1:]] == [2, 3]
+    assert list(threads) == ["thread-1", "thread-2", "thread-3"]
+    assert threads["thread-3"]["finding"] == "r2.F2"
+    assert threads["thread-2"]["finding"] == "r3.F1"
+
+
+@pytest.mark.parametrize(
+    "login,author_type,recognized",
+    [
+        ("review-bot-example[bot]", "Bot", True),
+        ("review-bot-example", "Bot", True),
+        ("review-bot-example[bot]", "User", False),
+        ("other-app[bot]", "Bot", False),
+        ("review-bot-example[bot][bot]", "Bot", False),
+    ],
+)
+def test_bot_root_matches_exact_configured_app_and_typed_login(
+    unit_env, login, author_type, recognized
+):
+    from tests.test_job_land import bot_thread
+
+    accepted = {"seq": 1, "round": 1, "ok": True, "verdict": "PASS"}
+    job = replace(unit_env.get(), reviews=(accepted,))
+    bot = {"apps": ["review-bot-example"], "threads": {}}
+    records, threads = job_findings.bot_updates(
+        job, accepted, bot, [bot_thread(author=login, author_type=author_type)], "a" * 40, 1000
+    )
+    assert bool(threads) == recognized
+    if recognized:
+        assert records[-1]["reviewer"] == "bot:review-bot-example"

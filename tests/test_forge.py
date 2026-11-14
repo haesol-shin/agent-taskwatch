@@ -66,6 +66,15 @@ if args[:1] == ["api"]:
     if endpoint == "graphql":
         fields = dict(args[index + 1].split("=", 1)
                       for index, arg in enumerate(args) if arg == "-f")
+        if "reviewThreads(" in fields.get("query", ""):
+            if fields.get("owner") != "sample" or fields.get("name") != "project":
+                fail()
+            if "pullRequest(number:17)" not in fields["query"]:
+                fail()
+            if "comments(first:100)" not in fields["query"]:
+                fail()
+            emit(state["thread_pages"][int(fields.get("cursor", "0"))])
+            sys.exit(0)
         if (fields.get("owner") != "sample" or fields.get("name") != "project"
                 or fields.get("ref") != "refs/heads/main"):
             fail()
@@ -191,7 +200,7 @@ def check(head, *, id=31, name="unit", conclusion="success", status="completed",
         "head_sha": head,
         "status": status,
         "conclusion": conclusion,
-        "app": {"id": app},
+        "app": {"id": app, "slug": "ci-app"},
         "check_suite": {"id": 41},
     }
 
@@ -966,3 +975,140 @@ def test_canonical_identity_survives_origin_case_and_attempt_check_urls(forge, o
         ]
     ]
     assert forge.ci().state == "success"
+
+
+def test_ci_excludes_only_optional_app_slug_not_check_name(forge):
+    bot = check(forge.head, name="lint", conclusion="failure")
+    bot["app"]["slug"] = "review-app"
+    forge.data["checks"] = [[bot, check(forge.head, id=32, name="review-app")]]
+    forge.save()
+    observed = forge.client.inspect_ci(forge.repo, 17, forge.head, exclude_apps=("review-app",))
+    assert observed.state == "success"
+    assert [e.name for e in observed.evidence if e.kind == "check"] == ["review-app"]
+    forge.data["rules"] = [
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [{"context": "lint", "integration_id": 7}]
+                },
+            }
+        ]
+    ]
+    forge.save()
+    observed = forge.client.inspect_ci(forge.repo, 17, forge.head, exclude_apps=("review-app",))
+    assert observed.state == "failed"
+    assert any(e.name == "lint" and e.required for e in observed.evidence)
+
+
+def test_bot_runs_include_all_pages_and_attempts_with_absent_apps(forge):
+    forge.data["checks"] = [
+        [check(forge.head, status="in_progress", conclusion=None)],
+        [check(forge.head, id=32, conclusion="failure")],
+    ]
+    forge.save()
+    assert forge.client.inspect_bot_runs(forge.repo, forge.head, ("ci-app", "absent")) == {
+        "ci-app": [
+            {"status": "in_progress", "conclusion": None},
+            {"status": "completed", "conclusion": "failure"},
+        ],
+        "absent": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("head_sha", OTHER_SHA),
+        ("status", "unknown"),
+        ("conclusion", "unknown"),
+        ("app", {}),
+    ],
+)
+def test_bot_runs_reject_malformed_or_wrong_head_checks(forge, field, value):
+    forge.data["checks"][0][0][field] = value
+    forge.save()
+    with pytest.raises(ForgeError):
+        forge.client.inspect_bot_runs(forge.repo, forge.head, ("ci-app",))
+
+
+def thread(head, index=1, *, more=False):
+    return {
+        "data": {
+            "repository": {
+                "nameWithOwner": "sample/project",
+                "pullRequest": {
+                    "number": 17,
+                    "headRefOid": head,
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": more, "endCursor": str(index)},
+                        "nodes": [
+                            {
+                                "id": f"THREAD_{index}",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {
+                                    "pageInfo": {"hasNextPage": False},
+                                    "nodes": [
+                                        {
+                                            "databaseId": index,
+                                            "url": f"https://{HOST}/discussion/{index}",
+                                            "path": "src.py",
+                                            "line": 3,
+                                            "body": "Review finding",
+                                            "author": {
+                                                "__typename": "Bot",
+                                                "login": "review-app[bot]",
+                                            },
+                                        },
+                                        {"databaseId": 999, "body": "Reply is not a root"},
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                },
+            }
+        }
+    }
+
+
+def test_review_threads_paginate_and_preserve_root_bot_identity(forge):
+    forge.data["thread_pages"] = [thread(forge.head, more=True), thread(forge.head, 2)]
+    forge.save()
+    assert forge.client.review_threads(forge.repo, 17, forge.head) == [
+        {
+            "id": f"THREAD_{index}",
+            "root_id": index,
+            "url": f"https://{HOST}/discussion/{index}",
+            "path": "src.py",
+            "line": 3,
+            "author_type": "Bot",
+            "author": "review-app[bot]",
+            "body": "Review finding",
+            "resolved": False,
+            "outdated": False,
+        }
+        for index in (1, 2)
+    ]
+
+
+@pytest.mark.parametrize("failure", ["head", "repository", "comments", "cursor", "errors"])
+def test_review_threads_reject_incomplete_or_mismatched_observations(forge, failure):
+    page = thread(forge.head)
+    repository = page["data"]["repository"]
+    threads = repository["pullRequest"]["reviewThreads"]
+    if failure == "head":
+        repository["pullRequest"]["headRefOid"] = OTHER_SHA
+    elif failure == "repository":
+        repository["nameWithOwner"] = "other/project"
+    elif failure == "comments":
+        threads["nodes"][0]["comments"]["pageInfo"]["hasNextPage"] = True
+    elif failure == "cursor":
+        threads["pageInfo"] = {"hasNextPage": True, "endCursor": "0"}
+    else:
+        page["errors"] = [{"message": "unavailable"}]
+    forge.data["thread_pages"] = [page]
+    forge.save()
+    with pytest.raises(ForgeError):
+        forge.client.review_threads(forge.repo, 17, forge.head)

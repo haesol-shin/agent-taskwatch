@@ -26,9 +26,36 @@ def _accepted(job: JobState, review: dict) -> bool:
     return bool(review.get("ok") and review.get("verdict") == "PASS")
 
 
+def accepted_review(job: JobState):
+    """Select the latest actual review; only bound bot observations may be skipped."""
+    if not job.reviews:
+        return {}
+    bot = job.land_state.get("bot", {})
+    if not (job.land and job.review == "code" and bot.get("apps")):
+        return job.reviews[-1]
+    observations = []
+    for review in reversed(job.reviews):
+        if "bot_observation" not in review:
+            if observations and (
+                not _accepted(job, review)
+                or type(review.get("seq")) is not int
+                or any(r.get("accepted_review_seq") != review["seq"] for r in observations)
+            ):
+                return {}
+            return review
+        if (
+            review.get("bot_observation") is not True
+            or type(review.get("accepted_review_seq")) is not int
+            or review.get("reviewer") not in {f"bot:{app}" for app in bot["apps"]}
+        ):
+            return {}
+        observations.append(review)
+    return {}
+
+
 def acceptance_current(jobs: Jobs, config: JobConfig, job: JobState) -> bool:
     """Shared delivery/landing freshness policy, including checked snapshot identity."""
-    review = job.reviews[-1] if job.reviews else {}
+    review = accepted_review(job)
     try:
         current = (
             _accepted(job, review)
@@ -129,7 +156,7 @@ def deliver_job(jobs: Jobs, config: JobConfig, job: JobState, now: float) -> Job
 def _message(jobs: Jobs, config: JobConfig, job: JobState) -> Path:
     """The card the owner reads and nothing else; the paths are at the end of `taskwatch brief`."""
     folder = jobs.folder(job)
-    review = job.reviews[-1] if job.reviews else {}
+    review = accepted_review(job)
     _write_durable(folder / "delivery-review.txt", review.get("body", ""))
     message = folder / "delivery.txt"
     _write_durable(message, "\n".join(brief.card(jobs, config, job)) + "\n")

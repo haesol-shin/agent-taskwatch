@@ -200,7 +200,12 @@ def _brief(args: argparse.Namespace, root: Path) -> int:
     tail = (*trailer(jobs, job), f"Worker brief: {jobs.folder(job) / 'brief.md'}")
     if template := reply_template(job):
         tail += (template,)
-    print("\n".join(cap(lines, tail)))
+    # The full brief retains every open bot finding and durable follow-up reference.
+    bot = job.land_state.get("bot", {})
+    active = bot.get("followup", {}).get("findings") or any(
+        thread.get("status") == "open" for thread in bot.get("threads", {}).values()
+    )
+    print("\n".join([*lines, *tail] if active else cap(lines, tail)))
     return 0
 
 
@@ -333,6 +338,8 @@ def _init(root: Path, unit_dir: Path | None) -> dict:
     data.pop("review_mode")
     data.pop("install_command")
     data.pop("install_commands")
+    data.pop("review_bots")
+    data.pop("review_bot_wait")
     data.pop("worker_mode")
     data.pop("worker_command")
     data.pop("private_tmp")

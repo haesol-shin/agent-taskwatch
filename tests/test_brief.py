@@ -444,3 +444,231 @@ def test_taskwatch_brief_ends_with_the_paths_that_left_the_card(tmp_path: Path, 
     assert tail[0] == f"Full brief: taskwatch --root {tmp_path / 'root'} brief {job.id}"
     assert tail[1] == f"Review: {folder / 'delivery-review.txt'}"
     assert tail[2] == f"Worker brief: {folder / 'brief.md'}"
+
+
+def _bot_job(tmp_path: Path, count=1, language="en"):
+    from dataclasses import replace
+
+    findings = [_summary_finding(n) for n in range(1, count + 1)]
+    jobs, config, job = _card_job(tmp_path, "## Card\nDone.\n", [], "", language)
+    original = {**job.reviews[-1], "round": 1, "findings": findings}
+    latest = {**job.reviews[-1], "round": 2, "findings": [_summary_finding(1, "P3")]}
+    bot = {
+        "apps": ["review-app"],
+        "wait": 600,
+        "head": "a" * 40,
+        "window_end": 1600,
+        "outcome": {"review-app": "fallback:timeout"},
+        "threads": {
+            f"thread-{n}": {
+                "finding": f"r1.F{n}",
+                "root_id": n,
+                "url": f"https://forge.invalid/owner/repo/pull/1#discussion_r{n}",
+                "path": "doc.md",
+                "line": n,
+                "severity": "P2",
+                "digest": f"digest-{n}",
+                "status": "deferred",
+                "head": "a" * 40,
+            }
+            for n in range(1, count + 1)
+        },
+        "followup": {
+            "id": f"bot-followup:{job.id}",
+            "findings": [f"r1.F{n}" for n in range(1, count + 1)],
+        },
+    }
+    return jobs, config, replace(job, reviews=(original, latest), land_state={"bot": bot})
+
+
+def test_bot_followup_retains_old_round_and_distinguishes_same_finding_id(tmp_path: Path) -> None:
+    jobs, config, job = _bot_job(tmp_path)
+    card = brief.card(jobs, config, job)
+    deferred = next(line for line in card if "deferred" in line)
+    assert f"P2 deferred [bot-followup:{job.id}]" in deferred
+    assert "Problem 1 for the user." in deferred
+    assert "- Problem 1 for the user." in card  # r2.F1 is a distinct finding.
+    full = brief.compose(jobs, config, job)
+    retained = next(line for line in full if line.startswith("- r1.F1 "))
+    assert "doc.md:1 https://forge.invalid/owner/repo/pull/1#discussion_r1" in retained
+    assert any(f"followup bot-followup:{job.id} (1 findings)" in line for line in full)
+    assert any("bot review-app fallback:timeout" in line for line in full)
+
+
+def test_bot_followup_deduplicates_latest_findings(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    jobs, config, job = _bot_job(tmp_path)
+    job = replace(job, reviews=job.reviews[:1])
+    small = brief.card(jobs, config, job)
+    assert sum("Problem 1 for the user." in line for line in small) == 1
+    assert sum(line.startswith("- r1.F1 ") for line in brief.compose(jobs, config, job)) == 1
+
+
+def test_bot_followup_full_list_survives_card_bounds(tmp_path: Path) -> None:
+    jobs, config, job = _bot_job(tmp_path, count=8)
+    card = brief.card(jobs, config, job)
+    assert "- +3" in card  # Eight retained entries plus the latest low finding.
+    full = brief.compose(jobs, config, job)
+    assert sum(line.startswith("- r1.F") for line in full) == 8
+    assert all(
+        f"doc.md:{n} https://forge.invalid/owner/repo/pull/1#discussion_r{n}" in "\n".join(full)
+        for n in range(1, 9)
+    )
+    assert all(len(line[2:]) <= 160 for line in card if line.startswith("- "))
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("outcome", ["absent", "timeout", "not_success:cancelled"])
+def test_bot_fallback_and_final_read_race_are_localized(
+    tmp_path: Path, language: str, outcome: str
+) -> None:
+    from dataclasses import replace
+
+    jobs, config, job = _bot_job(tmp_path, language=language)
+    bot = {**job.land_state["bot"], "outcome": {"review-app": f"fallback:{outcome}"}}
+    job = replace(job, land_state={"bot": bot})
+    card = brief.card(jobs, config, job)
+    if language == "ko":
+        assert "확인하지 못한 것" in card
+        assert any(f"fallback:{outcome}" in line and "자체 리뷰로 대체" in line for line in card)
+        assert any("마지막 확인과 병합 사이" in line for line in card)
+        assert any("P2 보류" in line for line in card)
+    else:
+        assert "Not checked" in card
+        assert any(f"fallback:{outcome}" in line and "accepted own review" in line for line in card)
+        assert any("final read and merge" in line for line in card)
+
+
+def test_unconfigured_bot_state_does_not_add_card_limitations(tmp_path):
+    from dataclasses import replace
+
+    jobs, config, job = _card_job(tmp_path, "## Card\nDone.\n", [], "")
+    original = brief.card(jobs, config, job)
+    job = replace(job, land_state={"bot": {"apps": [], "wait": 600, "outcome": {}}})
+    assert brief.card(jobs, config, job) == original
+
+
+def test_full_brief_cli_never_truncates_active_bot_source_links(tmp_path, capsys):
+    from taskwatch.job_cli import main
+
+    jobs, _, job = _bot_job(tmp_path, count=90)
+    assert main(["--root", str(tmp_path / "root"), "init"]) == 0
+    jobs.save(job, 2000)
+    capsys.readouterr()
+    assert main(["--root", str(tmp_path / "root"), "brief", job.id]) == 0
+    rendered = capsys.readouterr().out
+    assert all(
+        f"https://forge.invalid/owner/repo/pull/1#discussion_r{n}" in rendered for n in range(1, 91)
+    )
+
+
+@pytest.mark.parametrize(
+    "severity,status,count",
+    [
+        ("P0", "open", 1),
+        ("P1", "open", 90),
+        ("P2", "open", 1),
+        ("P2", "deferred", 1),
+        ("P2", "closed", 1),
+    ],
+)
+def test_bot_observation_keeps_the_accepted_review_in_card_brief_and_delivery(
+    tmp_path, capsys, severity, status, count
+):
+    from dataclasses import replace
+
+    from taskwatch import job_delivery
+    from taskwatch.job_cli import main
+
+    jobs, config, job = _card_job(tmp_path, "## Card\nDone.\n", [], "runtime")
+    accepted = {
+        **job.reviews[0],
+        "seq": 2,
+        "round": 1,
+        "ok": True,
+        "verdict": "PASS",
+        "body": "Looks fine.\n",
+        "findings": [_summary_finding(1)],
+    }
+    observation = {
+        **accepted,
+        "seq": 3,
+        "round": 2,
+        "ok": False,
+        "verdict": "FAIL",
+        "bot_observation": True,
+        "accepted_review_seq": 2,
+        "reviewer": "bot:review-app",
+        "body": "### F1\nbot text",
+        "findings": [
+            _summary_finding(n, severity, f"Bot finding {n}.") for n in range(1, count + 1)
+        ],
+    }
+    bot = {
+        "apps": ["review-app"],
+        "wait": 600,
+        "threads": {
+            f"thread-{n}": {
+                "finding": f"r2.F{n}",
+                "root_id": n,
+                "author": "review-app",
+                "url": f"https://forge.invalid/review/{n}",
+                "path": "doc.md",
+                "line": n,
+                "severity": severity,
+                "digest": "d",
+                "parser": "prefix",
+                "status": status,
+                "resolved": False,
+                "head": "a" * 40,
+            }
+            for n in range(1, count + 1)
+        },
+        "followup": {
+            "id": f"bot-followup:{job.id}",
+            "findings": [f"r2.F{n}" for n in range(1, count + 1)] if status == "deferred" else [],
+        },
+    }
+    job = replace(
+        job,
+        stage="user_wait",
+        wait_reason="land_bot_findings",
+        resume_stage="land",
+        land=True,
+        review="code",
+        reviews=(accepted, observation),
+        land_state={"bot": bot},
+    )
+    card = brief.card(jobs, config, job)
+    assert "- Problem 1 for the user." in card
+    if severity == "P2" and status != "closed":
+        assert any(f"P2 {status}" in line and "Bot finding 1." in line for line in card)
+        assert any(f"bot-followup:{job.id}" in line for line in card) == (status == "deferred")
+    else:
+        assert not any("Bot finding" in line for line in card)
+    full = brief.compose(jobs, config, job)
+    assert "- F1 P2 K-1 (clarity): doc.md:1" in full
+    assert "Reviewer checked: the result against the spec" in full
+    expected = "P2 1"
+    if status != "closed":
+        expected = f"P2 {count + 1}" if severity == "P2" else f"{severity} {count}, P2 1"
+        for n in range(1, count + 1):
+            line = next(line for line in full if line.startswith(f"- r2.F{n} "))
+            assert f"{severity} {status}" in line and f"Bot finding {n}." in line
+            assert f"doc.md:{n} https://forge.invalid/review/{n}" in line
+    else:
+        assert not any("Bot finding" in line for line in full)
+    assert f"Open findings: {expected}" in full
+    job_delivery._message(jobs, config, job)
+    review_text = (jobs.folder(job) / "delivery-review.txt").read_text()
+    assert review_text == "Looks fine.\n"
+    assert main(["--root", str(tmp_path / "root"), "init"]) == 0
+    jobs.save(job, 2000)
+    capsys.readouterr()
+    assert main(["--root", str(tmp_path / "root"), "brief", job.id]) == 0
+    rendered = capsys.readouterr().out
+    assert f"Open findings: {expected}" in rendered
+    if status != "closed":
+        assert f"- r2.F{count} {severity} {status}" in rendered
+        assert f"https://forge.invalid/review/{count}" in rendered
