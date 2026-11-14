@@ -651,8 +651,7 @@ def test_job_waits_for_predecessors_to_pass(board: Board) -> None:
             },
         ),
         guideline_hashes={
-            str(p): job_runner._file_sha(p)
-            for p in job_runner._guidelines(job, board.jobs.folder(job))
+            str(p): job_runner._file_sha(p) for p in job_runner._copied(job, board.jobs.folder(job))
         },
     )
     board.finish_step(first, "deliver_pending")

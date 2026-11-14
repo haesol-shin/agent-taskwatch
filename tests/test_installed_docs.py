@@ -92,11 +92,3 @@ def test_a_target_installed_at_the_linked_path_passes(tmp_path: Path):
     )
     data = {"share/docs": ["docs/*.md"], "share/docs/guides": ["docs/guides/*.md"]}
     assert missing_targets(tmp_path, data) == []
-
-
-def test_the_job_copy_takes_exactly_the_installed_files():
-    installed = set(install_map(ROOT, data_files()))
-    assert all(path.startswith("share/") for path in installed)
-    expected = {path.split("/", 1)[1] for path in installed}
-    copied = {relative.as_posix() for _, relative in review_docs.shipped_files(ROOT / "docs")}
-    assert copied == expected

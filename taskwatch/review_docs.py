@@ -1,14 +1,15 @@
 """Where the shared review documents live, which of them a review reads, and their links.
 
 The documents ship as one tree: the package docs at its root, their review folder, the launch
-and job contracts, and the examples their relative links name. The install keeps that tree
-under `share`, the job copy keeps the same shape, and both are checked the same way, so a
-relative link of a guide resolves wherever the documents are read.
+and job contracts, and the examples their relative links name. A job copies the documents its
+guides reach, in the installed shape, and both the install and the copy are checked with the
+same link rule, so a relative link of a guide resolves wherever the documents are read.
 """
 
 import re
 import shutil
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 PROFILES = {
@@ -21,23 +22,10 @@ COMMON = ("README.md", "common.md")
 
 SOURCE_OUTPUT = "claims.json"
 
-# The folder the package documents occupy in the installed share tree, the review folder inside
-# it, and the files that ship beside them. The example files are named by links in the documents.
+# The folder the package documents occupy in the installed share tree, and the review folder
+# inside it. The example files their links name ship beside the package at examples/.
 PACKAGE_DIR = "agent-taskwatch"
 GUIDE_DIR = "review"
-ROOT_DOCS = (
-    "checks.md",
-    "commands.md",
-    "configuration.md",
-    "review-launch.md",
-    "spec-template.md",
-)
-SUBDIRS = ("review", "launch", "jobs")
-EXAMPLES = (
-    "hermes/skills/taskwatch/SKILL.md",
-    "omp/reviewer.md",
-    "worker/opencode.py",
-)
 
 INLINE_LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
 REF_DEF = re.compile(
@@ -87,45 +75,110 @@ def _doc_roots() -> tuple[Path, ...]:
     )
 
 
-def shipped_files(root: Path) -> list[tuple[Path, Path]]:
-    """Each shipped file of the tree and its path in the installed share tree."""
-    pairs = [(root / name, Path(PACKAGE_DIR) / name) for name in ROOT_DOCS]
-    for folder in SUBDIRS:
-        pairs += [
-            (path, Path(PACKAGE_DIR) / folder / path.name)
-            for path in sorted((root / folder).glob("*"))
-            if path.is_file()
-        ]
-    examples = root.parent / "examples"
-    return [*pairs, *((examples / name, Path("examples") / name) for name in EXAMPLES)]
-
-
 def guide_dir(target: Path) -> Path:
     """The review folder inside a job's copy of the shipped documents."""
     return target / PACKAGE_DIR / GUIDE_DIR
 
 
-def copy_docs(target: Path) -> Path:
-    """Copy the shipped documents into `target` in the installed shape and return the review
-    folder inside it. A file already there stays, so a job keeps the copy it started with."""
-    root = docs_root()
-    if root is None:
+def copy_name(folder: Path, path: Path) -> str:
+    """The name a copied document has in the review basis: its path under the job's
+    `review-docs` copy, or its file name for a record from before the copy kept the shape."""
+    try:
+        return path.relative_to(folder / "review-docs").as_posix()
+    except ValueError:
+        return path.name
+
+
+def shipped_files(root: Path) -> list[Path]:
+    """Every shipped file of a copy or an install under `root`."""
+    return sorted(
+        path
+        for name in (PACKAGE_DIR, "examples")
+        for path in (root / name).rglob("*")
+        if path.is_file()
+    )
+
+
+def shipped_markdown(root: Path) -> list[Path]:
+    """The shipped Markdown of a copy or an install under `root`."""
+    return [path for path in shipped_files(root) if path.suffix == ".md"]
+
+
+def copy_docs(target: Path, names: Iterable[str]) -> list[Path]:
+    """Copy the shipped documents the named guides reach into `target` in the installed shape,
+    and return every shipped file of the copy. A file already there stays, so a job keeps the
+    copy it started with; guides a record wrote flat move into the shape before it is filled."""
+    docs = docs_root()
+    if docs is None:
         raise DocsError("the review documents were not found")
-    pairs = shipped_files(root)
-    missing = [str(source) for source, _ in pairs if not source.is_file()]
-    if missing:
-        raise DocsError("the review documents are incomplete: " + ", ".join(missing))
-    for source, relative in pairs:
-        path = target / relative
-        if path.is_file():
+    names = tuple(dict.fromkeys(names))
+    base = target.resolve()
+    _migrate(target, names)
+    pending: list[Path] = []
+    for name in names:
+        path = guide_dir(target) / name
+        if not path.is_file():
+            _copy(docs / GUIDE_DIR / name, path)
+        pending.append(path)
+    seen: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in seen:
             continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, path)
-    guides = guide_dir(target)
-    absent = [name for name in all_names() if not (guides / name).is_file()]
-    if absent:
-        raise DocsError("the review guides are missing: " + ", ".join(absent))
-    return guides
+        seen.add(path)
+        if path.suffix != ".md":
+            continue
+        for local in _links(path):
+            resolved = (path.parent / local).resolve()
+            relative = _inside(resolved, base, local)
+            copied = base / relative
+            if not copied.is_file():
+                source = _source(relative, docs)
+                if not source.is_file():
+                    shown = path.relative_to(base).as_posix()
+                    raise DocsError(f"{shown}: link does not resolve: {local}")
+                _copy(source, copied)
+            pending.append(copied)
+    return shipped_files(target)
+
+
+def _migrate(target: Path, names: tuple[str, ...]) -> None:
+    """A record from before the copy kept the installed shape wrote its guides flat; move those
+    bytes into the shape, so the job keeps the text it recorded."""
+    for name in names:
+        legacy = target / name
+        path = guide_dir(target) / name
+        if legacy.is_file() and not path.is_file():
+            _copy(legacy, path)
+
+
+def _links(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    targets = (local_target(target) for target in link_targets(text))
+    return [local for local in targets if local is not None]
+
+
+def _inside(resolved: Path, base: Path, local: str) -> Path:
+    try:
+        return resolved.relative_to(base)
+    except ValueError:
+        raise DocsError(f"a guide link leaves the shipped tree: {local}") from None
+
+
+def _source(relative: Path, docs: Path) -> Path:
+    parts = relative.parts
+    if parts and parts[0] == PACKAGE_DIR:
+        return docs / Path(*parts[1:])
+    if parts and parts[0] == "examples":
+        return docs.parent / "examples" / Path(*parts[1:])
+    raise DocsError(f"a guide link names a file the install does not ship: {relative.as_posix()}")
+
+
+def _copy(source: Path, dest: Path) -> None:
+    if not source.is_file():
+        raise DocsError(f"the shipped document is missing: {source}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, dest)
 
 
 def link_targets(text: str) -> list[str]:
@@ -146,14 +199,6 @@ def local_target(target: str) -> str | None:
     return raw.split("#", 1)[0]
 
 
-def shipped_markdown(root: Path) -> list[Path]:
-    """The Markdown files of the shipped tree under an install root. Other files of the root
-    are not shipped, so a job copy that still holds the older flat guides ignores them."""
-    return sorted(
-        path for name in (PACKAGE_DIR, "examples") for path in (root / name).rglob("*.md")
-    )
-
-
 def link_problems(root: Path) -> list[str]:
     """Every relative Markdown link of the shipped documents under `root` must name a file or
     folder inside the shipped tree."""
@@ -163,9 +208,7 @@ def link_problems(root: Path) -> list[str]:
     problems: list[str] = []
     for path in shipped_markdown(root):
         shown = path.relative_to(root).as_posix()
-        text = path.read_text(encoding="utf-8")
-        targets = (local_target(target) for target in link_targets(text))
-        for local in dict.fromkeys(target for target in targets if target is not None):
+        for local in _links(path):
             resolved = (path.parent / local).resolve()
             if not any(resolved.is_relative_to(base) for base in bases):
                 problems.append(f"{shown}: link leaves the tree: {local}")
