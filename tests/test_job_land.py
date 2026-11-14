@@ -155,6 +155,8 @@ def listing_of_runs(sha):
     save()
     if take("advance_main_on_ci"):
         external_commit()
+    if state.get("advance_main_always"):
+        external_commit()
     if take("edit_title_on_ci"):
         for pr in state["pulls"].values():
             pr["title"] += "!"
@@ -633,6 +635,38 @@ class Lab(Env):
         git(self.bare, "update-ref", "refs/heads/main", new)
         return new
 
+    def mktree(self, lines: list[str]) -> str:
+        done = subprocess.run(
+            [os.environ["REAL_GIT"], "--git-dir", str(self.bare), "mktree"],
+            input="\n".join(lines) + "\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return done.stdout.strip()
+
+    def advance_remote_file(self, path: str, text: str = "external\n") -> str:
+        """Add one path to the remote main, a directory path included."""
+        parent = git(self.bare, "rev-parse", "refs/heads/main")
+        blob_file = self.base / "remote-blob"
+        blob_file.write_text(text, encoding="utf-8")
+        blob = git(self.bare, "hash-object", "-w", str(blob_file))
+        parts = path.split("/")
+        entry = f"100644 blob {blob}\t{parts[-1]}"
+        for name in reversed(parts[:-1]):
+            entry = f"040000 tree {self.mktree([entry])}\t{name}"
+        lines = [
+            line
+            for line in git(self.bare, "ls-tree", parent).splitlines()
+            if line.split("\t", 1)[1] != parts[0]
+        ]
+        lines.append(entry)
+        lines.sort(key=lambda line: line.split("\t", 1)[1])
+        tree = self.mktree(lines)
+        commit = git(self.bare, "commit-tree", tree, "-p", parent, "-m", "external change")
+        git(self.bare, "update-ref", "refs/heads/main", commit, parent)
+        return commit
+
     def land(self) -> dict:
         return self.get().to_json()["land_state"]
 
@@ -645,7 +679,7 @@ class Lab(Env):
     def write_text(self, name: str, text: str) -> None:
         (self.folder() / "pr" / "pr" / name).write_text(text, encoding="utf-8")
 
-    def accept(self) -> None:
+    def accept(self, extra: dict[str, str] | None = None) -> None:
         """Build one commit, pass the check and the review; a landing job is then in `land`."""
         assert self.run("check") == 0  # creates the work folder; nothing is built yet
         for name, text in GOOD_FILES.items():
@@ -659,6 +693,10 @@ class Lab(Env):
         )
         (self.tree / "out.txt").write_text("ok\n", encoding="utf-8")
         (self.tree / f"{self.receipt}.txt").write_text("one\n", encoding="utf-8")
+        for name, text in (extra or {}).items():
+            path = self.tree / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
         git(self.tree, "add", "-A")
         git(self.tree, "commit", "-m", "feat(x): add\n\nWhy it is needed.")
         self.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
@@ -940,19 +978,137 @@ def test_changed_text_after_publication_parks_instead_of_requeueing(make):
 # --- L2: base --------------------------------------------------------------------------------
 
 
-def test_moved_default_branch_before_publication_parks(make):
+def test_moved_default_branch_updates_the_publication_base(make):
+    lab = make(window=30)
+    lab.accept()
+    base = lab.get().base
+    result = git(lab.tree, "rev-parse", "HEAD")
+    tree = git(lab.tree, "rev-parse", "HEAD^{tree}")
+    reviews = len(lab.get().reviews)
+    main = lab.advance_remote_file("external.txt")
+    lab.finish()
+    state = lab.land()
+    assert (state["B"], state["M"], state["R"]) == (base, main, result)
+    assert state["T"] != tree
+    assert state["T"] == git(lab.bare, "rev-parse", f"{state['H']}^{{tree}}")
+    assert git(lab.bare, "show", f"{state['T']}:external.txt").strip() == "external"
+    assert git(lab.bare, "show", f"{state['T']}:out.txt").strip() == "ok"
+    assert git(lab.bare, "rev-list", "--parents", "-n", "1", state["H"]).split() == [
+        state["H"],
+        main,
+    ]
+    assert state["tree_verified"] is True
+    assert len(lab.get().reviews) == reviews
+    update = state["base_updates"][0]
+    assert (update["B"], update["M"], update["T"], update["tree"]) == (
+        base,
+        main,
+        tree,
+        state["T"],
+    )
+    assert update["from_head"] is None and update["head"] == state["H"]
+    assert state["base_update"]["check"]["exit_code"] == 0
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
+
+
+def test_moved_default_branch_with_an_overlapping_path_parks(make):
     lab = make()
     lab.accept()
-    lab.advance_remote()
-    lab.park("land_base_moved")
+    main = lab.advance_remote_file("out.txt", "main\n")
+    job = lab.park("land_base_moved")
+    assert "out.txt" in job.error
+    assert "base_updates" not in job.land_state and "H" not in job.land_state
+    assert git(lab.bare, "rev-parse", "refs/heads/main") == main
     cleaned_forge(lab)
 
 
-def test_default_branch_moving_during_ci_parks_before_merge(make):
+def test_merge_conflict_on_disjoint_paths_parks_with_the_path(make):
     lab = make()
+    lab.accept({"nested/added.txt": "result\n"})
+    lab.advance_remote_file("nested")
+    job = lab.park("land_base_moved")
+    assert "automatic base update conflicts" in job.error and "nested" in job.error
+    assert "base_updates" not in job.land_state and "H" not in job.land_state
+    cleaned_forge(lab)
+
+
+def test_failed_check_on_the_updated_base_parks_before_publication(make):
+    lab = make(window=30)
+    script = (
+        "import os, sys\n"
+        "ok = os.path.exists('out.txt') and open('out.txt').read().strip() == 'ok'\n"
+        "sys.exit(0 if ok and not os.path.exists('raised.txt') else 1)\n"
+    )
+    lab.jobs.save(replace(lab.get(), check_command=(sys.executable, "-c", script)), time.time())
     lab.accept()
-    lab.edit(advance_main_on_ci=1)
-    lab.park("land_base_moved")
+    main = lab.advance_remote_file("raised.txt")
+    job = lab.park("land_base_update_failed")
+    failure = job.land_state["base_update_failure"]
+    assert failure["exit_code"] == 1 and failure["M"] == main
+    assert "base_updates" not in job.land_state and "H" not in job.land_state
+    assert Path(failure["log"]).is_file()
+    cleaned_forge(lab)
+
+
+def test_base_update_can_be_turned_off(make):
+    lab = make()
+    lab.configure(land_base_update=False)
+    lab.accept()
+    lab.advance_remote_file("external.txt")
+    job = lab.park("land_base_moved")
+    assert job.error == "fresh default branch differs from accepted base"
+    cleaned_forge(lab)
+
+
+def test_an_old_parked_base_move_applies_the_update_on_resume(make):
+    lab = make(window=30)
+    lab.configure(land_base_update=False)
+    lab.accept()
+    main = lab.advance_remote_file("external.txt")
+    job = lab.park("land_base_moved")
+    # A record from before the switch existed has no frozen value.
+    lab.jobs.save(
+        replace(
+            job,
+            land_state={
+                key: value for key, value in job.land_state.items() if key != "base_update_enabled"
+            },
+        ),
+        time.time(),
+    )
+    lab.configure(land_base_update=True)
+    lab.resume()
+    lab.finish()
+    state = lab.land()
+    assert state["M"] == main and len(state["base_updates"]) == 1
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
+
+
+def test_default_branch_moving_during_ci_updates_the_same_publication(make):
+    lab = make(window=30)
+    lab.accept()
+    lab.edit(advance_main_on_ci=1, follow_branch=True)
+    lab.finish()
+    state = lab.land()
+    update = state["base_updates"][0]
+    assert update["from_head"] and update["head"] == state["H"] != update["from_head"]
+    assert git(lab.bare, "rev-list", "--parents", "-n", "1", state["H"]).split() == [
+        state["H"],
+        update["M"],
+    ]
+    assert git(lab.bare, "rev-parse", f"{state['H']}^{{tree}}") == state["T"]
+    assert state["tree_verified"] is True and state["S"]
+    assert state["pr"]["number"] == 17 and len(lab.forge()["created"]) == 1
+    assert lab.writes() == ["pr create", "pr merge"]
+
+
+def test_repeated_main_movement_is_bounded(make):
+    lab = make(window=30)
+    lab.accept()
+    lab.edit(advance_main_always=True, follow_branch=True)
+    job = lab.park("land_base_moved")
+    assert "more than 3" in job.error
+    assert len(job.land_state["base_updates"]) == 3
     assert lab.writes() == ["pr create"] and lab.hook_calls() == []
 
 
@@ -1574,7 +1730,7 @@ def test_foreign_push_urls_stop_before_any_remote_write(make, tmp_path, multiple
 
 
 def test_main_fetch_ignores_restricted_remote_tracking_mapping(make):
-    lab = make()
+    lab = make(window=30)
     lab.accept()
     base = lab.get().base
     git(
@@ -1586,10 +1742,12 @@ def test_main_fetch_ignores_restricted_remote_tracking_mapping(make):
     )
     moved = lab.advance_remote()
     assert git(lab.repo, "rev-parse", "origin/main") == base
-    lab.park("land_base_moved")
-    assert git(lab.repo, "rev-parse", "origin/main") == moved
-    cleaned_forge(lab)
-    assert lab.hook_calls() == []
+    lab.finish()
+    state = lab.land()
+    assert state["M"] == moved and len(state["base_updates"]) == 1
+    assert git(lab.bare, "rev-parse", f"{state['S']}^") == moved
+    assert state["tree_verified"] is True
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
 
 
 def test_saved_pr_merged_during_ci_resumes_verification_without_remerge(make):
@@ -1636,17 +1794,21 @@ def test_resolved_push_alias_is_not_rewritten_a_second_time(make, tmp_path):
     assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
 
 
-def test_missing_pr_reconciliation_never_creates_before_rechecking_moved_base(make):
-    lab = make()
+def test_missing_pr_reconciliation_rechecks_a_moved_base_before_one_create(make):
+    lab = make(window=30)
     lab.accept()
     lab.edit(create_refused=1)
     lab.park("land_interrupted")
     assert len(lab.forge()["created"]) == 1 and not lab.forge()["pulls"]
-    lab.advance_remote()
+    main = lab.advance_remote()
     lab.resume()
-    lab.park("land_base_moved")
-    assert len(lab.forge()["created"]) == 1 and not lab.forge()["pulls"]
-    assert lab.writes() == ["pr create"] and lab.hook_calls() == []
+    lab.finish()
+    state = lab.land()
+    assert state["M"] == main and len(state["base_updates"]) == 1
+    assert state["pr"]["number"] == 17
+    assert len(lab.forge()["created"]) == 2 and list(lab.forge()["pulls"]) == ["17"]
+    assert lab.writes() == ["pr create", "pr create", "pr merge"]
+    assert len(lab.hook_calls()) == 1
 
 
 def _accepted_stack(make):
@@ -1702,6 +1864,7 @@ def test_stacked_tree_preserved_publishes_only_after_parent_lands(make):
 
 def test_stacked_replay_rechecks_only_child_diff_on_moved_main(make):
     first, second = _accepted_stack(make)
+    second.configure(land_base_update=False)
     _land_direct(first)
     main = _move_main(first)
     before = second.writes()
@@ -1730,6 +1893,7 @@ def test_stacked_replay_rechecks_only_child_diff_on_moved_main(make):
 
 def test_stacked_replay_conflict_keeps_workspace_and_publication_untouched(make):
     first, second = _accepted_stack(make)
+    second.configure(land_base_update=False)
     _land_direct(first)
     _move_main(first, "k2.txt", "different\n")
     head = git(second.tree, "rev-parse", "HEAD")
@@ -1745,6 +1909,7 @@ def test_stacked_replay_conflict_keeps_workspace_and_publication_untouched(make)
 @pytest.mark.parametrize("when", ["before:reset", "after:reset"])
 def test_stacked_replay_restart_reuses_saved_commit(make, when):
     first, second = _accepted_stack(make)
+    second.configure(land_base_update=False)
     _land_direct(first)
     main = _move_main(first)
     second.trap(when)
@@ -1766,6 +1931,7 @@ def test_stacked_replay_restart_reuses_saved_commit(make, when):
 @pytest.mark.parametrize("owner_input", [False, True])
 def test_stacked_replay_restart_budget_requires_a_new_owner_entry(make, owner_input):
     first, second = _accepted_stack(make)
+    second.configure(land_base_update=False)
     _land_direct(first)
     _move_main(first)
     job = second.get()
@@ -1793,13 +1959,18 @@ def test_stacked_predecessor_fixed_uses_final_tree_at_landing(make, tree_changed
     first.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
     assert first.run("review") == 0
     _land_direct(first)
+    reviews = len(second.get().reviews)
     job = _land_direct(second)
-    assert job.stage == ("check" if tree_changed else "deliver_pending")
+    state = second.land()
+    assert job.stage == "deliver_pending" and len(job.reviews) == reviews
+    assert state["M"] == first.land()["S"]
+    assert (second.tree / "k1.txt").read_text() == "one\n"
+    assert (second.tree / "k2.txt").read_text() == "one\n"
     if tree_changed:
-        assert (second.tree / "k1.txt").read_text() == "revised\n"
-        assert (second.tree / "k2.txt").read_text() == "one\n"
+        assert len(state["base_updates"]) == 1
+        assert git(second.bare, "show", f"{state['T']}:k1.txt").strip() == "revised"
     else:
-        assert second.land()["M"] == first.land()["S"]
+        assert "base_updates" not in state
 
 
 # --- optional review-bot gate ----------------------------------------------------------------
@@ -2323,6 +2494,39 @@ def test_bot_fixed_republishes_same_pr_and_delivers_once(make, monkeypatch, reso
         assert lab.finish().stage == "done"
         assert len(lab.cards()) == 1
         assert f"bot-followup:{lab.get().id}" in lab.cards()[0]["text"]
+
+
+def test_bot_fix_after_a_base_update_republishes_the_merged_tree(make, monkeypatch):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        visible = [bot_thread(severity="P1")]
+        tx.api.review_threads = lambda *args: visible
+        main = lab.advance_remote_file("external.txt")
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        state = lab.land()
+        assert state["M"] == main and len(state["base_updates"]) == 1
+        old = state["H"]
+        assert git(lab.bare, "show", f"{state['T']}:external.txt").strip() == "external"
+        lab.jobs.save(replace(lab.get(), max_reviews=lab.get().reviews_used + 1), time.time())
+        accept_bot_fix(lab, change_text=True)
+        visible[0]["resolved"] = True
+        tx = restart_bot_tx(lab, tx)
+        replies = []
+        tx.api.find_review_reply = lambda *args: args[3] in replies
+        tx.api.post_review_reply = lambda *args: replies.append(args[3])
+        lab.edit(follow_branch=True)
+        tx.run()
+        state = lab.land()
+        assert lab.get().stage == "deliver_pending"
+        assert git(lab.bare, "rev-list", "--parents", "-n", "1", state["H"]).split() == [
+            state["H"],
+            old,
+        ]
+        assert git(lab.bare, "show", f"{state['T']}:external.txt").strip() == "external"
+        assert git(lab.bare, "show", f"{state['T']}:k1.txt").strip() == "corrected"
+        assert state["tree_verified"] is True
+        assert git(lab.bare, "rev-parse", f"{state['S']}^{{tree}}") == state["T"]
+        assert replies == []
 
 
 def test_bot_not_fixed_needs_exact_owner_acceptance_before_publication(make, monkeypatch):
