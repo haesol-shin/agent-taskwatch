@@ -170,6 +170,7 @@ class JobConfig:
     install_commands: Mapping[str, tuple[str, ...]] | None = None
     review_bots: Mapping[str, tuple[str, ...]] | None = None
     review_bot_wait: int = 600
+    check_slots: int | None = None  # None: every check command may run at once
 
     def __post_init__(self) -> None:
         if self.review_bots is not None:
@@ -274,6 +275,12 @@ def _review_bot_wait(value: object) -> int:
     return value
 
 
+def _check_slots(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("check_slots must be a positive integer")
+    return value
+
+
 def load_job_config(root: Path) -> JobConfig:
     path = root / "taskwatch" / "jobs-config.json"
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -292,6 +299,7 @@ def load_job_config(root: Path) -> JobConfig:
         "private_tmp",
         "review_bots",
         "review_bot_wait",
+        "check_slots",
     } != {
         "version",
         "slots",
@@ -340,6 +348,7 @@ def load_job_config(root: Path) -> JobConfig:
     if type(private_tmp) is not bool:
         raise ValueError("private_tmp must be true or false")
     review_bot_wait = _review_bot_wait(obj.get("review_bot_wait", 600))
+    check_slots = _check_slots(obj["check_slots"]) if "check_slots" in obj else None
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -366,6 +375,7 @@ def load_job_config(root: Path) -> JobConfig:
         _install_commands(obj["install_commands"]) if "install_commands" in obj else None,
         _review_bots(obj.get("review_bots")),
         review_bot_wait,
+        check_slots,
     )
 
 

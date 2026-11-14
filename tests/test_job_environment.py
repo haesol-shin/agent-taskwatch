@@ -101,7 +101,7 @@ def test_worker_prompt_and_workflow_name_absolute_record_paths(tmp_path, monkeyp
     )
 
 
-def test_workflow_tells_the_worker_to_run_changed_tests_and_the_full_check_once(
+def test_workflow_tells_the_worker_to_run_changed_tests_and_the_full_suite_once(
     tmp_path, monkeypatch
 ):
     env = Env(tmp_path, monkeypatch)
@@ -109,9 +109,26 @@ def test_workflow_tells_the_worker_to_run_changed_tests_and_the_full_check_once(
     assert env.run("work") == 0
     text = (env.folder() / "WORKFLOW.md").read_text(encoding="utf-8")
     working, end = text.split("## While working")[1].split("## End")
-    assert "only the tests that cover the files you changed" in working
-    assert "whole check once" in working and "--run-command" in working
+    assert "only the tests that cover what you changed" in working
+    assert "full suite runs once" in working and "--run-command" in working
     assert "--run-command" in end
+
+
+def test_work_and_fix_messages_run_only_changed_tests(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    env.seed({**GOOD_FILES, "out.txt": "bad\n"})
+    assert env.run("check") == 0
+    assert env.get().stage == "fix"
+    env.scenario([work_turn()])
+    assert env.run("fix") == 0
+    work, fix = env.prompts()
+    for message in (work, fix):
+        flat = " ".join(message.split())
+        assert "run only the tests that cover what you changed" in flat
+        assert "The full suite runs once for the committed result" in flat
+        assert "Do not run the full suite a second time." in flat
 
 
 @pytest.mark.parametrize(("language", "name"), [("ko", "Korean"), ("en", "English"), (None, None)])
