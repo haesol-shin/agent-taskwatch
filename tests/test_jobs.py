@@ -930,3 +930,27 @@ def test_review_bot_wait_rejects_nonpositive_noninteger_values(tmp_path, value):
     path.write_text(json.dumps(config), encoding="utf-8")
     with pytest.raises(ValueError, match="review_bot_wait"):
         load_job_config(root)
+
+
+def test_check_slots_is_an_optional_positive_integer(tmp_path):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert "check_slots" not in config
+    assert load_job_config(root).check_slots is None
+    config["check_slots"] = 3
+    path.write_text(json.dumps(config), encoding="utf-8")
+    assert load_job_config(root).check_slots == 3
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1", None, [1]])
+def test_check_slots_rejects_nonpositive_noninteger_values(tmp_path, value):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["check_slots"] = value
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="check_slots"):
+        load_job_config(root)

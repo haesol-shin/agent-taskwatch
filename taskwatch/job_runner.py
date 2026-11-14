@@ -6,6 +6,7 @@ A step that fails without a routed outcome records the error and leaves the stag
 scan resumes it. Nothing here calls a model except the omp RPC sessions of work, fix and review.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -65,6 +66,7 @@ SOURCE_TABLE = "source-table.md"
 EVIDENCE_EVERY = 15.0
 SETTLE_POLL = 2.0
 WATCH_EVERY = 2.0
+CHECK_SLOT_POLL = 0.1
 _EVENTS = frozenset(
     {"agent_start", "agent_end", "prompt_result", "session_settled", "subagent_lifecycle"}
 )
@@ -468,10 +470,10 @@ Work inputs:
 - When a review sends you back to fix findings, record each one in
   `{ctx.folder / job_findings.FINDINGS_FILE}` before you finish, as the fix message shows.
   A rule that repeats also needs a section in `{ctx.folder / job_findings.NOTE_FILE}`.
-- While working, run only the tests that cover the files you changed. Run the whole check once,
-  with the `--run-command` option of the command in the End section, just before you end. The
-  runner reuses a passing run instead of running the command again, if the result does not
-  change after it.
+- While working, run only the tests that cover what you changed. The full suite runs once for
+  the committed result: the End command with `--run-command` is that run, and a passing one is
+  reused instead of run again while the result, intent, spec and guidelines do not change.
+  Otherwise the check step runs the full suite once and keeps the output as the evidence.
 {card_language}- If you delegate to subagents, wait until each one finished.
 
 {_job_type_text(job)}
@@ -538,6 +540,13 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
         lines += [f"Progress file: {ctx.folder / job.progress}"]
         lines += [f"Checklist file: {ctx.folder / job.checklist}"]
         lines += [f"Brief file: {ctx.folder / 'brief.md'}"]
+        lines += [
+            "",
+            "While you work, run only the tests that cover what you changed. The full suite runs",
+            "once for the committed result: a passing `check --run-command` is that run, and the",
+            "check step reuses it instead of running the command again. Do not run the full",
+            "suite a second time.",
+        ]
     for path in job.inputs.get("work", []):
         lines.append(f"Work input: {path}")
     lines += choices.defaults_lines(ctx.jobs.state.root, job)
@@ -616,10 +625,20 @@ def _subject_lines(ctx: Ctx) -> list[str]:
     job, target = ctx.job, ctx.job.review_target
     if target is None:
         log = job.checks[-1]["log"] if job.checks else ""
-        return [
+        lines = [
             f"Reviewed result: {ctx.workspace} (files: {', '.join(job.outputs)})",
             f"Result fingerprint: {job.fingerprint}",
             f"Check output: {log}",
+        ]
+        if job.review == "code":
+            lines += [
+                "The check step ran the full suite once for this result; its record, whose",
+                "fingerprint is the result fingerprint above, is the full-suite evidence and a",
+                "check older than that fingerprint is not evidence. Run targeted tests only",
+                "where a finding needs them; do not run the full suite again.",
+            ]
+        return [
+            *lines,
             *_source_lines(ctx),
             f"Brief: {ctx.folder / 'brief.md'} (compare it with the result, rule C-19)",
         ]
@@ -1228,10 +1247,55 @@ def _kill_group(pid: int) -> None:
         pass
 
 
-def _run_command(ctx: Ctx, log: Path) -> tuple[dict, list[str]]:
-    """Run the check argv in its own process group, and kill the whole group afterwards."""
-    code, problems = -1, []
+def _slot_paths(ctx: Ctx) -> list[Path]:
+    """The lock file of each host check slot, or none when the host sets no limit."""
+    count = ctx.config.check_slots
+    if count is None:
+        return []
+    return [ctx.jobs.state.dir / "check-slots" / f"{index}.lock" for index in range(count)]
+
+
+def _acquire_slot(ctx: Ctx) -> int | None:
+    """Wait for a free check slot and return the descriptor holding it, or None with no limit.
+
+    The lock is an fcntl lock on a slot file, so the operating system releases it when this
+    process dies and a killed holder never keeps the host limit. Waiting happens before the
+    command starts, so it does not count toward the check timeout.
+    """
+    paths = _slot_paths(ctx)
+    if paths:
+        paths[0].parent.mkdir(parents=True, exist_ok=True)
+    while paths:
+        for path in paths:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            return fd
+        time.sleep(CHECK_SLOT_POLL)
+    return None
+
+
+def _release_slot(fd: int | None) -> None:
+    if fd is None:
+        return
     try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _run_command(ctx: Ctx, log: Path) -> tuple[dict, list[str]]:
+    """Run the check argv in its own process group, and kill the whole group afterwards.
+
+    With `check_slots` set, one host-wide slot is held for the run and the timeout starts
+    after it is held."""
+    code, problems = -1, []
+    slot = None
+    try:
+        slot = _acquire_slot(ctx)
         with log.open("wb") as out:
             proc = subprocess.Popen(
                 ctx.job.check_command,
@@ -1254,6 +1318,8 @@ def _run_command(ctx: Ctx, log: Path) -> tuple[dict, list[str]]:
     except OSError as exc:
         log.write_text(f"{exc}\n", encoding="utf-8")
         problems.append(f"check command could not run: {exc}")
+    finally:
+        _release_slot(slot)
     record = {"exit_code": code, "log": str(log), "log_sha256": _file_sha(log)}
     return record, problems
 

@@ -21,6 +21,7 @@ from taskwatch.jobs import JobConfig, Jobs, JobState
 from taskwatch.rate_limit import RateLimit
 from tests.git_fixture import make_repo
 from tests.spec_fixture import VALID_SPEC
+from tests.verdicts import CODE_PASS
 
 FAKE = Path(__file__).with_name("fake_omp.py")
 PASS = (
@@ -395,6 +396,113 @@ def test_check_requires_files_checklist_and_progress(env):
     assert any("do not pass: a" in p for p in problems)
 
 
+HOLDER = (
+    "import fcntl, os, sys, time\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)\n"
+    "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+    "print('held', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+def _slot_ctx(env, check_slots, command=None, **config) -> job_runner.Ctx:
+    job = env.get() if command is None else replace(env.get(), check_command=tuple(command))
+    loaded = replace(env.config, check_slots=check_slots, **config)
+    return job_runner.Ctx(env.jobs, loaded, job, env.folder(), env.folder() / "work")
+
+
+def _hold_slot(ctx) -> subprocess.Popen:
+    slot = job_runner._slot_paths(ctx)[0]
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", HOLDER, str(slot)], stdout=subprocess.PIPE, text=True
+    )
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def _kill(holder: subprocess.Popen) -> None:
+    if holder.poll() is None:
+        holder.kill()
+    holder.wait(timeout=10)
+    holder.stdout.close()
+
+
+def test_check_slots_run_commands_one_after_another(env, tmp_path):
+    env.seed({})
+    marker = tmp_path / "order.txt"
+    command = [
+        sys.executable,
+        "-c",
+        f"import time\n"
+        f"open({str(marker)!r}, 'a').write('start\\n')\n"
+        "time.sleep(0.3)\n"
+        f"open({str(marker)!r}, 'a').write('end\\n')\n",
+    ]
+    ctx = _slot_ctx(env, 1, command)
+    runs = []
+    threads = [
+        threading.Thread(
+            target=lambda index=index: runs.append(
+                job_runner._run_command(ctx, tmp_path / f"check-{index}.log")
+            )
+        )
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert len(runs) == 2
+    assert [problem for _, problems in runs for problem in problems] == []
+    assert marker.read_text().split() == ["start", "end", "start", "end"]
+
+
+def test_a_killed_slot_holder_frees_its_slot(env):
+    env.seed({})
+    ctx = _slot_ctx(env, 1)
+    acquired = threading.Event()
+    fds = []
+
+    def take() -> None:
+        fds.append(job_runner._acquire_slot(ctx))
+        acquired.set()
+
+    holder = _hold_slot(ctx)
+    thread = threading.Thread(target=take)
+    try:
+        thread.start()
+        # The lock is on a file, so the cap holds across processes.
+        assert not acquired.wait(0.5)
+        holder.kill()
+        assert acquired.wait(5)
+    finally:
+        _kill(holder)
+        thread.join(5)
+        for fd in fds:
+            job_runner._release_slot(fd)
+    assert len(fds) == 1 and fds[0] is not None
+
+
+def test_waiting_for_a_slot_is_outside_the_check_timeout(env, tmp_path):
+    env.seed({})
+    ctx = _slot_ctx(env, 1, [sys.executable, "-c", "print('ok')"], rpc_timeout=0.2)
+    holder = _hold_slot(ctx)
+    timer = threading.Timer(0.5, holder.kill)
+    try:
+        timer.start()
+        record, problems = job_runner._run_command(ctx, tmp_path / "check.log")
+    finally:
+        timer.cancel()
+        _kill(holder)
+    assert problems == [] and record["exit_code"] == 0
+
+
+def test_no_check_slots_leaves_the_host_unlimited(env):
+    assert job_runner._acquire_slot(_slot_ctx(env, None)) is None
+    assert not (env.jobs.state.dir / "check-slots").exists()
+
+
 def test_prompt_result_alone_is_not_acceptance(env):
     env.config = JobConfig(omp_command=env.config.omp_command, rpc_timeout=1)
     env.scenario([work_turn(no_settle=True)])
@@ -744,6 +852,26 @@ def test_code_job_check_reuses_the_agents_run_on_the_committed_result(tmp_path, 
     job = env.get()
     assert job.stage == "review" and counter.read_text() == "x"
     assert job.checks[-1]["reused_precheck"] is True
+
+
+def test_code_review_message_names_the_check_record_as_the_full_suite_evidence(
+    tmp_path, monkeypatch
+):
+    repo = make_repo(tmp_path, "repo")
+    env = Env(tmp_path, monkeypatch, review="code", target=repo)
+    env.scenario(
+        [
+            work_turn(run=[["git", "add", "-A"], [*GIT, "commit", "-m", "work"]]),
+            {"reply": f"{CODE_PASS}\nNo findings."},
+        ]
+    )
+    assert env.run("work") == 0
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    message = env.prompts()[1]
+    assert "The check step ran the full suite once for this result" in message
+    assert "check older than that fingerprint is not evidence" in message
+    assert "do not run the full suite again" in message
 
 
 def test_stale_attempt_cannot_create_worktree_before_base_intent_is_saved(tmp_path, monkeypatch):

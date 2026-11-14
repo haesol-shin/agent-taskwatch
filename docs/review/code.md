@@ -51,7 +51,7 @@ Use this file with the common guidelines when the deliverable is a code change.
 
 **K-10.** Docs, error messages, and tests that still describe the old behavior are findings when the change left them that way.
 
-**K-11.** If the assignment includes test or CI output, a failure caused by the change is a finding. In the verdict, say which tests and commands you ran, or that tests were not checked. When the change adds a restart, cancel, or streaming path that the repository can run, run it or reproduce it; the code alone does not show the path works.
+**K-11.** If the assignment includes test or CI output, a failure caused by the change is a finding. The check output for the reviewed fingerprint is the full-suite evidence; a check older than the current fingerprint is not. Run targeted tests where a finding needs them and do not run the full suite again. In the verdict, say which tests and commands you ran, or that tests were not checked. When the change adds a restart, cancel, or streaming path that the repository can run, run it or reproduce it; the code alone does not show the path works.
 
 ## Public text
 

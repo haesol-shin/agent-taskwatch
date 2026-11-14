@@ -22,6 +22,8 @@ All keys shown above except `max_reviews` are required. The three numeric settin
 
 `max_reviews` limits the reviews of one cycle; see [Review limit](#review-limit).
 
+`check_slots` is optional and absent by default. When it is a positive integer, at most that many check commands run at once across every job of the host, the agent's [`check --run-command`](commands.md#check) included. A command waits for a free slot before it starts, so the wait is outside `rpc_timeout`. Each slot is an `fcntl` lock on a file under `taskwatch/state/check-slots/`; the operating system releases the lock when the holding process dies, so a killed or timed-out holder never keeps a slot. Without the key every check command starts at once, as before. The `init` draft omits this optional key.
+
 `install_command` is optional and defaults to `null`; optional `install_commands` selects hooks by repository identity instead. [Host install command](#host-install-command) owns their host-only argv contract, selection, frozen identity and explicit retry rules.
 
 Optionally add `"review_command": ["executor", "--role", "reviewer"]` to run independent reviews with a different command prefix. Like `omp_command`, it must be a nonempty list of nonempty strings. When omitted, RPC reviews use `omp_command`. With the default `review_mode` (`"rpc"`), review commands receive `--mode rpc --no-ui`. The `init` draft omits this optional key. Work and fix select their command through [Worker execution](#worker-execution).
@@ -517,7 +519,7 @@ For result delivery, success needs exit code 0, a JSON object with a truthy `suc
 
 [`check`](commands.md#check) shows what the check step would reject about a result before the job ends; its output, options and exit codes are in the command reference. `WORKFLOW.md` names the command in its End section as the last step before the agent finishes.
 
-`WORKFLOW.md` tells the worker to run only the tests that cover the files it changed while working, and `check <job> --run-command` once just before it ends. A run that exits 0 counts as the check command's run: the check step reuses it instead of running the command again, when the result, intent, spec and guidelines are unchanged since the run, as [checks](checks.md#job-checks) describes.
+`WORKFLOW.md` and the work and fix messages tell the worker to run only the tests that cover what it changed while working. The full suite runs once for the committed result: `check <job> --run-command` is that run when it passes just before the agent finishes, and the check step reuses it instead of running the command again while the result, intent, spec and guidelines are unchanged; otherwise the check step runs it once and keeps the output as the evidence, as [checks](checks.md#job-checks) describes. The review message names that check record as the full-suite evidence, and the reviewer runs only targeted tests.
 
 ### Chains and gates
 
