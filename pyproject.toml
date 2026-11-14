@@ -19,9 +19,21 @@ taskwatch = "taskwatch.job_cli:main"
 packages = ["taskwatch"]
 
 [tool.setuptools.data-files]
+# Installed docs link with relative paths, so every target ships at the path
+# its link resolves to. That includes the examples named as ../examples.
+"share/agent-taskwatch" = [
+    "docs/checks.md",
+    "docs/commands.md",
+    "docs/configuration.md",
+    "docs/review-launch.md",
+    "docs/spec-template.md",
+]
 "share/agent-taskwatch/review" = ["docs/review/*.md"]
 "share/agent-taskwatch/launch" = ["docs/launch/*.md", "docs/launch/*.json"]
 "share/agent-taskwatch/jobs" = ["docs/jobs/*.md", "docs/jobs/*.json"]
+"share/examples/hermes/skills/taskwatch" = ["examples/hermes/skills/taskwatch/SKILL.md"]
+"share/examples/omp" = ["examples/omp/reviewer.md"]
+"share/examples/worker" = ["examples/worker/opencode.py"]
 
 [project.urls]
 Repository = "https://github.com/haesol-shin/agent-taskwatch"
