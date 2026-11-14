@@ -38,7 +38,7 @@ The review session is separate from the work session. Re-review includes prior f
 
 Each finding in the output has a heading `### F<n>` and one JSON line with `finding`, `severity` (P0 to P3), `category`, `rule` (a guideline rule id, `text/<rule>`, or `other`), `location` and an optional `summary` (one line, at most 160 characters). The runner validates only those lines: ids are unique and match the headings, and a `PASS` carries no P0 or P1. The worker's record of each finding and the checks on repeated rules are in [Finding records and repeated rules](#finding-records-and-repeated-rules).
 
-Configured landing bots follow the canonical [Review bots policy](configuration.md#review-bots-policy): check-run-only completion, bounded fallback, severity gates and one retained low-severity followup. The gate does not automatically fix findings or publish replies.
+Configured landing bots follow the canonical [Review bots policy](configuration.md#review-bots-policy), including bounded observation, automatic fix routing, explicit reviewed dispositions, owner acceptance of every rejection, exact reply evidence and one retained low-severity followup.
 
 ### Public text evidence
 
@@ -53,6 +53,8 @@ The text fingerprint binds the title, pull request body, squash body and ordered
 The review reads a read-only snapshot containing the three texts and the step commit messages, and the record retains the snapshot digest and publication state.
 
 A changed title, pull request body, squash body or step commit message invalidates an earlier PASS; when the code is unchanged, the next round receives the text diff as a text-only review.
+
+Bot disposition candidates bind the worker status, source identity and exact full reply body to the accepting review. A PASS must explicitly accept every candidate; the separate owner reason gate cannot replace public-text review. Changed candidates return to check before any reply. See [Review bots policy](configuration.md#review-bots-policy) for the acceptance syntax and minimum-reply rules.
 
 [`taskwatch text`](commands.md#text) validates the accepted snapshot digest and current text fingerprint, then copies the reviewed `title.txt`, `body.md` and `commit.txt` from that snapshot; for a unit that declares `blank_squash_body` the copied `commit.txt` is empty.
 

@@ -1236,3 +1236,121 @@ def test_a_command_that_changes_the_result_is_not_recorded_as_a_run(env, tmp_pat
     assert not (env.folder() / "logs" / "precheck.json").exists()
     assert env.run("check") == 0
     assert counter.read_text() == "xx"
+
+
+def _pending_bot_replies(env):
+    from taskwatch import job_findings
+
+    env.to_review()
+    threads = {}
+    entries = []
+    for number, status in ((1, "not_fixed"), (2, "fixed")):
+        finding = f"r2.F{number}"
+        threads[f"thread-{number}"] = {
+            "root_id": number,
+            "finding": finding,
+            "path": "out.txt",
+            "digest": str(number) * 64,
+            "severity": "P2",
+            "status": "open",
+        }
+        entries.append(
+            {
+                "id": finding,
+                "status": status,
+                **({"reason": "Synthetic @owner reason."} if number == 1 else {"commit": "a" * 40}),
+            }
+        )
+    (env.folder() / "findings.json").write_text(json.dumps(entries), encoding="utf-8")
+    env.jobs.save(
+        replace(env.get(), land_state={"bot": {"threads": threads, "round": {"awaiting": True}}}),
+        1600.0,
+    )
+    # A check that ran after the fix freezes the exact reply bytes it covered.
+    job = env.get()
+    with env.jobs.state.lock():
+        env.jobs.save(
+            replace(
+                job,
+                checks=(
+                    *job.checks[:-1],
+                    {
+                        **job.checks[-1],
+                        "bot_dispositions": tuple(job_findings.bot_dispositions(job, env.folder())),
+                    },
+                ),
+            ),
+            1601.0,
+        )
+    env.put("review")
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_bot_dispositions_need_each_explicit_acceptance_and_store_exact_bytes(env, explicit):
+    from taskwatch import job_findings
+
+    _pending_bot_replies(env)
+    candidates = job_findings.bot_dispositions(env.get(), env.folder())
+    reply = PASS
+    if explicit:
+        reply += "\nBOT_DISPOSITION r2.F1: accepted\nBOT_DISPOSITION r2.F2: accepted"
+    env.scenario([{"reply": reply}])
+    assert env.run("review") == 0
+    review = env.get().reviews[-1]
+    assert review["ok"] == explicit
+    assert json.dumps(candidates, ensure_ascii=False, indent=2) in env.prompts()[0]
+    if explicit:
+        assert review["bot_dispositions"] == tuple(candidates)
+        assert review["bot_answers"] == (candidates[0],)
+        assert review["bot_fixed_replies"] == (candidates[1],)
+    else:
+        assert "missing explicit acceptance" in "; ".join(review["problems"])
+        assert "bot_dispositions" not in review
+
+
+def test_worker_disposition_change_during_review_requeues_check(env, monkeypatch):
+    _pending_bot_replies(env)
+    original = job_runner._converse
+
+    def changed(*args, **kwargs):
+        reply = original(*args, **kwargs)
+        path = env.folder() / "findings.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        entries[0]["reason"] = "Different reason after review."
+        path.write_text(json.dumps(entries), encoding="utf-8")
+        return reply
+
+    monkeypatch.setattr(job_runner, "_converse", changed)
+    env.scenario(
+        [{"reply": PASS + "\nBOT_DISPOSITION r2.F1: accepted\nBOT_DISPOSITION r2.F2: accepted"}]
+    )
+    assert env.run("review") == 0
+    assert env.get().stage == "check"
+    assert env.get().reviews == ()
+    assert "bot dispositions changed" in env.get().error
+
+
+def test_bot_candidate_changed_after_check_returns_to_check(env):
+    _pending_bot_replies(env)
+    # The record changes after the check froze the bytes the reviewer would judge.
+    path = env.folder() / "findings.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    entries[0]["reason"] = "Different reason after the check."
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    env.scenario([{"reply": PASS}])
+    before = env.get().reviews_used
+    assert env.run("review") == 0
+    job = env.get()
+    assert job.stage == "check" and job.reviews == ()
+    assert job.reviews_used == before
+
+
+def test_print_checked_string_requires_every_bot_disposition():
+    verdict = json.loads(PASS)
+    candidates = [{"finding": "r2.F1"}, {"finding": "r3.F1"}]
+    verdict["checked"] += "\nBOT_DISPOSITION r2.F1: accepted"
+    assert job_runner._bot_acceptance_problems(json.dumps(verdict), candidates) == [
+        "missing explicit acceptance: BOT_DISPOSITION r3.F1: accepted"
+    ]
+    verdict["checked"] += "\nBOT_DISPOSITION r3.F1: accepted"
+    assert job_runner._bot_acceptance_problems(json.dumps(verdict), candidates) == []

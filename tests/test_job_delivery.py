@@ -713,3 +713,60 @@ def test_bot_observations_cannot_replace_actual_code_review(board, control):
     job = replace(job, land=True, review="code", reviews=tuple(records), land_state={"bot": bot})
     selected = job_delivery.accepted_review(job)
     assert bool(selected.get("ok") and selected.get("verdict") == "PASS") == (control == "bound")
+
+
+@pytest.mark.parametrize("after_merge", [False, True])
+def test_settled_bot_status_changes_cannot_merge_or_deliver(tmp_path, monkeypatch, after_merge):
+    from taskwatch import job_land
+    from tests.test_job_land import (
+        Lab,
+        accept_bot_fix,
+        bot_lab,
+        bot_thread,
+        restart_bot_tx,
+    )
+
+    def make(**options):
+        return Lab(tmp_path, monkeypatch, **options)
+
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        try:
+            tx.api.review_threads = lambda *args: [bot_thread(severity="P1", resolved=False)]
+            with pytest.raises(job_land.BotParked):
+                tx.run()
+            accept_bot_fix(lab)
+            tx = restart_bot_tx(lab, tx)
+            replies = []
+            tx.api.find_review_reply = lambda *args: args[3] in replies
+            tx.api.post_review_reply = lambda *args: replies.append(args[3])
+            lab.edit(follow_branch=True)
+
+            def change_record():
+                (lab.folder() / "findings.json").write_text(
+                    '[{"id":"r2.F1","status":"not_fixed","reason":"Changed after review"}]',
+                    encoding="utf-8",
+                )
+
+            if not after_merge:
+                merge = tx.merge
+
+                def change_before_merge():
+                    assert lab.land()["bot"]["round"]["awaiting"] is False
+                    change_record()
+                    merge()
+
+                tx.merge = change_before_merge
+                with pytest.raises(job_land.FreshnessRequeued):
+                    tx.run()
+                assert lab.get().stage == "check"
+                assert "pr merge" not in lab.writes()
+            else:
+                tx.run()
+                assert lab.get().stage == "deliver_pending"
+                change_record()
+                job = job_delivery.deliver_job(lab.jobs, tx.ctx.config, lab.get(), 3000)
+                assert (job.stage, job.wait_reason) == ("user_wait", "land_review_stale")
+                assert job.land_state["S"]
+            assert lab.cards() == []
+        finally:
+            lab.close()

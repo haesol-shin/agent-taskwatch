@@ -446,6 +446,42 @@ class GitHub:
             raise Mismatch("pull request number differs")
         return pr
 
+    def edit_pull_request(
+        self, repo: Repository, number: int, head_sha: str, title: str, body_file: str | Path
+    ) -> PullRequest:
+        """Edit one pinned PR, then require exact title/body and head readback."""
+        number, head_sha, title = _int(number), _sha(head_sha), _string(title)
+        path = Path(body_file).resolve()
+        try:
+            body = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeError):
+            raise ForgeError("pull request body file could not be read as UTF-8") from None
+        pr = self.read_pull_request(repo, number, head_sha)
+        if pr.state != "OPEN":
+            raise Mismatch("pull request edit requires an open PR")
+        self._command(
+            [
+                "gh",
+                "pr",
+                "edit",
+                str(number),
+                "--repo",
+                repo.identity,
+                "--title",
+                title,
+                "--body-file",
+                str(path),
+            ],
+            write=True,
+        )
+        try:
+            observed = self.read_pull_request(repo, number, head_sha)
+            if observed.state != "OPEN" or observed.title != title or observed.body != body:
+                raise Mismatch("pull request edit readback differs")
+        except ForgeError:
+            raise Uncertain("pull request edit lacks exact pinned readback") from None
+        return observed
+
     def find_pull_requests(
         self, repo: Repository, head_branch: str, base_branch: str, head_sha: str
     ) -> tuple[PullRequest, ...]:
@@ -466,6 +502,69 @@ class GitHub:
         if len(found) > 1:
             raise Mismatch("multiple pull requests match stable identity")
         return tuple(found)
+
+    def viewer_login(self, repo: Repository) -> str:
+        """Read the authenticated identity on this repository's host."""
+        return _text(_object(self._api(repo, "user")).get("login"))
+
+    def find_review_reply(
+        self,
+        repo: Repository,
+        number: int,
+        root_id: int,
+        body: str,
+        kind: str,
+        previous: tuple[str, ...] = (),
+    ) -> bool:
+        """Reconcile an exact viewer-authored root reply; conflicting markers fail closed."""
+        number, root_id, body = _int(number), _int(root_id), _text(body)
+        if kind not in {"answer", "fixed"}:
+            raise ForgeError("unsupported review reply kind")
+        marker = f"<!-- taskwatch:{kind} thread={root_id} -->"
+        markers = re.findall(r"<!-- taskwatch:(?:answer|fixed) thread=\d+ -->", body)
+        if markers != [marker]:
+            raise Mismatch("review reply must contain exactly its requested marker")
+        viewer = self.viewer_login(repo)
+        rows = self._rows(repo, f"{self._path(repo)}/pulls/{number}/comments?per_page=100")
+        found = False
+        for row in rows:
+            author = _text(_object(row.get("user")).get("login"))
+            if author.casefold() != viewer.casefold():
+                continue
+            observed = _string(row.get("body"))
+            if marker not in observed:
+                continue
+            if observed in previous and observed != body:
+                if row.get("in_reply_to_id") != root_id:
+                    raise Mismatch("historic viewer reply has a different root")
+                continue
+            if (
+                found
+                or observed != body
+                or type(row.get("in_reply_to_id")) is not int
+                or row["in_reply_to_id"] != root_id
+            ):
+                raise Mismatch("viewer review reply marker conflicts with requested reply")
+            found = True
+        return found
+
+    def post_review_reply(self, repo: Repository, number: int, root_id: int, body: str) -> None:
+        """Post once to the REST root; the caller persists intent and reconciles uncertainty."""
+        number, root_id, body = _int(number), _int(root_id), _text(body)
+        self._command(
+            [
+                "gh",
+                "api",
+                "--hostname",
+                repo.host,
+                "--method",
+                "POST",
+                f"{self._path(repo)}/pulls/{number}/comments/{root_id}/replies",
+                "-f",
+                f"body={body}",
+            ],
+            write=True,
+        )
 
     def create_pull_request(
         self, repo: Repository, head_branch: str, head_sha: str, title: str, body_file: str | Path

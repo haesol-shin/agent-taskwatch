@@ -116,6 +116,9 @@ def tree_with_extra(tree):
 
 def row(pr):
     number = pr["number"]
+    if state.get("follow_branch") and pr["state"] == "open":
+        pr["head_sha"] = ref("refs/heads/" + pr["head_ref"])
+        save()
     return {
         "number": number,
         "html_url": f"https://github.com/{REPO}/pull/{number}",
@@ -284,6 +287,11 @@ if args[:2] == ["pr", "create"]:
     create()
 elif args[:2] == ["pr", "merge"]:
     merge()
+elif args[:2] == ["pr", "edit"]:
+    pr = state["pulls"][args[2]]
+    pr["title"] = option("--title")
+    pr["body"] = Path(option("--body-file")).read_bytes().decode("utf-8")
+    save()
 elif args[:2] == ["run", "rerun"]:
     rerun()
 else:
@@ -1849,8 +1857,8 @@ def test_bot_priority_routes_without_spending_review_budget(make, monkeypatch, e
             with pytest.raises(job_land.BotParked):
                 tx.run()
             job = lab.get()
-            assert (job.wait_reason, job.resume_stage) == (
-                ("review_exhausted", "fix") if exhausted else ("land_bot_findings", "land")
+            assert (job.stage, job.wait_reason, job.resume_stage) == (
+                ("user_wait", "review_exhausted", "fix") if exhausted else ("fix", "", "fix")
             )
             assert lab.writes() == ["pr create"]
         else:
@@ -2197,7 +2205,7 @@ def test_manual_resolution_closes_a_low_thread_and_landing_continues(make, monke
         tx.api.review_threads = lambda *args: visible
         with pytest.raises(job_land.BotParked):
             tx.run()
-        assert lab.get().wait_reason == "land_bot_findings"
+        assert lab.get().stage == "fix"
         visible[0]["resolved"] = True
         job = lab.put("land")
         tx.ctx = Ctx(lab.jobs, tx.ctx.config, job, lab.folder(), lab.tree)
@@ -2236,3 +2244,293 @@ def test_resolution_never_closes_a_high_finding_or_a_retained_deferral(make, mon
         assert threads["thread-2"]["status"] == "deferred"
         assert threads["thread-3"]["status"] == "closed"
         assert lab.land()["bot"]["followup"]["findings"] == ["r2.F2"]
+
+
+def restart_bot_tx(lab, tx):
+    job = lab.put("land")
+    newer = job_land.Transaction(
+        Ctx(lab.jobs, tx.ctx.config, job, lab.folder(), lab.tree), tx.lock_fd
+    )
+    newer.api.authenticated_hosts = ("forge.invalid",)
+    newer.api.inspect_bot_runs = tx.api.inspect_bot_runs
+    newer.api.review_threads = tx.api.review_threads
+    return newer
+
+
+def accept_bot_fix(lab, *, status="fixed", reason="Not applicable", change_text=False):
+    job = lab.get()
+    refs = job.land_state["bot"]["round"]["findings"]
+    if status == "fixed":
+        (lab.tree / "k1.txt").write_text("corrected\n", encoding="utf-8")
+        git(lab.tree, "add", "k1.txt")
+        git(lab.tree, "commit", "-m", "fix(x): correct input\n\n- Preserve valid input")
+        detail = {"commit": git(lab.tree, "rev-parse", "HEAD")}
+    else:
+        detail = {"reason": reason}
+    (lab.folder() / "findings.json").write_text(
+        json.dumps([{"id": ref, "status": status, **detail} for ref in refs]), encoding="utf-8"
+    )
+    if change_text:
+        lab.write_text("title.txt", "fix(x): correct input\n")
+        lab.write_text("body.md", "Corrected input.\n")
+        lab.write_text("commit.txt", "- Keep invalid input from being accepted\n")
+    assert lab.run("check") == 0
+    assert lab.get().checks[-1]["problems"] == ()
+    lab.scenario(
+        [
+            {
+                "reply": CODE_PASS
+                + "\n"
+                + "\n".join(f"BOT_DISPOSITION {ref}: accepted" for ref in refs)
+            }
+        ]
+    )
+    assert lab.run("review") == 0
+    assert lab.get().stage == "land", lab.get().error
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_bot_fixed_republishes_same_pr_and_delivers_once(make, monkeypatch, resolved):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        visible = [bot_thread(severity="P1")]
+        tx.api.review_threads = lambda *args: visible
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        old = lab.land()["H"]
+        lab.jobs.save(replace(lab.get(), max_reviews=lab.get().reviews_used + 1), time.time())
+        accept_bot_fix(lab, change_text=True)
+        visible[0]["resolved"] = resolved
+        visible.append(bot_thread(2, "P2"))
+        tx = restart_bot_tx(lab, tx)
+        replies = []
+        tx.api.find_review_reply = lambda *args: args[3] in replies
+        tx.api.post_review_reply = lambda *args: replies.append(args[3])
+        lab.edit(follow_branch=True)
+        tx.run()
+        state = lab.land()
+        assert lab.get().stage == "deliver_pending"
+        assert state["H"] != old
+        assert git(lab.bare, "rev-parse", f"{state['H']}^") == old
+        assert state["tree_verified"]
+        assert git(lab.bare, "rev-parse", f"{state['S']}^{{tree}}") == state["T"]
+        assert lab.forge()["pulls"]["17"]["title"] == "fix(x): correct input"
+        assert len(replies) == (0 if resolved else 1)
+        assert state["bot"]["threads"]["thread-1"]["status"] == "fixed"
+        assert state["bot"]["followup"]["findings"] == ["r4.F1"]
+        tx = restart_bot_tx(lab, tx)
+        tx.run()
+        assert len(replies) == (0 if resolved else 1)
+        assert lab.finish().stage == "done"
+        assert len(lab.cards()) == 1
+        assert f"bot-followup:{lab.get().id}" in lab.cards()[0]["text"]
+
+
+def test_bot_not_fixed_needs_exact_owner_acceptance_before_publication(make, monkeypatch):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        tx.api.review_threads = lambda *args: [bot_thread(severity="P1")]
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        old = lab.land()["H"]
+        accept_bot_fix(lab, status="not_fixed", reason="Already guarded for @someone")
+        tx = restart_bot_tx(lab, tx)
+        with pytest.raises(job_land.LandStop, match="BOT_ACCEPT") as stopped:
+            tx.run()
+        assert stopped.value.reason == "bot_reason_approval"
+        token = lab.land()["bot"]["owner_pending"]["digest"]
+        assert lab.land()["H"] == old
+        # A new owner entry without the bound token cannot approve a reason.
+        lab.jobs.save(
+            replace(
+                lab.get(),
+                events=(
+                    *lab.get().events,
+                    {
+                        "type": "resume",
+                        "entry": 1,
+                        "reason": "continue",
+                    },
+                ),
+            ),
+            time.time(),
+        )
+        tx = restart_bot_tx(lab, tx)
+        with pytest.raises(job_land.LandStop, match="BOT_ACCEPT"):
+            tx.run()
+        lab.jobs.save(
+            replace(
+                lab.get(),
+                events=(
+                    *lab.get().events,
+                    {
+                        "type": "resume",
+                        "entry": 2,
+                        "reason": f"BOT_ACCEPT {token}",
+                    },
+                ),
+            ),
+            time.time(),
+        )
+        tx = restart_bot_tx(lab, tx)
+        replies = []
+        tx.api.find_review_reply = lambda *args: args[3] in replies
+        tx.api.post_review_reply = lambda *args: replies.append(args[3])
+        lab.edit(follow_branch=True)
+        tx.run()
+        assert lab.get().stage == "deliver_pending"
+        assert len(replies) == 1
+        assert "@someone" not in replies[0]
+        assert "@\u200bsomeone" in replies[0]
+        assert lab.land()["bot"]["threads"]["thread-1"]["status"] == "answered"
+
+
+@pytest.mark.parametrize(
+    "mutation", ["foreign_head", "worker_status", "source", "path", "priority"]
+)
+def test_bot_fix_never_adopts_foreign_or_changed_evidence(make, monkeypatch, mutation):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        visible = [bot_thread(severity="P2")]
+        tx.api.review_threads = lambda *args: visible
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        old = lab.land()["H"]
+        accept_bot_fix(lab)
+        if mutation == "foreign_head":
+            foreign = git(lab.bare, "commit-tree", f"{old}^{{tree}}", "-p", old, "-m", "foreign")
+            git(lab.bare, "update-ref", f"refs/heads/{lab.land()['branch']}", foreign)
+        elif mutation == "worker_status":
+            (lab.folder() / "findings.json").write_text(
+                '[{"id":"r2.F1","status":"not_fixed","reason":"different"}]', encoding="utf-8"
+            )
+        elif mutation == "source":
+            visible[0]["body"] += "\nEdited"
+        elif mutation == "path":
+            visible[0]["path"] = "other.py"
+        else:
+            visible[0]["body"] = "P1: Problem 1"
+        tx = restart_bot_tx(lab, tx)
+        lab.edit(follow_branch=True)
+        if mutation == "foreign_head":
+            with pytest.raises(job_land.LandStop) as stopped:
+                tx.run()
+            assert stopped.value.reason == "land_head_changed"
+        elif mutation == "worker_status":
+            with pytest.raises(job_land.FreshnessRequeued):
+                tx.run()
+            assert lab.get().stage == "check"
+        else:
+            with pytest.raises(job_land.BotParked):
+                tx.run()
+            assert lab.get().stage == "fix"
+        assert "pr merge" not in lab.writes()
+
+
+def test_changed_worker_record_after_disposition_returns_to_a_new_round(make, monkeypatch):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        tx.api.review_threads = lambda *args: [bot_thread(severity="P1")]
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        accept_bot_fix(lab)
+        # The worker amends the accepted fix; its record no longer matches the reviewed bytes.
+        git(lab.tree, "commit", "--allow-empty", "-m", "fix(x): reword\n\n- Keep the fix")
+        (lab.folder() / "findings.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": lab.land()["bot"]["round"]["findings"][0],
+                        "status": "fixed",
+                        "commit": git(lab.tree, "rev-parse", "HEAD"),
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        tx = restart_bot_tx(lab, tx)
+        lab.edit(follow_branch=True)
+        with pytest.raises(job_land.FreshnessRequeued):
+            tx.run()
+        job = lab.get()
+        assert job.stage == "check"
+        assert job.land_state["bot"]["round"]["awaiting"] is True
+        assert job.land_state["bot"]["threads"]["thread-1"]["status"] == "open"
+        assert lab.run("check") == 0
+        refs = lab.get().land_state["bot"]["round"]["findings"]
+        lab.scenario(
+            [
+                {
+                    "reply": CODE_PASS
+                    + "\n"
+                    + "\n".join(f"BOT_DISPOSITION {r}: accepted" for r in refs)
+                }
+            ]
+        )
+        assert lab.run("review") == 0
+        tx = restart_bot_tx(lab, tx)
+        replies = []
+        tx.api.find_review_reply = lambda *args: args[3] in replies
+        tx.api.post_review_reply = lambda *args: replies.append(args[3])
+        tx.run()
+        assert lab.get().stage == "deliver_pending"
+
+
+def test_late_low_observation_at_exhaustion_still_lands(make, monkeypatch):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        visible = [bot_thread(severity="P2")]
+        tx.api.review_threads = lambda *args: visible
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        accept_bot_fix(lab)
+        # The same thread gains new low content after its accepted fix, at the review limit.
+        visible[0]["body"] = "P2: Problem 1, expanded"
+        job = lab.get()
+        lab.jobs.save(replace(job, reviews_used=job.max_reviews), time.time())
+        tx = restart_bot_tx(lab, tx)
+        lab.edit(follow_branch=True)
+        tx.api.find_review_reply = lambda *args: False
+        tx.api.post_review_reply = lambda *args: None
+        tx.run()
+        job = lab.get()
+        assert job.stage == "deliver_pending"
+        threads = job.land_state["bot"]["threads"]
+        assert job.land_state["bot"]["followup"]["findings"] == (threads["thread-1"]["finding"],)
+        assert "pr merge" in lab.writes()
+
+
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_reply_unknown_acknowledgement_requires_distinct_resume(acknowledged):
+    from taskwatch import forge
+
+    tx = job_land.Transaction.__new__(job_land.Transaction)
+    tx.state = {"bot": {}, "pr": {"number": 1}}
+    tx.repo = object()
+    events = []
+    posted = []
+    visible = []
+    tx.current = lambda: SimpleNamespace(events=events)
+    tx.freshness = lambda: None
+    tx.save = lambda **changes: tx.state.update(changes)
+
+    def post(*args):
+        posted.append(args[3])
+        if acknowledged:
+            visible.append(args[3])
+        raise forge.Uncertain("lost acknowledgement")
+
+    tx.api = SimpleNamespace(
+        find_review_reply=lambda *args: args[3] in visible,
+        post_review_reply=post,
+    )
+    candidate = {"root_id": 1, "body": "A reviewed reason\n\n<!-- taskwatch:answer thread=1 -->"}
+    if acknowledged:
+        tx.reply(candidate, "answer")
+        tx.reply(candidate, "answer")
+        assert len(posted) == 1
+    else:
+        for _ in range(2):
+            with pytest.raises(job_land.LandStop) as stopped:
+                tx.reply(candidate, "answer")
+            assert stopped.value.reason == "land_interrupted"
+        assert len(posted) == 1
+        events.append({"type": "resume"})
+        with pytest.raises(job_land.LandStop):
+            tx.reply(candidate, "answer")
+        assert len(posted) == 2
