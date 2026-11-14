@@ -47,7 +47,7 @@ Set the review step's command in `jobs-config.json`:
 ]
 ```
 
-`{guidelines}` is the job's own copy of the guidelines, taken when the job first ran, so the basis of the review cannot change under a job. A new job reads the current files. The runner adds `--mode rpc --no-ui`. The message it sends holds the intent, the spec, the target, the round, and `docs/launch/taskwatch.md`.
+`{guidelines}` is the review folder of the job's own copy of the documents, taken when the job first ran, so the basis of the review cannot change under a job. The copy keeps the installed shape and holds the documents the guides link, so a link such as `../checks.md` resolves inside the job folder; a copy whose guide link names no file stops the job before the review starts and returns that review's reservation. A new job reads the current files. The runner adds `--mode rpc --no-ui`. The message it sends holds the intent, the spec, the target, the round, and `docs/launch/taskwatch.md`.
 
 Submit a [review-only job](configuration.md#review-only-jobs) to review something that already exists.
 

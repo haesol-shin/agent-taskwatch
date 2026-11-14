@@ -554,7 +554,7 @@ def test_the_job_copy_and_the_source_folder_give_the_same_guideline_text(tmp_pat
     copy.mkdir()
     _guidelines(SimpleNamespace(review="code", outputs=()), copy)  # type: ignore[arg-type]
     source = _guideline_files(docs_dir("review"), ["code"])
-    assert _guideline_files(copy / "review-docs", ["code"]) == source
+    assert _guideline_files(copy / "review-docs" / "agent-taskwatch" / "review", ["code"]) == source
 
 
 BLOCK_AGENT = """---

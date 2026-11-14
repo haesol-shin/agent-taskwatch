@@ -29,6 +29,7 @@ from . import (
     job_text,
     job_workspace,
     review_delta,
+    review_docs,
     review_print,
     source_check,
 )
@@ -57,7 +58,6 @@ from .jobs import (
     progress_fingerprint,
 )
 from .rate_limit import RateLimit, print_rate_limit, scrub
-from .review_docs import docs_dir, profile_names
 
 STEPS = frozenset({"work", "fix", "check", "review", "land"})
 PRECHECK_LOG = "precheck.log"
@@ -102,6 +102,10 @@ class InputsChanged(StepError):
     """A copied input or review profile no longer matches its recorded hash."""
 
 
+class ReviewRan(InputsChanged):
+    """The review ran and its copied inputs changed under it. The round is spent."""
+
+
 class StaleAttempt(Exception):
     """The job moved on. This process must stop without writing."""
 
@@ -131,7 +135,7 @@ def run_job(jobs: Jobs, config: JobConfig, job_id: str, attempt: int) -> int:
     try:
         jobs.verify_inputs(job)
     except (ValueError, OSError) as exc:
-        return _stop(jobs, job, "inputs_invalid", f"copied input is unusable: {exc}")
+        return _stop(jobs, job, "inputs_invalid", f"copied input is unusable: {exc}", refund=True)
     try:
         if job.stage == "land":
             from .job_land import run_land
@@ -143,7 +147,7 @@ def run_job(jobs: Jobs, config: JobConfig, job_id: str, attempt: int) -> int:
     except (StaleAttempt, RpcAborted):
         return 2
     except InputsChanged as exc:
-        return _stop(jobs, job, "inputs_invalid", str(exc))
+        return _stop(jobs, job, "inputs_invalid", str(exc), refund=not isinstance(exc, ReviewRan))
     except (RpcError, StepError, OSError, ValueError, subprocess.SubprocessError) as exc:
         message = str(exc) or type(exc).__name__
         limit = getattr(exc, "rate_limit", None)
@@ -232,20 +236,24 @@ def _refund(job: JobState) -> dict:
     return {}
 
 
-def _stop(jobs: Jobs, job: JobState, reason: str, message: str) -> int:
-    done = _cas(
-        jobs,
-        job,
-        {job.stage},
-        lambda j: {
+def _stop(jobs: Jobs, job: JobState, reason: str, message: str, refund: bool = False) -> int:
+    """Wait for the user. `refund` returns a review reservation the step never used."""
+
+    def build(current: JobState) -> dict:
+        changes = {
             "stage": "user_wait",
             "wait_reason": reason,
             "ended_at": _now(),
             "error": message,
-            "events": _event(j, type="user_wait", reason=reason),
-        },
-    )
-    return 1 if done else 2
+            "events": _event(current, type="user_wait", reason=reason),
+        }
+        if refund:
+            changes.update(_refund(current))
+        if current.stage == "review":
+            changes["review_inflight"] = 0
+        return changes
+
+    return 1 if _cas(jobs, job, {job.stage}, build) else 2
 
 
 # --- workspace and files -------------------------------------------------------------------
@@ -257,10 +265,23 @@ def _context(jobs: Jobs, config: JobConfig, job: JobState) -> Ctx:
     ctx = Ctx(jobs, config, replace(job, workspace=str(workspace), **described), folder, workspace)
     hashes = _prepare(ctx)
     recorded = job.guideline_hashes
-    if recorded is not None and recorded != hashes:
+    if recorded is not None and recorded != hashes and not _same_guides(recorded, hashes, folder):
         raise InputsChanged("a copied review profile does not match its recorded hash")
     _apply(ctx, lambda j: {"workspace": str(workspace), "guideline_hashes": hashes, **described})
     return ctx
+
+
+def _same_guides(recorded: Mapping[str, str], current: Mapping[str, str], folder: Path) -> bool:
+    """A record written before the copy kept the installed shape names its guides flat one
+    folder up. Once those bytes move into the shape, the same guides with the same hashes are
+    the same basis, even when the copy also gained the documents they link."""
+    guides = review_docs.guide_dir(folder / "review-docs")
+    for path, digest in recorded.items():
+        moved = Path(path)
+        name = str(guides / moved.name) if moved.parent == folder / "review-docs" else path
+        if current.get(name) != digest:
+            return False
+    return True
 
 
 def _workspace(
@@ -292,7 +313,7 @@ def _workspace(
 
 
 def _docs_source(folder: str = "review") -> Path:
-    source = docs_dir(folder)
+    source = review_docs.docs_dir(folder)
     if source is None:
         raise StepError(f"{folder} documents were not found")
     return source
@@ -306,17 +327,26 @@ def _layer(name: str) -> str:
         raise StepError(f"launch layer is unreadable: {name}: {exc}") from exc
 
 
-def _guidelines(job: JobState, folder: Path) -> tuple[Path, ...]:
-    """The job's own copy of the review profile, so a basis cannot drift while it runs."""
-    names = profile_names(job.review, job.outputs)
+def _copied(job: JobState, folder: Path) -> list[Path]:
+    """The job's own copy of the shipped documents, in the installed shape, with every link of
+    the copy resolved. A broken or missing document stops the step before a model call."""
     target = folder / "review-docs"
-    target.mkdir(parents=True, exist_ok=True)
-    source = None
-    for name in names:
-        if not (target / name).is_file():
-            source = source or _docs_source()
-            shutil.copyfile(source / name, target / name)
-    return tuple(target / name for name in names)
+    names = review_docs.profile_names(job.review, job.outputs)
+    try:
+        copied = review_docs.copy_docs(target, names)
+    except (OSError, review_docs.DocsError) as exc:
+        raise InputsChanged(f"the review documents cannot be copied: {exc}") from exc
+    problems = review_docs.link_problems(target)
+    if problems:
+        raise InputsChanged("the review documents are incomplete: " + "; ".join(problems))
+    return copied
+
+
+def _guidelines(job: JobState, folder: Path) -> tuple[Path, ...]:
+    """The guide files a review reads, from the job's own copy of the shipped documents."""
+    _copied(job, folder)
+    guides = review_docs.guide_dir(folder / "review-docs")
+    return tuple(guides / name for name in review_docs.profile_names(job.review, job.outputs))
 
 
 def _write_durable(path: Path, text: str) -> None:
@@ -333,7 +363,7 @@ def _prepare(ctx: Ctx) -> dict[str, str]:
     _write_durable(folder / "prompt.md", job.prompt)
     if job.review_target is None:
         _write_durable(folder / "WORKFLOW.md", _workflow(ctx))
-    return {str(p): _file_sha(p) for p in _guidelines(job, folder)}
+    return {str(p): _file_sha(p) for p in _copied(job, folder)}
 
 
 def _cli_command(ctx: Ctx, *words: str) -> str:
@@ -922,14 +952,14 @@ def _schema_path(ctx: Ctx) -> Path:
 
 
 def _command(ctx: Ctx, review_root: Path | None = None) -> tuple[str, ...]:
-    """The review step may use its own command. {guidelines} and {review} name the job copy and
-    the review profile, {schema} the verdict schema file, {output} the file of the last message
-    (print mode)."""
+    """The review step may use its own command. {guidelines} names the review folder of the job's
+    document copy, {review} the review profile, {schema} the verdict schema file, {output} the
+    file of the last message (print mode)."""
     config = ctx.config
     if ctx.stage != "review" or config.review_command is None:
         return config.omp_command
     fields = {
-        "{guidelines}": str(ctx.folder / "review-docs"),
+        "{guidelines}": str(review_docs.guide_dir(ctx.folder / "review-docs")),
         "{review}": ctx.job.review,
         "{schema}": str(_schema_path(ctx)),
     }
@@ -1176,7 +1206,8 @@ def _fingerprint(job: JobState, workspace: Path, env: Mapping[str, str]) -> str:
 
 
 def _basis(job: JobState, folder: Path) -> str:
-    return basis_of(Path(job.intent), Path(job.spec), _guidelines(job, folder))
+    documents = tuple((review_docs.copy_name(folder, path), path) for path in _copied(job, folder))
+    return basis_of(Path(job.intent), Path(job.spec), documents)
 
 
 def _text_problems(
@@ -1688,7 +1719,7 @@ def _review_step(ctx: Ctx) -> int:
     try:
         ctx.jobs.verify_inputs(job)
     except (ValueError, OSError) as exc:
-        raise InputsChanged(f"a copied input changed during the review: {exc}") from exc
+        raise ReviewRan(f"a copied input changed during the review: {exc}") from exc
     problems = _evidence_problems(ctx, snapshot)
     if job_findings.bot_dispositions(job, ctx.folder) != dispositions:
         problems.append("the bot dispositions changed during the review")
@@ -1879,6 +1910,10 @@ def _judge(
         if _basis(job, ctx.folder) != job.basis:
             record["problems"].append("the review basis changed during the review")
             record["stale"] = True
+    except InputsChanged as exc:
+        # The review ran, so the round stays spent and the record holds the stale evidence.
+        record["problems"].append(f"the review basis cannot be read: {exc}")
+        record["stale"] = True
     except (ValueError, OSError) as exc:
         record["problems"].append(f"the result cannot be fingerprinted: {exc}")
         record["stale"] = True

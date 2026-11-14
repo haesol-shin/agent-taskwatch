@@ -104,6 +104,38 @@ def test_http_links_are_not_local(tmp_path: Path):
     assert CHECKER.check_review_dir(tmp_path) == []
 
 
+def test_installed_tree_links_pass(tmp_path: Path):
+    share = tmp_path / "share"
+    (share / "agent-taskwatch" / "review").mkdir(parents=True)
+    (share / "agent-taskwatch" / "checks.md").write_text("# Checks\n", encoding="utf-8")
+    readme = share / "agent-taskwatch" / "review" / "README.md"
+    readme.write_text("See [checks](../checks.md#scope).\n", encoding="utf-8")
+    assert CHECKER.main(["--tree", str(share)]) == 0
+
+
+def test_a_link_without_a_target_fails_the_tree_check(tmp_path: Path, capsys):
+    share = tmp_path / "share"
+    review = share / "agent-taskwatch" / "review"
+    review.mkdir(parents=True)
+    (review / "README.md").write_text("See [checks](../checks.md).\n", encoding="utf-8")
+    assert CHECKER.main(["--tree", str(share)]) == 1
+    assert "agent-taskwatch/review/README.md: link does not resolve: ../checks.md" in (
+        capsys.readouterr().err
+    )
+
+
+def test_a_link_that_leaves_the_tree_fails_the_tree_check(tmp_path: Path, capsys):
+    share = tmp_path / "share"
+    review = share / "agent-taskwatch" / "review"
+    review.mkdir(parents=True)
+    (tmp_path / "outside.md").write_text("# Outside\n", encoding="utf-8")
+    (review / "README.md").write_text("[out](../../../outside.md)\n", encoding="utf-8")
+    assert CHECKER.main(["--tree", str(share)]) == 1
+    assert "agent-taskwatch/review/README.md: link leaves the tree: ../../../outside.md" in (
+        capsys.readouterr().err
+    )
+
+
 def test_rule_id_in_two_files_fails(tmp_path: Path):
     write_valid(tmp_path)
     code = tmp_path / "code.md"

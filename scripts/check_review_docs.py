@@ -1,4 +1,9 @@
-"""Check the shape of docs/review. No model call and no meaning check."""
+"""Check the shape of docs/review and the links of the shipped documents.
+
+The shape check reads a checkout's review folder. The tree check reads an installed share folder
+and refuses a relative link that names no file, or that points outside the tree, because the
+reviewer reads those documents from the installed copy.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,8 @@ import argparse
 import re
 import sys
 from pathlib import Path
+
+from taskwatch.review_docs import link_problems, link_targets, local_target
 
 REQUIRED_FILES = (
     "README.md",
@@ -55,11 +62,6 @@ REQUIRED_SECTIONS = {
 }
 
 RULE_ID = re.compile(r"(?<![A-Za-z0-9])([A-Z]{1,3}-\d+)(?![A-Za-z0-9])")
-INLINE_LINK = re.compile(r"\[[^\]\n]*\]\(([^)\n]+)\)")
-REF_DEF = re.compile(
-    r"^[ ]{0,3}\[[^\]\n]+\]:[ \t]*(<[^>\n]+>|\S+)",
-    re.MULTILINE,
-)
 HEADING = re.compile(r"^## (.+?)\s*$", re.MULTILINE)
 
 
@@ -92,27 +94,14 @@ def _section_errors(name: str, text: str) -> list[str]:
 
 def _link_errors(path: Path, text: str) -> list[str]:
     errors: list[str] = []
-    targets = [*INLINE_LINK.findall(text), *REF_DEF.findall(text)]
-    for target in targets:
-        local = _local_target(target)
+    for target in link_targets(text):
+        local = local_target(target)
         if local is None:
             continue
         resolved = (path.parent / local).resolve()
         if not resolved.is_file() and not resolved.is_dir():
             errors.append(f"{path.name}: missing local reference: {local}")
     return errors
-
-
-def _local_target(target: str) -> str | None:
-    raw = target.strip()
-    if raw.startswith("<"):
-        end = raw.find(">")
-        raw = "" if end < 1 else raw[1:end].strip()
-    elif raw:
-        raw = raw.split()[0]
-    if raw.startswith(("http://", "https://", "mailto:")) or raw.startswith("#") or raw == "":
-        return None
-    return raw.split("#", 1)[0]
 
 
 def _duplicate_id_errors(texts: dict[str, str]) -> list[str]:
@@ -133,10 +122,20 @@ def _duplicate_id_errors(texts: dict[str, str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Check docs/review shape.")
+    parser = argparse.ArgumentParser(
+        description="Check docs/review shape, or the links of an installed document tree."
+    )
     parser.add_argument("--root", type=Path, default=repo_review_dir())
+    parser.add_argument(
+        "--tree",
+        type=Path,
+        help=(
+            "installed share folder; every relative link of its shipped documents must "
+            "resolve inside the shipped tree"
+        ),
+    )
     args = parser.parse_args(argv)
-    errors = check_review_dir(args.root)
+    errors = link_problems(args.tree) if args.tree is not None else check_review_dir(args.root)
     for error in errors:
         print(error, file=sys.stderr)
     return 1 if errors else 0

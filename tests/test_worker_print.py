@@ -328,7 +328,7 @@ def test_stale_evidence_cannot_deliver_even_when_print_reviewer_says_pass(
     if change == "output":
         (Path(env.get().workspace) / "out.txt").write_text("unreviewed\\n", encoding="utf-8")
     else:
-        guideline = env.folder() / "review-docs" / "source.md"
+        guideline = env.folder() / "review-docs" / "agent-taskwatch" / "review" / "source.md"
         guideline.write_text(guideline.read_text() + "\nChanged review basis.\n", encoding="utf-8")
     assert env.run("review") == (1 if change == "basis" else 0)
     current = env.get()

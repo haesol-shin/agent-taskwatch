@@ -8,7 +8,7 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 
-from . import brief
+from . import brief, review_docs
 from .evidence import basis_of
 from .fingerprint import files_fingerprint
 from .job_env import job_environment
@@ -53,6 +53,13 @@ def accepted_review(job: JobState):
     return {}
 
 
+def _named_guides(folder: Path, job: JobState) -> tuple[tuple[str, Path], ...]:
+    """The copied documents of a record under the names the basis used."""
+    return tuple(
+        (review_docs.copy_name(folder, Path(path)), Path(path)) for path in job.guideline_hashes
+    )
+
+
 def acceptance_current(jobs: Jobs, config: JobConfig, job: JobState) -> bool:
     """Shared delivery/landing freshness policy, including checked snapshot identity."""
     review = accepted_review(job)
@@ -71,9 +78,7 @@ def acceptance_current(jobs: Jobs, config: JobConfig, job: JobState) -> bool:
                 review.get("texts", {}),
             )
             and bool(job.guideline_hashes)
-            and basis_of(
-                Path(job.intent), Path(job.spec), tuple(Path(p) for p in job.guideline_hashes)
-            )
+            and basis_of(Path(job.intent), Path(job.spec), _named_guides(jobs.folder(job), job))
             == review.get("basis")
         )
         if job.land or "accepted_check" in review:

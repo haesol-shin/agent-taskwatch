@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from taskwatch import job_runner
+from taskwatch import job_runner, review_docs
 from taskwatch.fingerprint import files_fingerprint, head_sha
 from taskwatch.job_rpc import FrameDecoder, RpcError
 from taskwatch.job_runner import run_job
@@ -238,7 +239,7 @@ def test_pipeline_from_work_to_deliver_pending(env):
     assert env.prompts()[0].startswith("ORIGINAL PROMPT TEXT\nline two")
     assert "msg-1" in env.prompts()[0] and "task-1" in env.prompts()[0]
     assert (env.folder() / "WORKFLOW.md").is_file()
-    assert (env.folder() / "review-docs" / "source.md").is_file()
+    assert (env.folder() / "review-docs" / "agent-taskwatch" / "review" / "source.md").is_file()
 
     assert env.run("check") == 0
     job = env.get()
@@ -832,7 +833,7 @@ def test_code_job_uses_worktree_and_committed_fingerprint(tmp_path, monkeypatch)
     assert env.run("check") == 0
     job = env.get()
     assert job.stage == "review" and job.fingerprint == head_sha(worktree)
-    assert (env.folder() / "review-docs" / "code.md").is_file()
+    assert (env.folder() / "review-docs" / "agent-taskwatch" / "review" / "code.md").is_file()
     (worktree / "out.txt").write_text("ok\nmore\n", encoding="utf-8")
     assert env.run("check") == 0
     job = env.get()
@@ -901,11 +902,104 @@ def test_missing_input_hash_match_stops_job(env):
 def test_changed_review_profile_stops_job(env):
     env.scenario([work_turn()])
     assert env.run("work") == 0
-    profile = env.folder() / "review-docs" / "common.md"
+    profile = env.folder() / "review-docs" / "agent-taskwatch" / "review" / "common.md"
     profile.write_text(profile.read_text() + "\nedited\n", encoding="utf-8")
     assert env.run("check") == 1
     job = env.get()
     assert (job.stage, job.wait_reason) == ("user_wait", "inputs_invalid")
+
+
+def test_a_guide_link_without_a_target_stops_before_the_review(env):
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    guide = env.folder() / "review-docs" / "agent-taskwatch" / "review" / "common.md"
+    broken = guide.read_text(encoding="utf-8") + "\n[gone](../gone.md)\n"
+    guide.write_text(broken, encoding="utf-8")
+    assert env.run("check") == 1
+    job = env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "inputs_invalid")
+    assert "../gone.md" in job.error
+
+
+def test_a_broken_copy_does_not_spend_its_review(env):
+    env.scenario([work_turn()])
+    env.to_review()
+    guide = env.folder() / "review-docs" / "agent-taskwatch" / "review" / "common.md"
+    broken = guide.read_text(encoding="utf-8") + "\n[gone](../gone.md)\n"
+    guide.write_text(broken, encoding="utf-8")
+    assert env.run("review") == 1
+    job = env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "inputs_invalid")
+    assert (job.reviews_used, job.review_inflight) == (0, 0)
+
+
+def test_the_copied_documents_are_in_the_recorded_hashes(env):
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    hashes = env.get().guideline_hashes
+    assert any(path.endswith("agent-taskwatch/checks.md") for path in hashes)
+    assert len(hashes) > len(review_docs.profile_names("source"))
+
+
+def test_the_basis_covers_the_copied_documents(env):
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    job = env.get()
+    before = job_runner._basis(job, env.folder())
+    linked = env.folder() / "review-docs" / "agent-taskwatch" / "checks.md"
+    linked.write_text(linked.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert job_runner._basis(job, env.folder()) != before
+
+
+def test_a_changed_copied_document_stops_before_the_review(env):
+    env.scenario([work_turn()])
+    env.to_review()
+    linked = env.folder() / "review-docs" / "agent-taskwatch" / "checks.md"
+    linked.write_text(linked.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert env.run("review") == 1
+    job = env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "inputs_invalid")
+    assert (job.reviews_used, job.review_inflight) == (0, 0)
+
+
+def test_a_link_broken_during_the_review_keeps_the_round(env):
+    script = (
+        "from pathlib import Path; "
+        "p = Path('../review-docs/agent-taskwatch/review/common.md'); "
+        "p.write_text(p.read_text() + '\\n[gone](../gone.md)\\n')"
+    )
+    turn = {"reply": f"{PASS}\nNo findings.", "run": [[sys.executable, "-c", script]]}
+    env.scenario([work_turn(), turn])
+    assert env.run("work") == 0
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    job = env.get()
+    record = job.reviews[-1]
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("check", 1, 0)
+    assert record["stale"] and not record["ok"]
+    assert any("link does not resolve" in problem for problem in record["problems"])
+
+
+def test_a_record_of_the_flat_guide_copy_keeps_its_text(env):
+    env.scenario([work_turn()])
+    assert env.run("work") == 0
+    job = env.get()
+    folder = env.folder()
+    target = folder / "review-docs"
+    guides = review_docs.guide_dir(target)
+    legacy = {}
+    for name in review_docs.profile_names("source"):
+        flat = target / name
+        flat.write_text((guides / name).read_text(encoding="utf-8"), encoding="utf-8")
+        legacy[str(flat)] = job_runner._file_sha(flat)
+    shutil.rmtree(target / review_docs.PACKAGE_DIR)
+    env.jobs.save(replace(job, guideline_hashes=legacy), time.time())
+    assert env.run("check") == 0
+    current = env.get()
+    assert current.stage == "review"
+    assert (guides / "common.md").read_text(encoding="utf-8") == (target / "common.md").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_messages_list_each_predecessor_result_without_copying_it(tmp_path, monkeypatch):
