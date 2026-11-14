@@ -31,7 +31,7 @@ Use this file for every review, then the review file the assignment names.
 **C-8.** Give each finding one severity:
 
 - P0: breaks a stated rule, contract, or safety property about runtime behavior or data; corrupts data; or takes an external action the assignment does not allow.
-- P1: wrong on a realistic path, or does not do what the intent asks.
+- P1: wrong on a realistic path, or does not do what the intent asks. A data lifetime, persistence, or concurrency violation the path reaches is one.
 - P2: an edge case, a misleading document or message, a missing process artifact, or a style or wording rule break.
 - P3: an improvement, not a defect.
 
