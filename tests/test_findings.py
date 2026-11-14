@@ -11,6 +11,7 @@ from taskwatch import job_findings, job_runner
 from taskwatch.executor import _finding_lines
 from taskwatch.job_cli import main as cli_main
 from taskwatch.job_findings import notes, repeated_rules, sync_index
+from taskwatch.jobs import _json_value
 from tests.git_fixture import git
 from tests.test_job_runner import GOOD_FILES, Env
 from tests.test_public_text import UnitEnv
@@ -756,3 +757,100 @@ def test_bot_root_matches_exact_configured_app_and_typed_login(
     assert bool(threads) == recognized
     if recognized:
         assert records[-1]["reviewer"] == "bot:review-bot-example"
+
+
+def _disposition_job(unit_env):
+    accepted = {
+        "seq": 1,
+        "round": 1,
+        "ok": True,
+        "verdict": "PASS",
+        "reviewed_head": "a" * 40,
+        "fingerprint": "a" * 40,
+    }
+    from tests.test_job_land import bot_thread
+
+    job = replace(unit_env.get(), reviews=(accepted,))
+    records, threads = job_findings.bot_updates(
+        job,
+        accepted,
+        {"apps": ["review-bot-example", "second-app"], "threads": {}},
+        [bot_thread(1), bot_thread(2, author="second-app")],
+        "b" * 40,
+        1000,
+    )
+    return replace(
+        job,
+        reviews=tuple(records),
+        land_state={"bot": {"threads": threads, "round": {"awaiting": True}}},
+    )
+
+
+def test_dispositions_freeze_exact_bodies_and_survive_later_pass(unit_env):
+    job = _disposition_job(unit_env)
+    write_entries(
+        unit_env,
+        [
+            {"id": "r2.F1", "status": "fixed", "commit": "c" * 40},
+            {"id": "r3.F1", "status": "not_fixed", "reason": "Ask @synthetic.\nFull reason."},
+        ],
+    )
+    candidates = job_findings.bot_dispositions(job, unit_env.folder())
+    assert [p["thread_id"] for p in candidates] == ["thread-1", "thread-2"]
+    assert candidates[0]["body"] == (
+        "Fixed in the latest head of this pull request.\n\n"
+        f"<!-- taskwatch:fixed thread={candidates[0]['root_id']} -->"
+    )
+    assert candidates[1]["body"] == (
+        "Not changed in this PR: Ask @\u200bsynthetic.\nFull reason.\n\n"
+        f"<!-- taskwatch:answer thread={candidates[1]['root_id']} -->"
+    )
+    thread = job.land_state["bot"]["threads"]["thread-2"]
+    for key in ("root_id", "finding", "path", "digest", "severity"):
+        assert candidates[1][key] == thread[key]
+    later = replace(job, reviews=(*job.reviews, {"ok": True, "verdict": "PASS"}))
+    assert job_findings.bot_dispositions(later, unit_env.folder()) == candidates
+    assert all(r["reviewed_head"] == "a" * 40 for r in job.reviews[1:])
+
+
+@pytest.mark.parametrize("status", ["fixed", "answered", "deferred", "closed"])
+def test_only_awaiting_open_round_threads_generate_replies(unit_env, status):
+    job = _disposition_job(unit_env)
+    write_entries(
+        unit_env,
+        [
+            {"id": "r2.F1", "status": "not_fixed", "reason": "Synthetic reason."},
+            {"id": "r3.F1", "status": "not_fixed", "reason": "Other reason."},
+        ],
+    )
+    bot = _json_value(job.land_state["bot"])
+    bot["threads"]["thread-1"]["status"] = status
+    bot["round"]["findings"] = ["r2.F1"]
+    assert (
+        job_findings.bot_dispositions(replace(job, land_state={"bot": bot}), unit_env.folder())
+        == []
+    )
+    bot["threads"]["thread-1"]["status"] = "open"
+    candidates = job_findings.bot_dispositions(
+        replace(job, land_state={"bot": bot}), unit_env.folder()
+    )
+    assert len(candidates) == 1
+    bot["round"]["awaiting"] = False
+    assert (
+        job_findings.bot_dispositions(replace(job, land_state={"bot": bot}), unit_env.folder())
+        == []
+    )
+
+
+def test_bot_checks_all_apps_and_index_ignores_worker_claims(unit_env):
+    job = _disposition_job(unit_env)
+    write_entries(unit_env, [{"id": "r3.F1", "status": "not_fixed", "reason": "Synthetic reason."}])
+    problems = job_findings.bot_worker_problems(job, unit_env.folder(), "c" * 40, {})
+    assert any("r2.F1" in problem for problem in problems)
+    job_findings.sync_index(unit_env.jobs.state, job, unit_env.folder(), 3000)
+    assert [row["status"] for row in index_rows(unit_env)] == ["open", "open"]
+    bot = _json_value(job.land_state["bot"])
+    bot["threads"]["thread-2"]["status"] = "answered"
+    job = replace(job, land_state={"bot": bot})
+    job_findings.sync_index(unit_env.jobs.state, job, unit_env.folder(), 3001)
+    assert index_rows(unit_env)[-1]["status"] == "answered"

@@ -125,10 +125,11 @@ class Transaction:
             self.save()
 
     def freshness(self):
-        from .job_delivery import acceptance_current
+        from .job_delivery import acceptance_current, accepted_review
         from .job_runner import _requeue
 
         job = self.current()
+        self.dispositions_current(job, accepted_review(job))
         if acceptance_current(self.ctx.jobs, self.ctx.config, job):
             return
         if self.state.get("push_intent") or self.state.get("S"):
@@ -146,6 +147,7 @@ class Transaction:
         if not job.land or job.review != "code" or job.review_target is not None:
             raise LandStop("land_review_stale", "landing authority is absent")
         review = accepted_review(job)
+        self.dispositions_current(job, review)
         texts = review.get("texts", {})
         if len(job.public_text) != 1 or len(texts) != 1:
             raise LandStop("land_review_stale", "landing needs one complete-result publication")
@@ -160,7 +162,7 @@ class Transaction:
             raise LandStop("land_review_stale", "checked publication does not cover accepted tree")
         identity = digest({"review": _json_value(review), "check": _json_value(job.checks[-1])})
         if self.state.get("identity", identity) != identity:
-            raise LandStop("land_review_stale", "accepted transaction identity changed")
+            self.adopt_review(job, review, text, identity)
         copy = self.ctx.folder / "land-text"
         code, _ = job_text.reviewed_copy(job, self.ctx.env, self.ctx.folder, unit, copy)
         if code:
@@ -207,6 +209,213 @@ class Transaction:
                 },
             )
         self.repo = repo
+
+    def dispositions_current(self, job, review):
+        """Each reviewed disposition must still describe its thread and the worker's record."""
+        if review.get("seq", 0) <= self.state.get("bot", {}).get("round", {}).get("seq", 0):
+            return
+        changed = job_findings.dispositions_missing(job, self.ctx.folder, review)
+        if not changed:
+            return
+        self.reopen_round(_json_value(self.state.get("bot", {})), changed)
+        raise FreshnessRequeued
+
+    def reopen_round(self, bot, findings):
+        """A changed record needs a fresh review of exactly those bot findings."""
+        from .job_runner import _apply, _requeue
+
+        def build(job):
+            state = {**_json_value(bot)}
+            for thread in state.get("threads", {}).values():
+                if thread.get("finding") in findings:
+                    thread["status"] = "open"
+                    thread.pop("disposition", None)
+            state["round"] = {
+                "seq": state.get("round", {}).get("seq", 0),
+                "awaiting": True,
+                "findings": sorted(findings),
+            }
+            return {**_requeue(job), "land_state": {**self.state, "bot": state}}
+
+        _apply(self.ctx, build)
+
+    def adopt_review(self, job, review, text, identity):
+        """Only a routed bot fix may replace a published transaction's acceptance."""
+        from .job_runner import _apply, _requeue
+
+        bot = self.state.get("bot", {})
+        round_ = bot.get("round", {})
+        if (
+            not round_.get("awaiting")
+            or review.get("seq", 0) <= round_.get("seq", 0)
+            or self.state.get("S")
+        ):
+            raise LandStop("land_review_stale", "accepted transaction identity changed")
+        candidates = job_findings.bot_dispositions(job, self.ctx.folder)
+        if candidates != _json_value(review.get("bot_dispositions", [])):
+            _apply(self.ctx, lambda j: _requeue(j))
+            raise FreshnessRequeued
+        refs = {c["finding"] for c in candidates}
+        if refs != set(round_.get("findings", ())):
+            raise LandStop("land_review_stale", "bot dispositions are incomplete")
+        self.save(
+            identity=identity,
+            R=text["head"],
+            T=text["tree"],
+            review_digest=digest(_json_value(review)),
+            check_digest=digest(_json_value(job.checks[-1])),
+            snapshot_digest=review["snapshot_sha256"],
+            text_digest=digest(_json_value(text)),
+            bot={**bot, "dispositions": candidates, "disposition_review": review["seq"]},
+            republish={"from": self.state["H"], "review": review["seq"]},
+        )
+
+    def owner_reasons(self):
+        """A generic resume is never an owner's acceptance of a bot rejection."""
+        answers = [
+            c
+            for c in self.state.get("bot", {}).get("dispositions", ())
+            if c["status"] == "not_fixed"
+        ]
+        if not answers:
+            return
+        bot = self.state["bot"]
+        token = digest(answers)
+        pending = bot.get("owner_pending", {})
+        if bot.get("owner_accepted") == token:
+            return
+        job = self.current()
+        if pending.get("digest") == token and any(
+            event.get("type") == "resume"
+            and event.get("entry", 0) > pending["entry"]
+            and event.get("reason") == f"BOT_ACCEPT {token}"
+            for event in job.events
+        ):
+            self.save(bot={**bot, "owner_accepted": token})
+            return
+        self.save(bot={**bot, "owner_pending": {"digest": token, "entry": resume_entry(job)}})
+        raise LandStop(
+            "bot_reason_approval",
+            "owner must accept these exact not_fixed reasons: "
+            + json.dumps(answers, ensure_ascii=False)
+            + f"; resume --reason 'BOT_ACCEPT {token}'",
+        )
+
+    def post_answers(self):
+        intent = self.state.get("republish", {})
+        if not intent or intent.get("head"):
+            return
+        candidates = [
+            c for c in self.state["bot"].get("dispositions", ()) if c["status"] == "not_fixed"
+        ]
+        if not candidates:
+            return
+        visible = {
+            t["id"]: t
+            for t in self.api.review_threads(self.repo, self.state["pr"]["number"], self.state["H"])
+        }
+        for candidate in candidates:
+            root = visible.get(candidate["thread_id"])
+            if (
+                root is not None
+                and root["author_type"] == "Bot"
+                and root["author"].removesuffix("[bot]") in self.state["bot"]["apps"]
+                and root["path"] == candidate["path"]
+                and root["root_id"] == candidate["root_id"]
+                and job_findings.bot_text(root["body"])["digest"] == candidate["digest"]
+            ):
+                self.reply(candidate, "answer")
+
+    def prepare_republish(self):
+        intent = self.state.get("republish")
+        if not intent or intent.get("head"):
+            return
+        head = self.git(
+            "commit-tree",
+            self.state["T"],
+            "-p",
+            intent["from"],
+            stdin=job_text.squash_message(self.title, self.commit),
+        )
+        # Only per-head observations reset; thread identities and the followup survive.
+        self.state = {
+            k: v
+            for k, v in self.state.items()
+            if k
+            not in {
+                "ci_green",
+                "ci_evidence",
+                "ci_started_at",
+                "ci_deadline",
+                "ci_entry",
+                "rerun_round",
+                "push_intent",
+                "pushed",
+            }
+        }
+        bot = self.state["bot"]
+        bot = {k: v for k, v in bot.items() if k not in {"head", "window_end", "outcome"}}
+        self.save(
+            H=head,
+            commit_metadata=self.git("show", "-s", "--format=raw", head),
+            head_parent=intent["from"],
+            republish={**intent, "head": head},
+            bot={**bot, "outcome": {}},
+        )
+
+    def reply(self, candidate, kind):
+        """Persist intent before writing; reconcile viewer, marker and exact bytes."""
+        bot = self.state["bot"]
+        key = f"{kind}:{candidate['root_id']}:{digest(candidate['body'])}"
+        replies = dict(bot.get("replies", {}))
+        prior = replies.get(key, {})
+        entry = resume_entry(self.current())
+        args = (self.repo, self.state["pr"]["number"], candidate["root_id"], candidate["body"])
+        previous = tuple(
+            row["body"]
+            for old_key, row in replies.items()
+            if old_key != key
+            and old_key.startswith(f"{kind}:{candidate['root_id']}:")
+            and row["status"] == "posted"
+        )
+        if self.api.find_review_reply(*args, kind, previous):
+            replies[key] = {"status": "posted", "entry": entry, "body": candidate["body"]}
+            self.save(bot={**bot, "replies": replies})
+            return
+        if prior and (prior["status"] == "posted" or entry <= prior["entry"]):
+            raise LandStop(
+                "land_interrupted", "reply acknowledgement unknown; distinct resume needed"
+            )
+        replies[key] = {"status": "intent", "entry": entry, "body": candidate["body"]}
+        self.save(bot={**bot, "replies": replies})
+        self.freshness()
+        try:
+            self.api.post_review_reply(*args)
+        except forge.Uncertain:
+            pass
+        if not self.api.find_review_reply(*args, kind, previous):
+            raise LandStop(
+                "land_interrupted", "reply acknowledgement unknown; distinct resume needed"
+            )
+        replies[key] = {**replies[key], "status": "posted"}
+        self.save(bot={**self.state["bot"], "replies": replies})
+
+    def reconcile_dispositions(self, threads):
+        for candidate in self.state.get("bot", {}).get("dispositions", ()):
+            thread = threads.get(candidate["thread_id"])
+            if not thread or any(
+                thread.get(k) != candidate.get(k) for k in ("path", "digest", "severity", "finding")
+            ):
+                continue
+            if candidate["status"] == "not_fixed":
+                self.owner_reasons()
+                self.reply(candidate, "answer")
+                thread["status"] = "answered"
+            else:
+                if not thread["resolved"]:
+                    self.reply(candidate, "fixed")
+                thread["status"] = "fixed"
+            thread["disposition"] = candidate
 
     def fetch_main(self):
         ref = f"refs/remotes/origin/{self.repo.default_branch}"
@@ -357,13 +566,15 @@ class Transaction:
         head = self.state["H"]
         if self.git("rev-parse", f"{head}^{{tree}}") != self.state["T"] or self.git(
             "rev-list", "--parents", "-n", "1", head
-        ).split() != [head, self.state["M"]]:
+        ).split() != [head, self.state.get("head_parent", self.state["M"])]:
             raise LandStop("land_head_changed", "publication object parent or tree differs")
         target = self.push_target()
         remote = self.git("ls-remote", "--heads", target, f"refs/heads/{self.state['branch']}")
-        if remote and remote.split()[0] != head:
+        previous = self.state.get("republish", {}).get("from")
+        remote_head = remote.split()[0] if remote else None
+        if remote_head not in {None, head, previous} or (previous and remote_head is None):
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
-        if not remote:
+        if remote_head != head:
             self.freshness()
             self.save(push_intent=True, phase="push")
             self.git("push", target, f"{head}:refs/heads/{self.state['branch']}")
@@ -380,6 +591,40 @@ class Transaction:
         ):
             raise LandStop("land_pr_mismatch", "PR identity, state or reviewed publication differs")
         return pr
+
+    def edit_republished_pr(self):
+        intent = self.state.get("republish", {})
+        if not intent or not intent.get("head") or not self.state.get("pr"):
+            return
+        deadline = time.monotonic() + 60
+        while True:
+            pr = self.api.read_pull_request(self.repo, self.state["pr"]["number"], None)
+            if pr.head_sha == self.state["H"]:
+                break
+            if pr.head_sha != intent["from"] or time.monotonic() >= deadline:
+                raise LandStop("land_pr_mismatch", "republished PR head was not observed")
+            self.wait(2)
+        if pr.title == self.title and pr.body == self.body:
+            return
+        old = self.state.get("published_text", {})
+        if pr.title != old.get("title") or pr.body != old.get("body"):
+            raise LandStop("land_pr_mismatch", "PR text differs from previously published bytes")
+        entry = resume_entry(self.current())
+        edit = self.state.get("edit_intent", {})
+        if edit.get("head") == self.state["H"] and entry <= edit["entry"]:
+            raise LandStop("land_interrupted", "PR edit acknowledgement unknown; resume required")
+        self.freshness()
+        self.save(edit_intent={"head": self.state["H"], "entry": entry})
+        try:
+            self.api.edit_pull_request(
+                self.repo, pr.number, self.state["H"], self.title, self.body_file
+            )
+        except forge.Uncertain:
+            pass
+        observed = self.api.read_pull_request(self.repo, pr.number, self.state["H"])
+        if observed.title == old.get("title") and observed.body == old.get("body"):
+            raise LandStop("land_interrupted", "PR edit acknowledgement unknown; resume required")
+        self.validate_pr(observed)
 
     def pull_request(self, *, create=True):
         matches = self.api.find_pull_requests(
@@ -409,7 +654,11 @@ class Transaction:
                     self.repo, self.state["branch"], self.state["H"], self.title, self.body_file
                 )
             )
-        self.save(pr={"number": pr.number, "url": pr.url}, phase="pr")
+        self.save(
+            pr={"number": pr.number, "url": pr.url},
+            phase="pr",
+            published_text={"title": self.title, "body": self.body},
+        )
         if pr.state == "MERGED":
             self.save(S=pr.merge_sha, phase="merged")
         return pr
@@ -552,11 +801,15 @@ class Transaction:
         except ValueError as exc:
             raise LandStop("land_interrupted", str(exc)) from exc
         exhausted = job.reviews_used >= job.max_reviews
+        self.reconcile_dispositions(threads)
+        bot = self.state.get("bot", {})
         retained = set(bot.get("followup", {}).get("findings", ()))
         low = []
         for thread in threads.values():
             # A resolution toggle is not a disposition for a tracked high finding.
-            if thread["severity"] in {"P0", "P1"}:
+            if thread.get("disposition") and thread["status"] in {"fixed", "answered"}:
+                status = thread["status"]
+            elif thread["severity"] in {"P0", "P1"}:
                 status = "open"
             # A retained deferral outlives a resume that resets the review budget.
             elif thread["finding"] in retained:
@@ -572,18 +825,26 @@ class Transaction:
                 low.append(thread["finding"])
         followup = {"id": f"bot-followup:{job.id}", "findings": low}
         bot = {**bot, "threads": threads, "followup": followup}
+        if stop_refs := [t["finding"] for t in threads.values() if t["status"] == "open"]:
+            bot["round"] = {
+                "seq": max(r["seq"] for r in records),
+                "awaiting": True,
+                "findings": stop_refs,
+            }
+        else:
+            bot["round"] = {**bot.get("round", {}), "awaiting": False}
         state = {**self.state, "bot": bot}
         stop = any(thread["status"] == "open" for thread in threads.values())
         reason = "review_exhausted" if exhausted else "land_bot_findings"
         changes = {"land_state": state, "reviews": records, "evidence_at": time.time()}
         if stop:
             changes.update(
-                stage="user_wait",
-                resume_stage="fix" if exhausted else "land",
-                wait_reason=reason,
+                stage="user_wait" if exhausted else "fix",
+                resume_stage="fix",
+                wait_reason=reason if exhausted else "",
                 ended_at=time.time(),
                 error="review bot findings require disposition; owner judges not_fixed reasons",
-                events=_event(job, type="user_wait", reason=reason),
+                events=_event(job, type="user_wait" if exhausted else "bot_fix", reason=reason),
             )
         if not _cas(self.ctx.jobs, self.ctx.job, {"land"}, lambda j: changes):
             raise StaleAttempt
@@ -704,15 +965,15 @@ class Transaction:
         if self.state.get("replay"):
             self.finish_replay()
         self.initialize()
-        if (
-            not self.state.get("S")
-            and self.state.get("H")
-            and (self.state.get("pr") or self.state.get("create_intent"))
-        ):
+        self.owner_reasons()
+        self.post_answers()
+        self.prepare_republish()
+        if not self.state.get("S") and self.state.get("H") and not self.state.get("republish"):
             self.pull_request(create=False)
         if not self.state.get("S") and not self.state.get("merge_intent"):
             self.base_guard()
             self.head()
+            self.edit_republished_pr()
             self.pull_request()
         if not self.state.get("S"):
             if not self.state.get("merge_intent"):

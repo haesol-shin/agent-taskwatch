@@ -89,6 +89,10 @@ def acceptance_current(jobs: Jobs, config: JobConfig, job: JobState) -> bool:
                 == check.get("log_sha256")
             )
         if review.get("texts"):
+            from .job_findings import dispositions_missing
+
+            if review.get("bot_dispositions"):
+                current = current and not dispositions_missing(job, jobs.folder(job), review)
             from .job_text import snapshot_digest
 
             current = current and snapshot_digest(Path(review["snapshot"])) == review.get(

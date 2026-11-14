@@ -56,13 +56,33 @@ if args[:2] == ["auth", "status"]:
 if args[:1] == ["api"]:
     endpoint = args[args.index("--method") + 2]
     if (option("--hostname") != "forge.invalid"
-            or option("--method") != ("POST" if endpoint == "graphql" else "GET")):
+            or option("--method") != (
+                "POST" if endpoint == "graphql" or endpoint.endswith("/replies") else "GET")):
         fail()
     if endpoint in state.get("raw", {}):
         print(state["raw"][endpoint])
         sys.exit(0)
     if endpoint in state.get("errors", []):
         fail()
+    if endpoint == "user":
+        emit(state.get("viewer", {"login": "fixture-owner"}))
+        sys.exit(0)
+    if endpoint == "repos/sample/project/pulls/17/comments/1/replies":
+        fields = dict(args[index + 1].split("=", 1)
+                      for index, arg in enumerate(args) if arg == "-f")
+        body = fields["body"]
+        state.setdefault("reply_posts", []).append(body)
+        state.setdefault("comment_pages", [[]])[-1].append({
+            "id": 91, "in_reply_to_id": 1, "body": body,
+            "user": {"login": "fixture-owner"},
+        })
+        save()
+        if state.get("reply_timeout"):
+            time.sleep(10)
+        if state.get("reply_lost_ack"):
+            fail()
+        emit({"id": 91})
+        sys.exit(0)
     if endpoint == "graphql":
         fields = dict(args[index + 1].split("=", 1)
                       for index, arg in enumerate(args) if arg == "-f")
@@ -106,6 +126,10 @@ if args[:1] == ["api"]:
                      "head": ["sample:topic"], "base": ["main"]}:
             fail()
         value, paged = state["pull_pages"], True
+    elif path == "repos/sample/project/pulls/17/comments":
+        if query != {"per_page": ["100"]}:
+            fail()
+        value, paged = state.get("comment_pages", [[]]), True
     elif path.startswith("repos/sample/project/pulls/"):
         value = state["pulls"][path.rsplit("/", 1)[1]]
     elif path == "repos/sample/project/commits/" + state["head"] + "/check-runs":
@@ -152,6 +176,22 @@ if args[:2] == ["pr", "create"]:
     if state.get("create_lost_ack"):
         fail()
     print(pr["html_url"])
+elif args[:2] == ["pr", "edit"]:
+    pr = state["pulls"][args[2]]
+    body = Path(option("--body-file")).read_bytes()
+    state["edited_body"] = body.hex()
+    state["edited_title"] = option("--title")
+    if state.get("edit_observed", True):
+        pr.update(title=option("--title"), body=body.decode("utf-8"))
+    if state.get("edit_head"):
+        pr["head"]["sha"] = state["edit_head"]
+    if state.get("edit_body") is not None:
+        pr["body"] = state["edit_body"]
+    save()
+    if state.get("edit_timeout"):
+        time.sleep(10)
+    if state.get("edit_lost_ack"):
+        fail()
 elif args[:2] == ["pr", "merge"]:
     if "--squash" not in args or option("--match-head-commit") != state["head"]:
         fail()
@@ -1112,3 +1152,161 @@ def test_review_threads_reject_incomplete_or_mismatched_observations(forge, fail
     forge.save()
     with pytest.raises(ForgeError):
         forge.client.review_threads(forge.repo, 17, forge.head)
+
+
+def test_edit_pull_request_replaces_old_text_and_reads_exact_bytes(forge):
+    body = forge.body_file()
+    body.write_bytes(b"New evidence.\r\n\r\nUnicode: \xe2\x98\x83\n")
+    title = "fix: reviewed replacement"
+    edited = forge.client.edit_pull_request(forge.repo, 17, forge.head, title, body)
+    assert edited.number == 17
+    assert edited.head_sha == forge.head
+    assert edited.title == title
+    assert edited.body.encode("utf-8") == body.read_bytes()
+    assert bytes.fromhex(forge.observed()["edited_body"]) == body.read_bytes()
+
+
+def test_edit_pull_request_rejects_head_drift_before_write(forge):
+    forge.data["pulls"]["17"]["head"]["sha"] = OTHER_SHA
+    forge.save()
+    with pytest.raises(Mismatch):
+        forge.client.edit_pull_request(forge.repo, 17, forge.head, "new title", forge.body_file())
+    assert "edited_body" not in forge.observed()
+
+
+@pytest.mark.parametrize(
+    "setting, value",
+    [
+        ("edit_head", OTHER_SHA),
+        ("edit_body", "not the exact body"),
+        ("edit_observed", False),
+        ("edit_lost_ack", True),
+        ("edit_timeout", True),
+    ],
+)
+def test_edit_pull_request_requires_exact_acknowledged_readback(forge, setting, value):
+    forge.data[setting] = value
+    forge.save()
+    if setting == "edit_timeout":
+        forge.client.timeout = 0.15
+    with pytest.raises(Uncertain):
+        forge.client.edit_pull_request(forge.repo, 17, forge.head, "new title", forge.body_file())
+    assert "edited_body" in forge.observed()
+
+
+def test_edit_pull_request_rejects_closed_pr_without_write(forge):
+    forge.data["pulls"]["17"]["state"] = "closed"
+    forge.save()
+    with pytest.raises(Mismatch):
+        forge.client.edit_pull_request(forge.repo, 17, forge.head, "new title", forge.body_file())
+    assert "edited_body" not in forge.observed()
+
+
+def review_reply(*, body=None, author="fixture-owner", root=1):
+    return {
+        "id": 91,
+        "in_reply_to_id": root,
+        "user": {"login": author},
+        "body": body
+        if body is not None
+        else ("Not changed in this PR: reason.\n\n<!-- taskwatch:answer thread=1 -->"),
+    }
+
+
+def test_viewer_login_reads_authenticated_host_identity(forge):
+    assert forge.client.viewer_login(forge.repo) == "fixture-owner"
+
+
+@pytest.mark.parametrize("viewer", [None, {}, {"login": ""}, {"login": 12}])
+def test_viewer_login_rejects_missing_or_invalid_identity(forge, viewer):
+    forge.data["viewer"] = viewer
+    forge.save()
+    with pytest.raises(ForgeError):
+        forge.client.viewer_login(forge.repo)
+
+
+def test_find_review_reply_scans_all_pages_and_ignores_other_authors(forge):
+    body = review_reply()["body"]
+    forge.data["comment_pages"] = [
+        [review_reply(body="conflict " + body, author="someone-else")],
+        [review_reply(author="FIXTURE-OWNER")],
+    ]
+    forge.save()
+    assert forge.client.find_review_reply(forge.repo, 17, 1, body, "answer") is True
+
+
+def test_find_review_reply_returns_false_for_foreign_marker_only(forge):
+    body = review_reply()["body"]
+    forge.data["comment_pages"] = [[review_reply(author="someone-else")]]
+    forge.save()
+    assert forge.client.find_review_reply(forge.repo, 17, 1, body, "answer") is False
+
+
+@pytest.mark.parametrize("conflict", ["duplicate", "body", "root", "root_missing"])
+def test_find_review_reply_rejects_conflicting_viewer_marker(forge, conflict):
+    body = review_reply()["body"]
+    row = review_reply()
+    if conflict == "body":
+        row["body"] = "different bytes\n" + body
+    elif conflict == "root":
+        row["in_reply_to_id"] = 2
+    elif conflict == "root_missing":
+        del row["in_reply_to_id"]
+    forge.data["comment_pages"] = [[row], [row] if conflict == "duplicate" else []]
+    forge.save()
+    with pytest.raises(Mismatch):
+        forge.client.find_review_reply(forge.repo, 17, 1, body, "answer")
+
+
+@pytest.mark.parametrize(
+    "body, kind",
+    [
+        ("No marker", "answer"),
+        (review_reply()["body"], "fixed"),
+        (review_reply()["body"] * 2, "answer"),
+        ("<!-- taskwatch:answer thread=2 -->", "answer"),
+        (review_reply()["body"], "other"),
+    ],
+)
+def test_find_review_reply_requires_exact_unique_requested_marker(forge, body, kind):
+    with pytest.raises(ForgeError):
+        forge.client.find_review_reply(forge.repo, 17, 1, body, kind)
+
+
+def test_fixed_reply_marker_preserves_full_body(forge):
+    body = f"Fixed in {forge.head}.\n\n<!-- taskwatch:fixed thread=1 -->"
+    forge.data["comment_pages"] = [[review_reply(body=body)]]
+    forge.save()
+    assert forge.client.find_review_reply(forge.repo, 17, 1, body, "fixed") is True
+
+
+def test_post_review_reply_uses_rest_root_and_preserves_exact_body(forge):
+    body = review_reply()["body"] + "\nUnicode: \u2603\r\n"
+    assert forge.client.post_review_reply(forge.repo, 17, 1, body) is None
+    assert forge.observed()["reply_posts"] == [body]
+    assert forge.client.find_review_reply(forge.repo, 17, 1, body, "answer") is True
+
+
+@pytest.mark.parametrize("failure", ["reply_lost_ack", "reply_timeout"])
+def test_post_reply_uncertainty_is_reconciled_without_reposting(forge, failure):
+    body = review_reply()["body"]
+    forge.data[failure] = True
+    forge.save()
+    if failure == "reply_timeout":
+        forge.client.timeout = 0.15
+    with pytest.raises(Uncertain):
+        forge.client.post_review_reply(forge.repo, 17, 1, body)
+    forge.client.timeout = 30
+    assert forge.client.find_review_reply(forge.repo, 17, 1, body, "answer") is True
+    assert forge.observed()["reply_posts"] == [body]
+
+
+def test_new_source_disposition_can_follow_a_verified_historic_reply(forge):
+    old = review_reply()["body"]
+    new = old.replace("reason.", "a newly reviewed reason.")
+    forge.data["comment_pages"] = [[review_reply(body=old)]]
+    forge.save()
+    assert not forge.client.find_review_reply(forge.repo, 17, 1, new, "answer", (old,))
+    forge.client.post_review_reply(forge.repo, 17, 1, new)
+    assert forge.client.find_review_reply(forge.repo, 17, 1, new, "answer", (old,))
+    assert forge.observed()["reply_posts"] == [new]

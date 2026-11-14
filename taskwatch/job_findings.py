@@ -363,6 +363,114 @@ def bot_record(
     return record
 
 
+def bot_dispositions(job: JobState, folder: Path, *, settled: bool = False) -> list[dict]:
+    """Freeze the exact proposed replies for the active bot round, without changing state."""
+    bot = job.land_state.get("bot", {})
+    if not settled and not bot.get("round", {}).get("awaiting"):
+        return []
+    entries = _entries(folder)
+    active = set(bot["round"].get("findings", ()))
+    candidates = []
+    for ident, thread in sorted(bot.get("threads", {}).items()):
+        if (thread.get("status") != "open" and not settled) or (
+            active and thread["finding"] not in active
+        ):
+            continue
+        entry = entries.get(thread["finding"], {})
+        status = entry.get("status")
+        detail = entry.get("commit" if status == "fixed" else "reason")
+        if status not in {"fixed", "not_fixed"} or not isinstance(detail, str):
+            continue
+        if not detail.strip() or (status == "fixed" and _SHA.fullmatch(detail) is None):
+            continue
+        root = thread["root_id"]
+        # The worker's fix commit stays on the job branch; only the PR head is public.
+        body = (
+            "Fixed in the latest head of this pull request.\n\n"
+            f"<!-- taskwatch:fixed thread={root} -->"
+            if status == "fixed"
+            else f"Not changed in this PR: {detail}\n\n<!-- taskwatch:answer thread={root} -->"
+        )
+        candidates.append(
+            {
+                "thread_id": ident,
+                **{
+                    key: thread[key] for key in ("root_id", "finding", "path", "digest", "severity")
+                },
+                "status": status,
+                "commit" if status == "fixed" else "reason": detail,
+                "body": body.replace("@", "@\u200b"),
+            }
+        )
+    return candidates
+
+
+def dispositions_missing(job: JobState, folder: Path, review: Mapping) -> list[str]:
+    """Reviewed dispositions that no longer describe their thread or the worker's record.
+
+    A later observation of the same thread is a separate finding: the exhaustion gate defers or
+    blocks it on its own, so it does not stale the review of the earlier disposition.
+    """
+    stored = _json_value(review.get("bot_dispositions", ()))
+    if not stored:
+        return []
+    bot = _json_value(job.land_state.get("bot", {}))
+    threads = bot.get("threads", {})
+    followup = set(bot.get("followup", {}).get("findings", ()))
+    current = {c["thread_id"]: c for c in bot_dispositions(job, folder, settled=True)}
+    missing = []
+    for candidate in stored:
+        thread = threads.get(candidate["thread_id"])
+        if thread is not None and all(
+            thread.get(key) == candidate.get(key)
+            for key in ("finding", "path", "digest", "severity")
+        ):
+            if current.get(candidate["thread_id"]) != candidate:
+                missing.append(candidate["finding"])
+            continue
+        if thread is None or thread.get("status") in {"deferred", "closed"}:
+            continue
+        if candidate["finding"] in followup:
+            continue
+        missing.append(candidate["finding"])
+    return missing
+
+
+def bot_worker_problems(
+    job: JobState,
+    folder: Path,
+    fingerprint: str,
+    texts: Mapping,
+    repo: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Validate every active bot observation, including other apps and older rounds."""
+    bot = job.land_state.get("bot", {})
+    if not bot.get("round", {}).get("awaiting"):
+        return []
+    refs = set(bot["round"].get("findings", ()))
+    active = {
+        thread["finding"]
+        for thread in bot.get("threads", {}).values()
+        if thread.get("status") == "open" and (not refs or thread["finding"] in refs)
+    }
+    problems = []
+    found = set()
+    for review in job.reviews:
+        findings = [
+            finding
+            for finding in review.get("findings", ())
+            if finding_id(review, finding) in active
+        ]
+        found.update(finding_id(review, finding) for finding in findings)
+        if findings:
+            problems += worker_problems(
+                folder, {**review, "findings": findings}, fingerprint, texts, repo, env
+            )
+    problems += [f"{key}: bot observation is missing" for key in sorted(active - found)]
+    return list(dict.fromkeys(problems))
+
+
 def _bot_threads(job: JobState, bot: Mapping) -> dict:
     threads = _json_value(bot.get("threads", {}))
     known = {finding_id(r, f) for r in job.reviews for f in r.get("findings", ())}
@@ -392,7 +500,15 @@ def bot_updates(
         if thread["resolved"] and prior is None:
             continue
         parsed = bot_text(thread["body"])
-        if prior is None or prior["digest"] != parsed["digest"]:
+        if prior is None or any(
+            prior.get(key) != value
+            for key, value in {
+                "digest": parsed["digest"],
+                "path": thread["path"],
+                "root_id": thread["root_id"],
+                "author": thread["author"],
+            }.items()
+        ):
             changed.setdefault(thread["author"], []).append(thread)
         else:
             threads[thread["id"]] = {
@@ -403,6 +519,7 @@ def bot_updates(
     records = list(job.reviews)
     for offset, group in enumerate(changed.values()):
         record = bot_record(job, review, group, now, offset)
+        record["reviewed_head"] = reviewed_head(review) or review.get("fingerprint", "")
         records.append(record)
         for thread, finding in zip(group, record["findings"], strict=True):
             parsed = bot_text(thread["body"])
@@ -433,12 +550,18 @@ def sync_index(state: State, job: JobState, folder: Path, now: float) -> None:
         last[(row["job"], row["finding"])] = row["status"]
     entries = _entries(folder)
     deferred = set(job.land_state.get("bot", {}).get("followup", {}).get("findings", ()))
+    bot_threads = {
+        thread["finding"]: thread
+        for thread in job.land_state.get("bot", {}).get("threads", {}).values()
+    }
     stamp = datetime.fromtimestamp(now, timezone.utc)
     for review in job.reviews:
         for finding in review.get("findings", []):
             key = finding_id(review, finding)
             entry = entries.get(key)
             status = entry["status"] if entry and entry.get("status") else "open"
+            if review.get("bot_observation"):
+                status = bot_threads.get(key, {}).get("status", "open")
             if key in deferred:
                 status = "deferred"
             if last.get((job.id, key)) == status:
