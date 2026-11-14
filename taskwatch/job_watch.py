@@ -518,10 +518,14 @@ def _stuck(job: JobState) -> str:
     """Why the job stopped, in counts the runner already keeps: round, open findings, repeats."""
     reviews = [r for r in job.reviews if isinstance(r, Mapping)]
     last = reviews[-1] if reviews else {}
-    earlier = {f["rule"] for r in reviews[:-1] for f in r.get("findings", [])}
-    repeated = sorted({f["rule"] for f in last.get("findings", [])} & earlier - {"other"})
+    round_number = last.get("round", len(reviews))
+    repeated = sorted(
+        f"r{round_number}.{finding['finding']}"
+        for finding in last.get("findings", ())
+        if finding.get("repeat_of")
+    )
     text = f"round {len(reviews)}; open {count_findings(last)}"
-    return text + (f"; repeated rules: {', '.join(repeated)}" if repeated else "")
+    return text + (f"; repeated findings: {', '.join(repeated)}" if repeated else "")
 
 
 def _deadline(job: JobState) -> list[str]:

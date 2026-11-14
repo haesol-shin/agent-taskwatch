@@ -183,7 +183,7 @@ Optionally add `"language"`, `"en"` or `"ko"`, to choose the language of the car
 
 ### Review limit
 
-Optionally add `"max_reviews"`, an integer from 1 to 3, to set how many reviews one cycle may run. The first review counts, so `1` reviews once and stops for the owner when it fails, and `3`, the default, allows the first review and two more. A submission may carry its own `max_reviews` with the same range. The per-job value wins over the host value, and the host value wins over the built-in default. The result is frozen into the job when it is submitted, so a later change of the host setting does not change a job that exists. A boolean, `null`, a string, a fractional number or a value outside 1 to 3 is rejected, and a submission that carries one is refused before anything is stored. The `init` draft writes the default.
+Optionally add `"max_reviews"`, an integer from 1 to 5, to set how many reviews one cycle may run. The first review counts, so `1` reviews once and stops for the owner when it fails, and `3`, the default, allows the first review and two more. A submission may carry its own `max_reviews` with the same range. The per-job value wins over the host value, and the host value wins over the built-in default. The result is frozen into the job when it is submitted, so a later change of the host setting does not change a job that exists. A boolean, `null`, a string, a fractional number or a value outside 1 to 5 is rejected, and a submission that carries one is refused before anything is stored. The `init` draft writes the default.
 
 ```json
 "max_reviews": 2
@@ -268,7 +268,7 @@ Only parent directories needed for these named files may be created; directory d
 
 All these worker-owned files stay outside the workspace and must never be copied into the committed result.
 
-Findings are written when repairing review findings; root-cause evidence is needed for repeated rules.
+Findings are written when repairing review findings; root-cause evidence is needed for a finding the review marks with `repeat_of`.
 
 Neither is mandatory for an untouched initial result.
 
@@ -584,7 +584,7 @@ Three consecutive failed recoveries stop for user judgment. A passing check rese
 
 The independent review has its own budget: at most `max_reviews` attempts per cycle, the first included. The scanner reserves each attempt in the locked write that launches the review, so a crash, a reboot, a stall, a lost start or a stale answer cannot hide one: every launched review uses one, whether it ended with a verdict, a malformed answer, an interrupted run or a result that went stale. The one same-session repair of a malformed reply is part of its attempt. An answer with no accepted verdict reviews again directly while an attempt is left and parks at `user_wait/review_exhausted` when none is; it never starts a fix. A `FAIL` or blocking verdict starts a fix only when a later review is still available, so the last permitted review that fails parks at `review_exhausted` without a fix. A result or review basis that changed during a review returns through `check` before the next reserved review. A parsed `PASS`, and the parsed verdict of a review-only job, are delivered whatever the count. Review rounds are numbered across the whole job and never restart, so finding ids `r<round>.F<n>` stay unique. `show <id>` prints `max_reviews`, `reviews_used`, `review_cycle_start` (an index into the retained review records), `review_inflight` (the attempt that holds a reservation its review has not completed) and `retry_not_before`.
 
-Two consecutive substantive failed reviews of one cycle that share a rule id stop the job at `user_wait/root_cause_required` before anything else runs; the root-cause note it asks for is described in [checks](checks.md#finding-records-and-repeated-rules). When the same review also reaches the limit, `root_cause_required` is the reason and the stop notes both.
+A substantive failed review with a finding that carries `repeat_of` stops the job at `user_wait/root_cause_required` before anything else runs; the reviewer marks the same unresolved defect there, and a shared rule id alone never stops a job. The root-cause note it asks for is keyed by those finding ids and described in [checks](checks.md#finding-records-and-repeated-rules). When the same review also reaches the limit, `root_cause_required` is the reason and the stop notes both.
 
 An explicit `resume` opens a new review cycle at the saved stage: it sets the count to zero, starts the cycle after the last review record, clears the recovery budget and keeps every review record and event. A job that stopped at `review_exhausted` after a failed review resumes into `fix`; one that stopped for answers without a verdict resumes into `review`. `wait` and `approve` keep the cycle. Nothing else resets it: not a passing check, a scan or a restart.
 

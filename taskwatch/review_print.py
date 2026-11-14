@@ -231,6 +231,9 @@ def render(verdict: Mapping) -> str:
         item = {k: finding[k] for k in ("finding", "severity", "category", "rule", "location")}
         if finding["summary"].strip():
             item["summary"] = finding["summary"]
+        for key in ("repeat_of", "repeat_reason"):
+            if finding.get(key, "").strip():
+                item[key] = finding[key]
         place = " ".join(finding["location"].split())
         out += ["", f"### {finding['finding']} {place}"]
         out.append(json.dumps(item, ensure_ascii=False))

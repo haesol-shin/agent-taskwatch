@@ -10,7 +10,7 @@ import pytest
 from taskwatch import job_findings, job_runner
 from taskwatch.executor import _finding_lines
 from taskwatch.job_cli import main as cli_main
-from taskwatch.job_findings import notes, repeated_rules, sync_index
+from taskwatch.job_findings import notes, sync_index
 from taskwatch.jobs import _json_value
 from tests.git_fixture import git
 from tests.test_job_runner import GOOD_FILES, Env
@@ -20,7 +20,14 @@ from tests.verdicts import CODE_PASS as PASS
 
 
 def line(
-    ident="F1", severity="P2", category="evidence", rule="K-7", location="a.py:1", summary=None
+    ident="F1",
+    severity="P2",
+    category="evidence",
+    rule="K-7",
+    location="a.py:1",
+    summary=None,
+    repeat_of=None,
+    repeat_reason=None,
 ) -> str:
     obj = {
         "finding": ident,
@@ -31,6 +38,10 @@ def line(
     }
     if summary is not None:
         obj["summary"] = summary
+    if repeat_of is not None:
+        obj["repeat_of"] = repeat_of
+    if repeat_reason is not None:
+        obj["repeat_reason"] = repeat_reason
     return json.dumps(obj)
 
 
@@ -92,6 +103,29 @@ def test_a_summary_is_kept_trimmed():
 def test_a_bad_summary_is_rejected(summary):
     with pytest.raises(ValueError, match="summary"):
         _finding_lines(body(line(summary=summary)), "PASS")
+
+
+def test_a_repeat_names_an_earlier_finding():
+    found = _finding_lines(
+        body(line(repeat_of="r1.F1", repeat_reason="  the same defect  ")), "FAIL", ["r1.F1"]
+    )
+    assert (found[0]["repeat_of"], found[0]["repeat_reason"]) == ("r1.F1", "the same defect")
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"repeat_of": "r1.F1"},
+        {"repeat_reason": "the same defect"},
+        {"repeat_of": "r2.F1", "repeat_reason": "the same defect"},
+        {"repeat_of": "F1", "repeat_reason": "the same defect"},
+        {"repeat_of": "r1.F1", "repeat_reason": " "},
+    ],
+    ids=["no reason", "no id", "not earlier", "bad id", "empty reason"],
+)
+def test_a_bad_repeat_is_rejected(fields):
+    with pytest.raises(ValueError, match="repeat"):
+        _finding_lines(body(line(**fields)), "FAIL", ["r1.F1"])
 
 
 # --- the review step records findings ------------------------------------------------------
@@ -391,7 +425,8 @@ def test_permission_aware_worker_records_findings_and_the_root_cause_note(unit_e
     env.scenario([{"writes": first, "require_write_grants": True}])
     assert env.run("fix") == 0
     assert env.problems() == []
-    env.scenario([{"reply": "\n".join([FAIL, body(line("F1", rule="K-7"))])}])
+    repeat = line("F1", rule="K-7", repeat_of="r1.F1", repeat_reason="the same defect")
+    env.scenario([{"reply": "\n".join([FAIL, body(repeat)])}])
     assert env.run("review") == 0
     job = env.get()
     assert (job.stage, job.wait_reason) == ("user_wait", "root_cause_required")
@@ -406,7 +441,6 @@ def test_permission_aware_worker_records_findings_and_the_root_cause_note(unit_e
     env.scenario([{"writes": second, "require_write_grants": True}])
     assert env.run("fix") == 0
     assert env.problems() == []
-    assert env.get().checks[-1]["noted"] == {"K-7": "a spec heading"}
     assert git(env.tree, "status", "--porcelain") == ""
     assert (folder / "root-cause.md").read_text().startswith(NOTE)
     assert not (env.tree / "pr").exists()
@@ -415,96 +449,105 @@ def test_permission_aware_worker_records_findings_and_the_root_cause_note(unit_e
 # --- repeats and notes ---------------------------------------------------------------------
 
 
-def row(job, rule, target="/t"):
-    return {"job": job, "target": target, "rule": rule, "finding": "r1.F1", "status": "open"}
+def failed(round_number: int, *findings: dict) -> dict:
+    return {
+        "round": round_number,
+        "verdict": "FAIL",
+        "problems": [job_findings.FAIL_PROBLEM],
+        "findings": [{"finding": f"F{n}", **finding} for n, finding in enumerate(findings, 1)],
+    }
 
 
-@pytest.fixture
-def job(unit_env):
-    return replace(unit_env.get(), target="/t")
+def test_a_shared_rule_id_is_not_a_repeat():
+    cycle = [failed(1, {"rule": "K-7"}), failed(2, {"rule": "K-7"})]
+    assert job_findings.repeated_findings(cycle) == []
 
 
-def review_of(*rules):
-    return {"findings": [{"finding": f"F{i}", "rule": r} for i, r in enumerate(rules, 1)]}
+def test_a_reviewer_marked_repeat_is_found_by_its_finding_id():
+    cycle = [
+        failed(1, {"rule": "K-7"}),
+        failed(2, {"rule": "K-9", "repeat_of": "r1.F1", "repeat_reason": "same defect"}),
+    ]
+    assert job_findings.repeated_findings(cycle) == ["r2.F1"]
 
 
-def test_the_same_rule_in_an_earlier_round_is_a_repeat(job):
-    assert repeated_rules(job, [review_of("K-7")], review_of("K-7", "K-8"), []) == ["K-7"]
+def test_a_malformed_round_after_a_repeat_does_not_hide_it():
+    cycle = [
+        failed(1, {"rule": "K-7"}),
+        failed(2, {"rule": "K-9", "repeat_of": "r1.F1", "repeat_reason": "same defect"}),
+        {"round": 3, "verdict": "", "problems": ["no verdict"], "findings": []},
+    ]
+    assert job_findings.repeated_findings(cycle) == ["r2.F1"]
 
 
-def test_a_rule_seen_in_an_earlier_job_of_the_target_is_a_repeat(job):
-    assert repeated_rules(job, [], review_of("K-7"), [row("old", "K-7")]) == ["K-7"]
-
-
-def test_a_rule_on_another_target_or_in_this_job_is_not_a_repeat(job):
-    rows = [row("old", "K-7", target="/other"), row(job.id, "K-7")]
-    assert repeated_rules(job, [], review_of("K-7"), rows) == []
-
-
-def test_other_never_repeats(job):
-    assert repeated_rules(job, [review_of("other")], review_of("other"), []) == []
-
-
-def test_the_window_is_the_last_ten_jobs(job):
-    rows = [row("job0", "K-7"), *(row(f"job{n}", "K-1") for n in range(1, 11))]
-    assert repeated_rules(job, [], review_of("K-7"), rows) == []
-    assert repeated_rules(job, [], review_of("K-7"), rows[1:] + [row("job11", "K-7")]) == ["K-7"]
-
-
-NOTE = "## K-7\nCause: rushed\nMissed by: the text check\nPrevention: a spec heading\n"
+NOTE = "## r2.F1\nCause: rushed\nMissed by: the text check\nPrevention: a spec heading\n"
 
 
 def test_a_complete_note_passes(tmp_path):
     (tmp_path / "root-cause.md").write_text(NOTE, encoding="utf-8")
-    assert job_findings.note_problems(tmp_path, ["K-7"]) == []
-    assert job_findings.named_preventions(tmp_path, ["K-7"]) == {"K-7": "a spec heading"}
+    assert job_findings.note_problems(tmp_path, ["r2.F1"]) == []
+    assert notes(tmp_path)["r2.F1"]["Prevention:"] == "a spec heading"
 
 
 @pytest.mark.parametrize("label", ["Cause:", "Missed by:", "Prevention:"])
 def test_a_note_missing_a_labeled_line_fails(tmp_path, label):
     text = "\n".join(x for x in NOTE.splitlines() if not x.startswith(label))
     (tmp_path / "root-cause.md").write_text(text, encoding="utf-8")
-    problems = job_findings.note_problems(tmp_path, ["K-7"])
+    problems = job_findings.note_problems(tmp_path, ["r2.F1"])
     assert len(problems) == 1 and label in problems[0]
 
 
 def test_a_missing_note_or_section_fails_and_an_empty_line_fails(tmp_path):
-    assert job_findings.note_problems(tmp_path, ["K-7"])
+    assert job_findings.note_problems(tmp_path, ["r2.F1"])
     (tmp_path / "root-cause.md").write_text(NOTE.replace("rushed", ""), encoding="utf-8")
+    assert job_findings.note_problems(tmp_path, ["r2.F1"])
+    assert notes(tmp_path)["r2.F1"]["Missed by:"] == "the text check"
+
+
+def test_a_stop_keyed_by_finding_id_needs_the_same_id_not_its_rule(tmp_path):
+    (tmp_path / "root-cause.md").write_text(NOTE, encoding="utf-8")
+    stop = {"repeats": ["r2.F1"], "note_digest": "x"}
+    assert job_findings.stop_problems(tmp_path, stop) == []
     assert job_findings.note_problems(tmp_path, ["K-7"])
-    assert notes(tmp_path)["K-7"]["Missed by:"] == "the text check"
 
 
-def test_an_accepted_prevention_names_none(tmp_path):
-    (tmp_path / "root-cause.md").write_text(
-        NOTE.replace("a spec heading", "accepted: rare"), encoding="utf-8"
-    )
-    assert job_findings.named_preventions(tmp_path, ["K-7"]) == {}
+def test_a_stop_recorded_before_finding_ids_still_accepts_a_rule_note(tmp_path):
+    note = "## K-7\nCause: rushed\nMissed by: the text check\nPrevention: a spec heading\n"
+    (tmp_path / "root-cause.md").write_text(note, encoding="utf-8")
+    stop = {"rules": ["K-7"], "note_digest": "x"}
+    assert job_findings.stop_problems(tmp_path, stop) == []
 
 
-def reply(*rules: str) -> dict:
-    lines = [line(f"F{n}", rule=rule) for n, rule in enumerate(rules, 1)]
-    return {"reply": "\n".join([FAIL, body(*lines)])}
-
-
-def next_round(env: UnitEnv, rules: tuple[str, ...], answered: int) -> None:
+def next_round(
+    env: UnitEnv, rules: tuple[str, ...], answered: int, repeat_of: tuple[str, ...] = ()
+) -> None:
     """Answer the last review's findings with a verified commit, then run the next failing
-    review."""
+    review. `repeat_of` names the earlier finding each rule repeats, by position."""
     commit = more_commit(env, f"round{answered}.txt")
     last = job_findings.last_failed(env.get().reviews)
     write_entries(env, [fixed(commit, job_findings.finding_id(last, f)) for f in last["findings"]])
     assert env.problems() == []
-    env.scenario([reply(*rules)])
+    lines = [
+        line(
+            f"F{n}",
+            rule=rule,
+            repeat_of=repeat_of[n - 1] if n <= len(repeat_of) else None,
+            repeat_reason="the same defect" if n <= len(repeat_of) else None,
+        )
+        for n, rule in enumerate(rules, 1)
+    ]
+    env.scenario([{"reply": "\n".join([FAIL, body(*lines)])}])
     assert env.run("review") == 0
 
 
-def test_the_same_rule_in_two_consecutive_rounds_stops_for_a_root_cause(unit_env):
+def test_a_reviewer_marked_repeat_stops_for_a_root_cause(unit_env):
     failed_review(unit_env, line("F1", rule="K-7"))
     commit = more_commit(unit_env)
     write_entries(unit_env, [fixed(commit)])
     assert unit_env.problems() == []
     (unit_env.folder() / "root-cause.md").write_text(NOTE, encoding="utf-8")  # an older note
-    unit_env.scenario([reply("K-7")])
+    repeat = line("F1", rule="K-9", repeat_of="r1.F1", repeat_reason="the premise is still false")
+    unit_env.scenario([{"reply": f"{FAIL}\n{body(repeat)}"}])
     prompts = len(unit_env.prompts())
     assert unit_env.run("review") == 0
     job = unit_env.get()
@@ -513,9 +556,10 @@ def test_the_same_rule_in_two_consecutive_rounds_stops_for_a_root_cause(unit_env
         "root_cause_required",
         "fix",
     )
-    assert "K-7" in job.error and "rounds 1 and 2" in job.error
+    assert "r2.F1" in job.error
     stop = [e for e in job.events if e.get("reason") == "root_cause_required"][-1]
-    assert (stop["rules"], stop["rounds"], stop["exhausted"]) == (("K-7",), (1, 2), False)
+    assert (tuple(stop["repeats"]), stop["exhausted"]) == (("r2.F1",), False)
+    assert "rules" not in stop
     assert stop["note_digest"] == job_findings.note_digest(unit_env.folder())
     assert len(unit_env.prompts()) == prompts + 1  # nothing ran after the stop
 
@@ -528,7 +572,7 @@ def resume(env: UnitEnv) -> int:
 def test_a_resume_after_the_stop_needs_a_changed_complete_note(unit_env, capsys):
     failed_review(unit_env, line("F1", rule="K-7"))
     (unit_env.folder() / "root-cause.md").write_text(NOTE, encoding="utf-8")
-    next_round(unit_env, ("K-7",), 1)
+    next_round(unit_env, ("K-7",), 1, repeat_of=("r1.F1",))
     assert unit_env.get().wait_reason == "root_cause_required"
     assert resume(unit_env) == 1  # the note that existed before the stop is not enough
     assert "has not changed since the stop" in capsys.readouterr().err
@@ -543,24 +587,18 @@ def test_a_resume_after_the_stop_needs_a_changed_complete_note(unit_env, capsys)
     assert job.review_cycle_start == len(job.reviews) == 2
 
 
-@pytest.mark.parametrize(
-    "rounds",
-    [
-        [("K-7",), ("K-8",)],
-        [("other",), ("other",)],
-        [("K-7",), ("K-8",), ("K-7",)],
-        [("K-7", "K-8"), ("K-9",)],
-    ],
-    ids=["different", "other", "not consecutive", "no shared rule"],
-)
-def test_only_a_rule_shared_by_consecutive_rounds_stops(unit_env, rounds):
-    failed_review(unit_env, *[line(f"F{n}", rule=r) for n, r in enumerate(rounds[0], 1)])
-    for answered, rules in enumerate(rounds[1:], 1):
-        next_round(unit_env, rules, answered)
-        job = unit_env.get()
-        last = answered == len(rounds) - 1 and len(rounds) == 3  # the cycle's last permitted review
-        expected = ("user_wait", "review_exhausted") if last else ("fix", "")
-        assert (job.stage, job.wait_reason) == expected, job.error
+def test_a_shared_rule_does_not_stop_and_the_limit_still_does(unit_env):
+    failed_review(unit_env, line("F1", rule="K-7"))
+    next_round(unit_env, ("K-7",), 1)
+    job = unit_env.get()
+    assert (job.stage, job.wait_reason) == ("fix", "")
+    next_round(unit_env, ("K-7",), 2)
+    job = unit_env.get()
+    assert (job.stage, job.wait_reason, job.resume_stage) == (
+        "user_wait",
+        "review_exhausted",
+        "fix",
+    )
 
 
 def test_a_malformed_round_does_not_erase_the_preceding_substantive_round(unit_env):
@@ -568,7 +606,8 @@ def test_a_malformed_round_does_not_erase_the_preceding_substantive_round(unit_e
     commit = more_commit(unit_env)
     write_entries(unit_env, [fixed(commit)])
     assert unit_env.problems() == []
-    unit_env.scenario([{"reply": "no verdict"}] * 2 + [reply("K-7")])
+    repeat = line("F1", rule="K-9", repeat_of="r1.F1", repeat_reason="the same defect")
+    unit_env.scenario([{"reply": "no verdict"}] * 2 + [{"reply": f"{FAIL}\n{body(repeat)}"}])
     assert unit_env.run("review") == 0
     job = unit_env.get()
     assert (job.stage, job.reviews_used, job.reviews[-1]["findings"]) == ("review", 2, ())
@@ -576,64 +615,44 @@ def test_a_malformed_round_does_not_erase_the_preceding_substantive_round(unit_e
     job = unit_env.get()
     assert (job.stage, job.wait_reason) == ("user_wait", "root_cause_required")
     assert [r["round"] for r in job.reviews] == [1, 2, 3]
-    assert [e for e in job.events if e.get("reason") == "root_cause_required"][-1]["rounds"] == (
-        1,
-        3,
-    )
+    stop = [e for e in job.events if e.get("reason") == "root_cause_required"][-1]
+    assert tuple(stop["repeats"]) == ("r3.F1",)
 
 
-def test_a_repeat_in_a_new_cycle_does_not_trigger_the_consecutive_stop(unit_env):
-    unit_env.jobs.save(replace(unit_env.get(), max_reviews=1), 1500.0)
+def test_a_reviewer_marked_repeat_stops_again_in_a_new_cycle(unit_env):
     failed_review(unit_env, line("F1", rule="K-7"))
-    assert unit_env.get().wait_reason == "review_exhausted"
+    next_round(unit_env, ("K-9",), 1, repeat_of=("r1.F1",))
+    assert unit_env.get().wait_reason == "root_cause_required"
+    (unit_env.folder() / "root-cause.md").write_text(NOTE + "\nMore: analysed.\n", encoding="utf-8")
     assert resume(unit_env) == 0
-    next_round(unit_env, ("K-7",), 1)
+    next_round(unit_env, ("K-9",), 2, repeat_of=("r2.F1",))
     job = unit_env.get()
-    # The new cycle holds one review, so the repeat is not consecutive; it still exhausts it.
-    assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")
+    assert (job.stage, job.wait_reason) == ("user_wait", "root_cause_required")
+    stop = [e for e in job.events if e.get("reason") == "root_cause_required"][-1]
+    assert tuple(stop["repeats"]) == ("r3.F1",)
 
 
 def test_root_cause_takes_precedence_over_an_exhausted_cycle(unit_env):
     unit_env.jobs.save(replace(unit_env.get(), max_reviews=2), 1500.0)
     failed_review(unit_env, line("F1", rule="K-7"))
-    next_round(unit_env, ("K-7",), 1)
+    next_round(unit_env, ("K-7",), 1, repeat_of=("r1.F1",))
     job = unit_env.get()
     assert (job.stage, job.wait_reason) == ("user_wait", "root_cause_required")
     assert "review limit is also reached" in job.error
     assert [e for e in job.events if e.get("reason") == "root_cause_required"][-1]["exhausted"]
 
 
-def test_a_repeat_that_is_not_consecutive_still_needs_the_note(unit_env):
+def test_the_root_cause_note_of_a_repeated_finding_reaches_the_next_reviewer(unit_env):
     failed_review(unit_env, line("F1", rule="K-7"))
-    next_round(unit_env, ("K-8",), 1)
-    next_round(unit_env, ("K-7",), 2)  # K-8 came between: not the consecutive stop
-    job = unit_env.get()
-    assert (job.stage, job.wait_reason) == ("user_wait", "review_exhausted")
-    assert resume(unit_env) == 0
-    write_entries(unit_env, [fixed(more_commit(unit_env, "round3.txt"), "r3.F1")])
-    assert any("root-cause.md needs a section `## K-7`" in p for p in unit_env.problems())
-
-
-def test_a_repeat_after_a_named_prevention_is_told_to_the_reviewer(unit_env):
-    """Round 1 and 2 break K-7 and stop; after the analysis round 3 breaks it again."""
-    (unit_env.folder() / "root-cause.md").write_text(NOTE, encoding="utf-8")
-    failed_review(unit_env, line("F1", rule="K-7"))
-    next_round(unit_env, ("K-7",), 1)
+    next_round(unit_env, ("K-9",), 1, repeat_of=("r1.F1",))
     assert unit_env.get().wait_reason == "root_cause_required"
-    (unit_env.folder() / "root-cause.md").write_text(NOTE + "\nMore: round 2.\n", encoding="utf-8")
+    (unit_env.folder() / "root-cause.md").write_text(NOTE + "\nMore: analysed.\n", encoding="utf-8")
     assert resume(unit_env) == 0
-    next_round(unit_env, ("K-7",), 2)
-    check = unit_env.get().checks[-1]
-    assert check["noted"] == {"K-7": "a spec heading"} and check["recurred"] == {}
-    commit = more_commit(unit_env, "round3.txt")
-    write_entries(unit_env, [fixed(commit, "r3.F1")])
-    assert unit_env.problems() == []
-    assert unit_env.get().checks[-1]["recurred"] == {"K-7": "a spec heading"}
-    unit_env.scenario([{"reply": PASS}])
-    assert unit_env.run("review") == 0
+    next_round(unit_env, ("K-9",), 2, repeat_of=("r2.F1",))
     prompt = unit_env.prompts()[-1]
-    assert "repeated after a note named this prevention: a spec heading" in prompt
-    assert "Root-cause note for K-7" in prompt
+    assert "Root-cause note for r2.F1" in prompt
+    assert "a spec heading" in prompt
+    assert "Earlier finding ids: r1.F1, r2.F1" in prompt
 
 
 # --- the index -----------------------------------------------------------------------------

@@ -94,12 +94,14 @@ def _severe(prior: Sequence[Mapping]) -> bool:
     return any(f.get("severity") == "P0" for r in prior for f in r.get("findings", ()))
 
 
-def _recurred(prior: Sequence[Mapping], checks: Sequence[Mapping]) -> list[str]:
-    """Rules of the last review's findings that an earlier round already named."""
-    last = {f["rule"] for f in prior[-1].get("findings", ()) if f["rule"] != "other"}
-    before = {f["rule"] for r in prior[:-1] for f in r.get("findings", ())}
-    named = checks[-1].get("recurred", {}) if checks else {}
-    return sorted((last & before) | set(named))
+def _repeated(prior: Sequence[Mapping]) -> list[str]:
+    """Ids of the last review's findings that name an earlier finding as the same defect."""
+    last = prior[-1]
+    return sorted(
+        f"r{last['round']}.{finding['finding']}"
+        for finding in last.get("findings", ())
+        if finding.get("repeat_of")
+    )
 
 
 def effective_base(
@@ -131,7 +133,6 @@ def decide(
     fingerprint: str,
     approval_scope: str,
     prior: Sequence[Mapping],
-    checks: Sequence[Mapping],
     roots: Sequence[str] = (),
 ) -> Scope:
     """The scope of the round that follows the reviews in `prior` (at least one).
@@ -139,8 +140,9 @@ def decide(
     F1 delta file outside what earlier rounds saw (read those files in full, nothing else
     changes); F2 delta over 50% of the first review's diff or over 400 lines; F3 the base
     commit differs from the last review's; F5 an earlier round had a P0; F6 the delta touches a
-    security path or a path the approval scope names; F7 a rule recurred. Any of F2, F3, F5, F6
-    and F7, or a diff that cannot be read, makes the round a full review.
+    security path or a path the approval scope names; F7 a finding the reviewer marked with
+    `repeat_of`. Any of F2, F3, F5, F6 and F7, or a diff that cannot be read, makes the round a
+    full review.
     """
     first, last = prior[0], prior[-1]
     full: list[str] = []
@@ -173,8 +175,8 @@ def decide(
         full.append(
             f"F6: the delta touches a security or approval-scope path: {', '.join(touched)}"
         )
-    if repeated := _recurred(prior, checks):
-        full.append(f"F7: a rule recurred: {', '.join(repeated)}")
+    if repeated := _repeated(prior):
+        full.append(f"F7: an earlier defect came back: {', '.join(repeated)}")
     reasons = list(full)
     if new_files:
         reasons.insert(

@@ -28,6 +28,7 @@ After that line, give every finding with its location. Each finding has a headin
 - The headings and the finding lines must name the same ids, and an id is used once.
 - A `PASS` cannot carry a P0 or P1 finding line.
 - `summary` is one sentence of at most 160 characters in the owner's words: what is wrong for the user, with no file name and no rule id. A `PASS` needs one on every P2 or P3 finding; the owner reads it in the card under "small problems left".
+- A finding that is the same unresolved defect as an earlier finding of the job, not merely one that breaks the same rule, also carries `repeat_of` (that finding's id, from the earlier ids the message lists) and `repeat_reason` (one line why). Set both or neither; an id that is not an earlier finding of the job makes the answer unacceptable.
 - Write `not_checked` as short plain items joined by `; `: the card shows each item as one bullet.
 - Taskwatch reads only these lines and the verdict line, never the free text.
 
