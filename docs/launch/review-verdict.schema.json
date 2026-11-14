@@ -111,7 +111,9 @@
         "rule",
         "location",
         "summary",
-        "detail"
+        "detail",
+        "repeat_of",
+        "repeat_reason"
       ],
       "properties": {
         "finding": {
@@ -151,7 +153,7 @@
         },
         "repeat_of": {
           "type": "string",
-          "pattern": "^r[0-9]+\\.F[0-9]+$"
+          "pattern": "^(r[0-9]+\\.F[0-9]+)?$"
         },
         "repeat_reason": {
           "type": "string"
