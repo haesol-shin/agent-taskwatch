@@ -1140,6 +1140,68 @@ def test_crash_around_the_push_reuses_the_same_head(make, when):
     assert lab.writes() == ["pr create", "pr merge"] and len(lab.forge()["created"]) == 1
 
 
+def test_first_push_interrupted_before_a_move_updates_the_base(make):
+    lab = make(window=30)
+    lab.accept()
+    lab.trap("before:push")
+    lab.scan_once()
+    lab.service.wait()
+    first = lab.land()
+    abandoned = first["H"]
+    assert not first.get("pushed")
+    assert f"refs/heads/{lab.get().branch}-land" not in git(
+        lab.bare, "for-each-ref", "--format=%(refname)"
+    )
+    main = lab.advance_remote_file("external.txt")
+    lab.finish()
+    state = lab.land()
+    update = state["base_updates"][0]
+    assert update["from_head"] is None and update["M"] == main
+    assert update["head"] == state["H"] != abandoned
+    assert state["base_update"]["published"] is False
+    assert lab.remote_land_branch() == state["H"]
+    assert git(lab.bare, "rev-list", "--parents", "-n", "1", state["H"]).split() == [
+        state["H"],
+        main,
+    ]
+    assert git(lab.bare, "show", f"{state['T']}:external.txt").strip() == "external"
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
+
+
+def test_saved_update_push_is_reconciled_before_a_new_move(make):
+    lab = make(window=30)
+    lab.accept()
+    lab.trap("after:push")
+    lab.scan_once()
+    lab.service.wait()
+    initial = lab.land()["H"]
+    assert lab.remote_land_branch() == initial
+    first = lab.advance_remote_file("one.txt")
+    lab.trap("after:push")
+    lab.scan_once()
+    lab.service.wait()
+    crashed = lab.land()
+    saved = crashed["base_update"]["head"]
+    assert crashed["H"] == initial and crashed["M"] == first
+    assert saved != initial and lab.remote_land_branch() == saved
+    second = lab.advance_remote_file("two.txt")
+    lab.finish()
+    state = lab.land()
+    assert state["M"] == second
+    assert [update["from_head"] for update in state["base_updates"]] == [initial, saved]
+    assert state["H"] not in {initial, saved}
+    assert state["base_update"]["from"] == saved and state["base_update"]["published"] is True
+    assert git(lab.bare, "rev-list", "--parents", "-n", "1", state["H"]).split() == [
+        state["H"],
+        second,
+    ]
+    assert git(lab.bare, "show", f"{state['T']}:one.txt").strip() == "external"
+    assert git(lab.bare, "show", f"{state['T']}:two.txt").strip() == "external"
+    assert lab.remote_land_branch() == state["H"]
+    assert lab.writes() == ["pr create", "pr merge"]
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
+
+
 def test_lost_create_acknowledgement_reuses_the_created_pr_after_resume(make):
     lab = make()
     lab.accept()

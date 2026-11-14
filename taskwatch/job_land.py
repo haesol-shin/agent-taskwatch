@@ -552,12 +552,15 @@ class Transaction:
         with contextlib.suppress(subprocess.SubprocessError):
             self.git("worktree", "prune")
 
-    def published_head(self):
-        """The remote publication head, before a saved republish or base update is pushed."""
-        republish = self.state.get("republish") or {}
-        if republish.get("head") and not self.state.get("pushed"):
-            return republish.get("from")
-        return self.state.get("H")
+    def publication_head(self, target=None):
+        """The remote publication head, or None before the branch exists."""
+        remote = self.git(
+            "ls-remote",
+            "--heads",
+            target or self.push_target(),
+            f"refs/heads/{self.state['branch']}",
+        )
+        return remote.split()[0] if remote else None
 
     def pending_base_update(self):
         update = self.state.get("base_update") or {}
@@ -605,9 +608,16 @@ class Transaction:
                 "land_base_moved",
                 f"default branch moved more than {MAX_BASE_UPDATES} times during landing",
             )
+        pending = self.pending_base_update()
+        if pending and self.publication_head() == pending.get("head"):
+            # The previous update reached the remote before its adoption was saved.
+            self.adopt_base_update(pending)
+            self.observe_base_update()
         base = self.state["B"]
         tree = self.updated_merge(self.state["R"], main)
-        published = self.published_head()
+        published = self.publication_head()
+        if published is None and (self.state.get("pushed") or self.state.get("pr")):
+            raise LandStop("land_head_changed", "publication branch disappeared")
         previous = self.state.get("H")
         head = self.git(
             "commit-tree", tree, "-p", main, stdin=job_text.squash_message(self.title, self.commit)
@@ -636,6 +646,7 @@ class Transaction:
                 "head": head,
                 "tree": tree,
                 "check": check,
+                "published": published is not None,
             },
         )
         return True
@@ -649,22 +660,22 @@ class Transaction:
             raise LandStop("land_head_changed", "updated publication object differs")
         target = self.push_target()
         branch = f"refs/heads/{self.state['branch']}"
-        remote = self.git("ls-remote", "--heads", target, branch)
-        remote_head = remote.split()[0] if remote else None
+        remote_head = self.publication_head(target)
         if remote_head == head:
             self.adopt_base_update(update)
             return
-        if remote_head not in {update.get("from"), update.get("previous")}:
+        if remote_head is None and not update.get("published", False):
+            lease = []
+        elif remote_head is not None and remote_head == update.get("from"):
+            lease = [f"--force-with-lease={branch}:{remote_head}"]
+        elif remote_head is None:
+            raise LandStop("land_head_changed", "publication branch disappeared")
+        else:
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
         self.freshness()
         self.save(push_intent=True, phase="push")
         try:
-            self.git(
-                "push",
-                f"--force-with-lease={branch}:{remote_head}",
-                target,
-                f"{head}:{branch}",
-            )
+            self.git("push", *lease, target, f"{head}:{branch}")
         except subprocess.CalledProcessError:
             raise LandStop("land_interrupted", "base update push was refused") from None
         observed = self.git("ls-remote", "--heads", target, branch)
@@ -702,7 +713,11 @@ class Transaction:
             if pr.head_sha == update["head"]:
                 self.save(base_update={**update, "pr_observed": True})
                 return
-            if pr.head_sha not in {update.get("from"), update.get("previous")}:
+            if pr.head_sha not in {
+                update.get("from"),
+                update.get("previous"),
+                (self.state.get("republish") or {}).get("from"),
+            }:
                 raise LandStop("land_pr_mismatch", "updated publication head was not observed")
             if time.monotonic() >= deadline:
                 raise LandStop("land_pr_mismatch", "updated publication head was not observed")
@@ -868,9 +883,8 @@ class Transaction:
         ).split() != [head, self.state.get("head_parent", self.state["M"])]:
             raise LandStop("land_head_changed", "publication object parent or tree differs")
         target = self.push_target()
-        remote = self.git("ls-remote", "--heads", target, f"refs/heads/{self.state['branch']}")
+        remote_head = self.publication_head(target)
         previous = self.state.get("republish", {}).get("from")
-        remote_head = remote.split()[0] if remote else None
         if remote_head not in {None, head, previous} or (previous and remote_head is None):
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
         if remote_head != head:
