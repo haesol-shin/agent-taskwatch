@@ -922,16 +922,8 @@ class Transaction:
         if stop:
             raise BotParked
 
-    def merge(self):
-        # A lost merge acknowledgement is never authorization for another merge request.
-        if self.state.get("merge_intent"):
-            pr = self.validate_pr(
-                self.api.read_pull_request(self.repo, self.state["pr"]["number"], self.state["H"])
-            )
-            if pr.state != "MERGED":
-                raise LandStop("land_merge_failed", "saved merge request has no observed merge")
-            self.save(S=pr.merge_sha, phase="merged")
-            return
+    def premerge(self):
+        """Refresh every merge precondition; the bot gate can outlive any of them."""
         self.freshness()
         self.base_guard()
         repo = self.api.inspect_repository()
@@ -943,20 +935,38 @@ class Transaction:
         )
         if pr.state == "MERGED":
             self.save(S=pr.merge_sha, phase="merged")
-            return
+            return None
         if pr.mergeability not in {"clean", "has_hooks"} or pr.auto_merge is not False:
             raise LandStop("land_merge_failed", "direct mergeability is not proven")
         if not self.state.get("ci_green"):
             raise LandStop("land_ci_failed", "merge requires observed green CI")
         evidence, apps, changed = self.observe_ci()
         self.green(evidence, apps, "green CI identity changed before merge")
+        return pr, repo, changed
+
+    def merge(self):
+        # A lost merge acknowledgement is never authorization for another merge request.
+        if self.state.get("merge_intent"):
+            pr = self.validate_pr(
+                self.api.read_pull_request(self.repo, self.state["pr"]["number"], self.state["H"])
+            )
+            if pr.state != "MERGED":
+                raise LandStop("land_merge_failed", "saved merge request has no observed merge")
+            self.save(S=pr.merge_sha, phase="merged")
+            return
+        first = self.premerge()
+        if first is None:
+            return
+        pr, repo, changed = first
         if changed and self.state.get("bot", {}).get("apps"):
-            # A changed selection is not covered by the completed gate; run it in its window.
+            # The gate can outlive the approved base, PR text, acceptance evidence or CI.
             self.bot()
-            evidence, apps, again = self.observe_ci()
-            if again:
+            again = self.premerge()
+            if again is None:
+                return
+            pr, repo, changed = again
+            if changed:
                 raise LandStop("land_interrupted", "review bot selection changed during the gate")
-            self.green(evidence, apps, "green CI identity changed before merge")
         self.bot_findings()
         subject = self.title + f" (#{pr.number})"
         problems = message_problems(

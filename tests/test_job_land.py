@@ -2322,6 +2322,42 @@ def test_a_bot_added_after_the_gate_is_observed_before_merge(make, monkeypatch):
         assert lab.writes() == ["pr create", "pr merge"]
 
 
+def test_main_moving_during_the_merge_gate_blocks_the_squash(make, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "ORIGIN", "https://forge.invalid/sample/project.git")
+    monkeypatch.setattr(
+        sys.modules[__name__], "FAKE_GH", FAKE_GH.replace("github.com", "forge.invalid")
+    )
+    monkeypatch.setattr(sys.modules[__name__], "SHIM", SHIM.replace("github.com", "forge.invalid"))
+    lab = make(window=60, install=None)
+    lab.configure(review_bot_wait=1)
+    lab.accept()
+    job = lab.put("land")
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.api.authenticated_hosts = ("forge.invalid",)
+        seen, moved = [], []
+
+        def current():
+            value = () if len(seen) < 2 else (APP,)
+            seen.append(value)
+            return value
+
+        def inspect(*args):
+            if not moved:
+                moved.append(1)
+                lab.advance_remote()
+            return {APP: [{"status": "in_progress", "conclusion": None}]}
+
+        tx.review_bots = current
+        tx.api.inspect_bot_runs = inspect
+        tx.api.review_threads = lambda *args: []
+        with pytest.raises(job_land.LandStop) as stopped:
+            tx.run()
+        assert stopped.value.reason == "land_base_moved"
+        assert lab.writes() == ["pr create"]
+
+
 def test_resumed_budget_does_not_repark_retained_deferrals(make, monkeypatch):
     with bot_lab(make, monkeypatch) as (lab, tx):
         tx.api.review_threads = lambda *args: [bot_thread()]
