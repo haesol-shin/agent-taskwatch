@@ -962,6 +962,24 @@ def test_a_changed_copied_document_stops_before_the_review(env):
     assert (job.reviews_used, job.review_inflight) == (0, 0)
 
 
+def test_a_link_broken_during_the_review_keeps_the_round(env):
+    script = (
+        "from pathlib import Path; "
+        "p = Path('../review-docs/agent-taskwatch/review/common.md'); "
+        "p.write_text(p.read_text() + '\\n[gone](../gone.md)\\n')"
+    )
+    turn = {"reply": f"{PASS}\nNo findings.", "run": [[sys.executable, "-c", script]]}
+    env.scenario([work_turn(), turn])
+    assert env.run("work") == 0
+    assert env.run("check") == 0
+    assert env.run("review") == 0
+    job = env.get()
+    record = job.reviews[-1]
+    assert (job.stage, job.reviews_used, job.review_inflight) == ("check", 1, 0)
+    assert record["stale"] and not record["ok"]
+    assert any("link does not resolve" in problem for problem in record["problems"])
+
+
 def test_a_record_of_the_flat_guide_copy_keeps_its_text(env):
     env.scenario([work_turn()])
     assert env.run("work") == 0

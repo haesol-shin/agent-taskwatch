@@ -1910,6 +1910,10 @@ def _judge(
         if _basis(job, ctx.folder) != job.basis:
             record["problems"].append("the review basis changed during the review")
             record["stale"] = True
+    except InputsChanged as exc:
+        # The review ran, so the round stays spent and the record holds the stale evidence.
+        record["problems"].append(f"the review basis cannot be read: {exc}")
+        record["stale"] = True
     except (ValueError, OSError) as exc:
         record["problems"].append(f"the result cannot be fingerprinted: {exc}")
         record["stale"] = True
