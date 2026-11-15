@@ -832,6 +832,37 @@ def test_pr_event_requires_explicit_pr_association(forge):
         forge.ci()
 
 
+def test_merged_ci_counts_only_default_branch_push_runs(forge):
+    merge = SQUASH_SHA
+    forge.data["head"] = merge
+    push = run(merge, id=61)
+    push.update(pull_requests=[], event="push", head_branch="main")
+    topic = {**push, "id": 62, "head_branch": "topic"}
+    forge.data["runs"] = [[run(merge, id=63), push, topic]]
+    forge.data["checks"] = [[]]
+    forge.save()
+    observed = forge.client.inspect_merged_ci(forge.repo, merge)
+    assert observed.state == "success"
+    assert [(e.kind, e.id) for e in observed.evidence] == [("run", 61)]
+
+
+def test_merged_ci_without_a_push_run_has_no_evidence(forge):
+    forge.data["head"] = SQUASH_SHA
+    forge.data["runs"] = [[run(SQUASH_SHA)]]
+    forge.data["checks"] = [[]]
+    forge.save()
+    observed = forge.client.inspect_merged_ci(forge.repo, SQUASH_SHA)
+    assert observed.state == "missing" and observed.evidence == ()
+
+
+def test_merged_ci_rejects_a_run_for_another_head(forge):
+    forge.data["head"] = SQUASH_SHA
+    forge.data["runs"] = [[run(OTHER_SHA)]]
+    forge.save()
+    with pytest.raises(Mismatch):
+        forge.client.inspect_merged_ci(forge.repo, SQUASH_SHA)
+
+
 def test_same_attempt_duplicates_cannot_hide_failure(forge):
     forge.data["checks"] = [[check(forge.head, id=30, conclusion="failure"), check(forge.head)]]
     forge.data["runs"][0][0]["run_attempt"] = 2
