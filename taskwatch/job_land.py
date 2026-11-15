@@ -5,6 +5,8 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import time
@@ -15,6 +17,10 @@ from urllib.parse import urlsplit
 from . import forge, job_findings, job_text, job_workspace
 from .checks import message_problems
 from .jobs import _json_value
+
+MAX_BASE_UPDATES = 3
+# premerge: the base moved, so publication, CI and the bot gate run again under one bound.
+BASE_UPDATED = object()
 
 
 class LandStop(Exception):
@@ -209,6 +215,8 @@ class Transaction:
                 },
             )
         self.repo = repo
+        if "base_update_enabled" not in self.state:
+            self.save(base_update_enabled=bool(self.ctx.config.land_base_update))
 
     def dispositions_current(self, job, review):
         """Each reviewed disposition must still describe its thread and the worker's record."""
@@ -258,17 +266,33 @@ class Transaction:
         refs = {c["finding"] for c in candidates}
         if refs != set(round_.get("findings", ())):
             raise LandStop("land_review_stale", "bot dispositions are incomplete")
-        self.save(
-            identity=identity,
-            R=text["head"],
-            T=text["tree"],
-            review_digest=digest(_json_value(review)),
-            check_digest=digest(_json_value(job.checks[-1])),
-            snapshot_digest=review["snapshot_sha256"],
-            text_digest=digest(_json_value(text)),
-            bot={**bot, "dispositions": candidates, "disposition_review": review["seq"]},
-            republish={"from": self.state["H"], "review": review["seq"]},
-        )
+        tree = text["tree"]
+        updates = list(self.state.get("base_updates", ()))
+        # A published transaction that already updated its base merges the fix the same way.
+        if self.state.get("M") and self.state["M"] != self.state["B"]:
+            tree = self.updated_merge(text["head"], self.state["M"])
+            if tree != self.state["T"]:
+                # Only the tree matters here; the reviewed message is loaded after this check.
+                head = self.git(
+                    "commit-tree", tree, "-p", self.state["M"], stdin="base update check\n"
+                )
+                self.check_updated_tree(head, self.state["M"], tree)
+            if updates:
+                updates[-1] = {**updates[-1], "tree": tree, "accepted": text["tree"]}
+        changes = {
+            "identity": identity,
+            "R": text["head"],
+            "T": tree,
+            "review_digest": digest(_json_value(review)),
+            "check_digest": digest(_json_value(job.checks[-1])),
+            "snapshot_digest": review["snapshot_sha256"],
+            "text_digest": digest(_json_value(text)),
+            "bot": {**bot, "dispositions": candidates, "disposition_review": review["seq"]},
+            "republish": {"from": self.state["H"], "review": review["seq"]},
+        }
+        if updates:
+            changes["base_updates"] = updates
+        self.save(**changes)
 
     def owner_reasons(self):
         """A generic resume is never an owner's acceptance of a bot rejection."""
@@ -352,6 +376,7 @@ class Transaction:
                 "rerun_round",
                 "push_intent",
                 "pushed",
+                "base_update",
             }
         }
         bot = self.state["bot"]
@@ -423,14 +448,328 @@ class Transaction:
         self.git("fetch", "--no-tags", "origin", f"+refs/heads/{self.repo.default_branch}:{ref}")
         return self.git("rev-parse", f"{ref}^{{commit}}")
 
+    def base_update_enabled(self):
+        return bool(self.state.get("base_update_enabled", self.ctx.config.land_base_update))
+
+    def changed_paths(self, older, newer):
+        """Every side of a rename counts, so a rename cannot hide an overlap."""
+        out = self.command(["git", "diff", "--name-only", "--no-renames", "-z", older, newer])
+        return {path for path in out.split("\0") if path}
+
+    def merge_tree(self, base, main, result):
+        """The tree of result rebased onto main, or the conflict paths."""
+        try:
+            out = self.command(
+                [
+                    "git",
+                    "merge-tree",
+                    "--write-tree",
+                    "--no-messages",
+                    f"--merge-base={base}",
+                    main,
+                    result,
+                ]
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != 1:
+                raise
+            return None, self.conflict_paths(exc.stdout or "")
+        return out.splitlines()[0].strip(), None
+
+    def conflict_paths(self, output):
+        paths = set()
+        for line in output.splitlines()[1:]:
+            if "\t" in line:
+                path = line.split("\t", 1)[1]
+                # A directory/file conflict renames the merged path with a blob suffix.
+                paths.add(re.sub(r"~[0-9a-f]{7,64}$", "", path))
+        return sorted(paths)
+
+    def names(self, paths):
+        shown = ", ".join(paths[:10])
+        return shown + (f" (+{len(paths) - 10} more)" if len(paths) > 10 else "")
+
+    def updated_merge(self, result, main):
+        """The three-way tree of result onto main; park when the paths are not disjoint."""
+        base = self.state["B"]
+        shared = sorted(self.changed_paths(base, main) & self.changed_paths(base, result))
+        if shared:
+            raise LandStop(
+                "land_base_moved",
+                "fresh default branch changed paths of the result: " + self.names(shared),
+            )
+        tree, conflicts = self.merge_tree(base, main, result)
+        if conflicts is not None:
+            detail = self.names(conflicts) if conflicts else "no merged tree"
+            raise LandStop("land_base_moved", "automatic base update conflicts: " + detail)
+        return tree
+
+    def check_updated_tree(self, head, main, tree):
+        """Run the accepted check command on the updated tree before publication.
+
+        The run takes a host check slot like the check step, so `check_slots` bounds it too.
+        """
+        from .job_runner import _acquire_slot, _release_slot
+
+        path = self.ctx.folder / "base-update-tree"
+        log = self.ctx.folder / "base-update.log"
+        self.remove_check_tree(path)
+        record = {"exit_code": 0, "log": str(log)}
+        try:
+            self.git("worktree", "add", "--detach", str(path), head)
+            slot = None
+            try:
+                slot = _acquire_slot(self.ctx)
+                try:
+                    output = self.command(
+                        list(self.ctx.job.check_command),
+                        timeout=self.ctx.config.rpc_timeout,
+                        cwd=str(path),
+                    )
+                except subprocess.CalledProcessError as exc:
+                    output = (exc.stdout or "") + (exc.stderr or "")
+                    record["exit_code"] = exc.returncode
+                except subprocess.TimeoutExpired:
+                    output = "check command timed out\n"
+                    record["exit_code"] = "timeout"
+                except OSError as exc:
+                    output = f"check command could not run: {exc}\n"
+                    record["exit_code"] = "error"
+            finally:
+                _release_slot(slot)
+            log.write_text(output, encoding="utf-8")
+        finally:
+            self.remove_check_tree(path)
+        if record["exit_code"] != 0:
+            self.save(
+                base_update_failure={
+                    "B": self.state["B"],
+                    "M": main,
+                    "T": self.state["T"],
+                    "tree": tree,
+                    **record,
+                }
+            )
+            raise LandStop(
+                "land_base_update_failed",
+                f"check command exited {record['exit_code']} on the updated base; see {log}",
+            )
+        return record
+
+    def remove_check_tree(self, path):
+        if path.exists():
+            with contextlib.suppress(subprocess.SubprocessError):
+                self.git("worktree", "remove", "--force", str(path))
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+        with contextlib.suppress(subprocess.SubprocessError):
+            self.git("worktree", "prune")
+
+    def publication_head(self, target=None):
+        """The remote publication head, or None before the branch exists."""
+        remote = self.git(
+            "ls-remote",
+            "--heads",
+            target or self.push_target(),
+            f"refs/heads/{self.state['branch']}",
+        )
+        return remote.split()[0] if remote else None
+
+    def owned_heads(self):
+        """Publication heads this job created, which a rewrite may replace."""
+        republish = self.state.get("republish") or {}
+        update = self.state.get("base_update") or {}
+        heads = [
+            self.state.get("H"),
+            republish.get("from"),
+            republish.get("head"),
+            update.get("head"),
+            *(record.get("head") for record in self.state.get("base_updates", ())),
+        ]
+        return {head for head in heads if head}
+
+    def pending_base_update(self):
+        update = self.state.get("base_update") or {}
+        if (
+            update.get("head")
+            and update["head"] != self.state.get("H")
+            and update.get("tree") == self.state.get("T")
+        ):
+            return update
+        return {}
+
+    def reset_per_head(self):
+        """A new publication head restarts CI and bot observation; review evidence stays."""
+        dropped = {
+            "ci_green",
+            "ci_evidence",
+            "ci_bots",
+            "ci_started_at",
+            "ci_deadline",
+            "ci_entry",
+            "rerun_round",
+            "push_intent",
+            "pushed",
+        }
+        self.state = {k: v for k, v in self.state.items() if k not in dropped}
+        if bot := self.state.get("bot"):
+            self.state = {
+                **self.state,
+                "bot": {
+                    **{k: v for k, v in bot.items() if k not in {"head", "window_end", "outcome"}},
+                    "outcome": {},
+                },
+            }
+
+    def update_base(self, main):
+        """Put the accepted result on main when the two change sets share no path.
+
+        True means state now carries the new tree and a head for the new base. A shared path or
+        a conflict parks without changing the worktree; a failed check parks before publication.
+        """
+        if not self.base_update_enabled() or self.state.get("merge_intent"):
+            return False
+        updates = list(self.state.get("base_updates", ()))
+        if len(updates) >= MAX_BASE_UPDATES:
+            raise LandStop(
+                "land_base_moved",
+                f"default branch moved more than {MAX_BASE_UPDATES} times during landing",
+            )
+        pending = self.pending_base_update()
+        if pending and self.publication_head() == pending.get("head"):
+            # The previous update reached the remote before its adoption was saved.
+            self.adopt_base_update(pending)
+            self.observe_base_update()
+        base = self.state["B"]
+        tree = self.updated_merge(self.state["R"], main)
+        previous = self.state.get("H")
+        published = self.publication_head()
+        if published is not None and published not in self.owned_heads():
+            raise LandStop("land_head_changed", "publication branch belongs to a different head")
+        if published is None and (self.state.get("pushed") or self.state.get("pr")):
+            raise LandStop("land_head_changed", "publication branch disappeared")
+        head = self.git(
+            "commit-tree", tree, "-p", main, stdin=job_text.squash_message(self.title, self.commit)
+        )
+        check = self.check_updated_tree(head, main, tree)
+        record = {
+            "B": base,
+            "M": main,
+            "T": self.state["T"],
+            "tree": tree,
+            "from_head": published,
+            "head": head,
+        }
+        if published is not None:
+            self.reset_per_head()
+        self.state = {
+            k: v for k, v in self.state.items() if k not in {"base_update", "base_update_failure"}
+        }
+        self.save(
+            M=main,
+            T=tree,
+            base_updates=[*updates, record],
+            base_update={
+                "from": published,
+                "previous": previous,
+                "head": head,
+                "tree": tree,
+                "check": check,
+                "published": published is not None,
+            },
+        )
+        return True
+
+    def publish_base_update(self, update):
+        """Replace a published head on its branch, lease-pinned to the observed previous head."""
+        head = update["head"]
+        if self.git("rev-parse", f"{head}^{{tree}}") != update.get("tree") or self.git(
+            "rev-list", "--parents", "-n", "1", head
+        ).split() != [head, self.state["M"]]:
+            raise LandStop("land_head_changed", "updated publication object differs")
+        target = self.push_target()
+        branch = f"refs/heads/{self.state['branch']}"
+        remote_head = self.publication_head(target)
+        if remote_head == head:
+            self.adopt_base_update(update)
+            return
+        if remote_head is None and not update.get("published", False):
+            lease = []
+        elif (
+            remote_head is not None
+            and remote_head == update.get("from")
+            and remote_head in self.owned_heads()
+        ):
+            lease = [f"--force-with-lease={branch}:{remote_head}"]
+        elif remote_head is None:
+            raise LandStop("land_head_changed", "publication branch disappeared")
+        else:
+            raise LandStop("land_head_changed", "publication branch belongs to a different head")
+        self.freshness()
+        self.save(push_intent=True, phase="push")
+        try:
+            self.git("push", *lease, target, f"{head}:{branch}")
+        except subprocess.CalledProcessError:
+            raise LandStop("land_interrupted", "base update push was refused") from None
+        observed = self.git("ls-remote", "--heads", target, branch)
+        if (observed.split()[0] if observed else None) != head:
+            raise LandStop("land_interrupted", "base update push acknowledgement unknown")
+        self.adopt_base_update(update)
+
+    def adopt_base_update(self, update):
+        head = update["head"]
+        changes = {
+            "H": head,
+            "head_parent": self.state["M"],
+            "commit_metadata": self.git("show", "-s", "--format=raw", head),
+            "pushed": True,
+        }
+        republish = self.state.get("republish")
+        if republish and republish.get("from") == update.get("from"):
+            changes["republish"] = {**republish, "head": head}
+        self.save(**changes)
+
+    def observe_base_update(self):
+        """The same pull request follows a rewritten branch before its guards run again."""
+        update = self.state.get("base_update") or {}
+        if (
+            not update.get("head")
+            or update["head"] != self.state.get("H")
+            or update.get("from") is None
+            or update.get("pr_observed")
+            or not self.state.get("pr")
+        ):
+            return
+        deadline = time.monotonic() + 60
+        while True:
+            pr = self.api.read_pull_request(self.repo, self.state["pr"]["number"], None)
+            if pr.head_sha == update["head"]:
+                self.save(base_update={**update, "pr_observed": True})
+                return
+            if pr.head_sha not in {
+                update.get("from"),
+                update.get("previous"),
+                (self.state.get("republish") or {}).get("from"),
+            }:
+                raise LandStop("land_pr_mismatch", "updated publication head was not observed")
+            if time.monotonic() >= deadline:
+                raise LandStop("land_pr_mismatch", "updated publication head was not observed")
+            self.wait(2)
+
     def base_guard(self):
+        """False when the publication stands on the fetched base; True after an update."""
         main = self.fetch_main()
-        if main != self.state["B"] and not self.predecessor_base(main):
-            self.replay(main)
-            raise LandStop("land_base_moved", "fresh default branch differs from accepted base")
-        if self.state.get("M") and self.state["M"] != main:
-            raise LandStop("land_base_moved", "default branch changed during landing")
+        expected = self.state.get("M", self.state["B"])
+        if main != expected:
+            if not self.state.get("M") and self.predecessor_base(main):
+                pass
+            elif self.update_base(main):
+                return True
+            else:
+                self.replay(main)
+                raise LandStop("land_base_moved", "fresh default branch differs from accepted base")
         self.save(M=main)
+        return False
 
     def predecessor_base(self, main):
         job = self.current()
@@ -559,9 +898,16 @@ class Transaction:
         return "origin"
 
     def head(self):
+        pending = self.pending_base_update()
+        if pending and self.state.get("H"):
+            self.publish_base_update(pending)
         if not self.state.get("H"):
-            message = job_text.squash_message(self.title, self.commit)
-            head = self.git("commit-tree", self.state["T"], "-p", self.state["M"], stdin=message)
+            head = pending.get("head") if pending else None
+            if not head:
+                message = job_text.squash_message(self.title, self.commit)
+                head = self.git(
+                    "commit-tree", self.state["T"], "-p", self.state["M"], stdin=message
+                )
             metadata = self.git("show", "-s", "--format=raw", head)
             self.save(H=head, commit_metadata=metadata, phase="head")
         head = self.state["H"]
@@ -570,9 +916,8 @@ class Transaction:
         ).split() != [head, self.state.get("head_parent", self.state["M"])]:
             raise LandStop("land_head_changed", "publication object parent or tree differs")
         target = self.push_target()
-        remote = self.git("ls-remote", "--heads", target, f"refs/heads/{self.state['branch']}")
+        remote_head = self.publication_head(target)
         previous = self.state.get("republish", {}).get("from")
-        remote_head = remote.split()[0] if remote else None
         if remote_head not in {None, head, previous} or (previous and remote_head is None):
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
         if remote_head != head:
@@ -925,7 +1270,9 @@ class Transaction:
     def premerge(self):
         """Refresh every merge precondition; the bot gate can outlive any of them."""
         self.freshness()
-        self.base_guard()
+        if self.base_guard():
+            # The updated tree needs a new publication head, then CI and this gate again.
+            return BASE_UPDATED
         repo = self.api.inspect_repository()
         if repo != self.repo:
             raise LandStop("land_pr_mismatch", "repository capabilities changed")
@@ -953,17 +1300,21 @@ class Transaction:
             if pr.state != "MERGED":
                 raise LandStop("land_merge_failed", "saved merge request has no observed merge")
             self.save(S=pr.merge_sha, phase="merged")
-            return
+            return False
         first = self.premerge()
+        if first is BASE_UPDATED:
+            return True
         if first is None:
-            return
+            return False
         pr, repo, changed = first
         if changed and self.state.get("bot", {}).get("apps"):
             # The gate can outlive the approved base, PR text, acceptance evidence or CI.
             self.bot()
             again = self.premerge()
+            if again is BASE_UPDATED:
+                return True
             if again is None:
-                return
+                return False
             pr, repo, changed = again
             if changed:
                 raise LandStop("land_interrupted", "review bot selection changed during the gate")
@@ -985,6 +1336,7 @@ class Transaction:
         except forge.ForgeError as exc:
             raise LandStop("land_merge_failed", str(exc)) from exc
         self.save(S=merged.merge_sha, phase="merged")
+        return False
 
     def verify_tree(self):
         main = self.fetch_main()
@@ -998,7 +1350,7 @@ class Transaction:
             contains = False
             same = False
         if not contains or not same:
-            raise LandStop("land_tree_mismatch", "merged/default tree differs from accepted tree")
+            raise LandStop("land_tree_mismatch", "merged/default tree differs from publication")
         self.save(tree_verified=True, phase="verified")
 
     def install(self):
@@ -1050,18 +1402,27 @@ class Transaction:
         self.owner_reasons()
         self.post_answers()
         self.prepare_republish()
-        if not self.state.get("S") and self.state.get("H") and not self.state.get("republish"):
-            self.pull_request(create=False)
-        if not self.state.get("S") and not self.state.get("merge_intent"):
-            self.base_guard()
-            self.head()
-            self.edit_republished_pr()
-            self.pull_request()
-        if not self.state.get("S"):
-            if not self.state.get("merge_intent"):
-                self.ci()
-                self.bot()
-            self.merge()
+        while True:
+            if (
+                not self.state.get("S")
+                and self.state.get("H")
+                and not self.state.get("republish")
+                and not self.pending_base_update()
+            ):
+                self.pull_request(create=False)
+            if not self.state.get("S") and not self.state.get("merge_intent"):
+                self.base_guard()
+                self.head()
+                self.observe_base_update()
+                self.edit_republished_pr()
+                self.pull_request()
+            if not self.state.get("S"):
+                if not self.state.get("merge_intent"):
+                    self.ci()
+                    self.bot()
+                if self.merge():
+                    continue
+            break
         self.verify_tree()
         self.install()
         from .job_runner import _apply

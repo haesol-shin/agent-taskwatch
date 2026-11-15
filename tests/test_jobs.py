@@ -457,6 +457,27 @@ def test_a_private_tmp_that_is_not_a_boolean_is_a_config_error(tmp_path, value):
         load_job_config(root)
 
 
+def test_land_base_update_is_on_when_the_init_draft_omits_it(tmp_path):
+    root = tmp_path / "root"
+    path = host_config(root)
+    assert "land_base_update" not in json.loads(path.read_text(encoding="utf-8"))
+    assert load_job_config(root).land_base_update is True
+
+
+def test_land_base_update_can_be_turned_off(tmp_path):
+    root = tmp_path / "root"
+    host_config(root, land_base_update=False)
+    assert load_job_config(root).land_base_update is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_land_base_update_must_be_a_boolean(tmp_path, value):
+    root = tmp_path / "root"
+    host_config(root, land_base_update=value)
+    with pytest.raises(ValueError, match="land_base_update"):
+        load_job_config(root)
+
+
 def test_four_and_five_reviews_are_allowed_for_the_host_and_a_job(tmp_path):
     root = tmp_path / "root"
     jobs = Jobs(root)
