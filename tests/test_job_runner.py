@@ -537,28 +537,37 @@ def test_a_slot_wait_longer_than_the_stall_limit_is_not_a_stall(env):
     assert len(fd) == 1 and fd[0] is not None
 
 
-def test_a_cancelled_attempt_leaves_the_slot_wait(env):
+@pytest.mark.parametrize(
+    "change", [{"stage": "cancelled"}, {"attempt": 2}], ids=["cancelled", "replaced"]
+)
+def test_a_stale_wait_never_runs_the_check(env, tmp_path, change):
     env.seed({})
     env.put("work")
-    ctx = _slot_ctx(env, 1, stall_seconds=1)
+    marker = tmp_path / "ran.txt"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"]
+    # A long stall limit means no beat can notice this: the slot frees and the old wait must
+    # still refuse to run the command it queued.
+    ctx = _slot_ctx(env, 1, command, stall_seconds=600)
     outcome = []
 
-    def take() -> None:
+    def run() -> None:
         try:
-            outcome.append(job_runner._acquire_slot(ctx))
+            outcome.append(job_runner._run_command(ctx, tmp_path / "check.log"))
         except job_runner.StaleAttempt as exc:
             outcome.append(exc)
 
     holder = _hold_slot(ctx)
-    thread = threading.Thread(target=take)
+    thread = threading.Thread(target=run)
     try:
         thread.start()
-        env.jobs.save(replace(env.get(), stage="cancelled"), 3000.0)
+        env.jobs.save(replace(env.get(), **change), 3000.0)
+        _kill(holder)
         thread.join(10)
     finally:
         _kill(holder)
         thread.join(10)
     assert len(outcome) == 1 and isinstance(outcome[0], job_runner.StaleAttempt)
+    assert not marker.exists()
 
 
 class _ActiveUnit:
