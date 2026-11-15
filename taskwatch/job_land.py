@@ -505,28 +505,38 @@ class Transaction:
         return tree
 
     def check_updated_tree(self, head, main, tree):
-        """Run the accepted check command on the updated tree before publication."""
+        """Run the accepted check command on the updated tree before publication.
+
+        The run takes a host check slot like the check step, so `check_slots` bounds it too.
+        """
+        from .job_runner import _acquire_slot, _release_slot
+
         path = self.ctx.folder / "base-update-tree"
         log = self.ctx.folder / "base-update.log"
         self.remove_check_tree(path)
         record = {"exit_code": 0, "log": str(log)}
         try:
             self.git("worktree", "add", "--detach", str(path), head)
+            slot = None
             try:
-                output = self.command(
-                    list(self.ctx.job.check_command),
-                    timeout=self.ctx.config.rpc_timeout,
-                    cwd=str(path),
-                )
-            except subprocess.CalledProcessError as exc:
-                output = (exc.stdout or "") + (exc.stderr or "")
-                record["exit_code"] = exc.returncode
-            except subprocess.TimeoutExpired:
-                output = "check command timed out\n"
-                record["exit_code"] = "timeout"
-            except OSError as exc:
-                output = f"check command could not run: {exc}\n"
-                record["exit_code"] = "error"
+                slot = _acquire_slot(self.ctx)
+                try:
+                    output = self.command(
+                        list(self.ctx.job.check_command),
+                        timeout=self.ctx.config.rpc_timeout,
+                        cwd=str(path),
+                    )
+                except subprocess.CalledProcessError as exc:
+                    output = (exc.stdout or "") + (exc.stderr or "")
+                    record["exit_code"] = exc.returncode
+                except subprocess.TimeoutExpired:
+                    output = "check command timed out\n"
+                    record["exit_code"] = "timeout"
+                except OSError as exc:
+                    output = f"check command could not run: {exc}\n"
+                    record["exit_code"] = "error"
+            finally:
+                _release_slot(slot)
             log.write_text(output, encoding="utf-8")
         finally:
             self.remove_check_tree(path)

@@ -6,12 +6,14 @@ GitHub URL to that bare repository, so nothing leaves the temporary folder. Each
 as a child process of the scanner; a crash is a real SIGKILL of that process.
 """
 
+import fcntl
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1048,6 +1050,40 @@ def test_failed_check_on_the_updated_base_parks_before_publication(make):
     assert "base_updates" not in job.land_state and "H" not in job.land_state
     assert Path(failure["log"]).is_file()
     cleaned_forge(lab)
+
+
+def test_the_update_check_waits_for_a_host_check_slot(make):
+    lab = make(window=30)
+    lab.configure(check_slots=1)
+    lab.accept()
+    job = lab.put("land")
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    slot = ctx.jobs.state.dir / "check-slots" / "0.lock"
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    held = os.open(slot, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    head = git(lab.tree, "rev-parse", "HEAD")
+    tree = git(lab.tree, "rev-parse", "HEAD^{tree}")
+    log = lab.folder() / "base-update.log"
+    result = {}
+
+    def check():
+        with (lab.repo / ".git" / "HEAD").open() as lock:
+            tx = job_land.Transaction(ctx, lock.fileno())
+            result["exit_code"] = tx.check_updated_tree(head, head, tree)["exit_code"]
+
+    try:
+        worker = threading.Thread(target=check, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not log.exists():
+            time.sleep(0.05)
+        assert not log.exists()
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    worker.join(30)
+    assert not worker.is_alive() and result == {"exit_code": 0} and log.is_file()
 
 
 def test_base_update_can_be_turned_off(make):
