@@ -163,7 +163,12 @@ def listing_of_runs(sha):
         for pr in state["pulls"].values():
             pr["title"] += "!"
         save()
-    pages([{"workflow_runs": fill(snapshot()["runs"], sha)}])
+    runs = fill(snapshot()["runs"], sha)
+    heads = {p["head_sha"] for p in state["pulls"].values()}
+    # A merged commit's first push run may register inside the landing grace.
+    if sha not in heads and take("push_run_late"):
+        runs = [r for r in runs if r.get("event") != "push"]
+    pages([{"workflow_runs": runs}])
 
 
 def api():
@@ -1594,6 +1599,16 @@ def test_no_push_workflow_on_the_default_branch_records_none(make):
     assert state["post_merge_ci"]["evidence"] == []
     assert state["verified"]["post_merge_ci"] == "none"
     assert len(lab.hook_calls()) == 1 and state["install"]["status"] == "succeeded"
+
+
+def test_a_run_registered_inside_the_grace_is_judged_before_install(make):
+    lab = make(window=4)
+    lab.accept()
+    # The first merged observation has no push run yet; the run registers inside the grace.
+    lab.edit(push_run_late=1, ci=[ci([run_row(), push_run(id=62, conclusion="failure")])])
+    job = lab.park("land_post_merge_failed")
+    assert lab.land()["S"] in job.error and "62" in job.error
+    assert lab.hook_calls() == [] and len(lab.forge()["merge_calls"]) == 1
 
 
 def test_an_unfinished_post_merge_run_parks_at_the_deadline(make):

@@ -1360,8 +1360,9 @@ class Transaction:
     def post_merge_ci(self):
         """Require the merged commit's own push CI before installation, bounded like PR CI.
 
-        Only a default-branch push run for S proves the merged work was built. No registered
-        push run after the grace means the repository has no push workflow to verify.
+        Only a default-branch push run for S proves the merged work was built. Absence means
+        no push workflow only when the observation at the end of the registration grace still
+        has no run, so a run that registers inside the grace is judged, never skipped.
         """
         saved = self.state.get("post_merge_ci", {})
         if saved.get("status") in {"success", "none"}:
@@ -1383,30 +1384,22 @@ class Transaction:
             }
             self.save(post_merge_ci=saved, phase="post_merge_ci")
         while True:
-            if time.time() >= saved["deadline"]:
-                raise LandStop(
-                    "land_post_merge_failed",
-                    f"post-merge CI for {sha} did not finish before the deadline: "
-                    + post_merge_problems(saved.get("evidence", [])),
-                )
             evidence = self.api.inspect_merged_ci(self.repo, sha, exclude_apps=apps)
             saved = {**saved, "evidence": [asdict(e) for e in evidence.evidence]}
             if not any(e.kind == "run" for e in evidence.evidence):
-                # Absence is decided by registration grace, not by a workflow that finishes.
                 end = min(saved["started_at"] + POST_MERGE_GRACE, saved["deadline"])
                 if time.time() < end:
+                    # Re-observe at the grace end; a run registered inside it must be judged.
                     self.wait(end - time.time())
-                if time.time() >= end:
-                    self.save(post_merge_ci={**saved, "status": "none"}, phase="post_merge_ci")
-                    return
-                continue
-            if time.time() >= saved["deadline"]:
-                raise LandStop(
-                    "land_post_merge_failed",
-                    f"post-merge CI for {sha} was not decided before the deadline: "
-                    + post_merge_problems(saved["evidence"]),
-                )
+                    continue
+                self.save(post_merge_ci={**saved, "status": "none"}, phase="post_merge_ci")
+                return
             if evidence.state == "success":
+                if time.time() >= saved["deadline"]:
+                    raise LandStop(
+                        "land_post_merge_failed",
+                        f"post-merge CI for {sha} finished after the deadline",
+                    )
                 self.save(post_merge_ci={**saved, "status": "success"}, phase="post_merge_ci")
                 return
             if evidence.state in {"failed", "missing"}:
@@ -1414,6 +1407,12 @@ class Transaction:
                 raise LandStop(
                     "land_post_merge_failed",
                     f"post-merge CI for {sha} is not green: "
+                    + post_merge_problems(saved["evidence"]),
+                )
+            if time.time() >= saved["deadline"]:
+                raise LandStop(
+                    "land_post_merge_failed",
+                    f"post-merge CI for {sha} did not finish before the deadline: "
                     + post_merge_problems(saved["evidence"]),
                 )
             self.save(post_merge_ci=saved)
