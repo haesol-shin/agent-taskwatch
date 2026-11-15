@@ -502,10 +502,10 @@ Work inputs:
   `{ctx.folder / job_findings.FINDINGS_FILE}` before you finish, as the fix message shows.
   A finding the review marks as a repeat also needs a section in
   `{ctx.folder / job_findings.NOTE_FILE}`.
-- While working, run only the tests that cover what you changed. The full suite runs once for
-  the committed result: the End command with `--run-command` is that run, and a passing one is
-  reused instead of run again while the result, intent, spec and guidelines do not change.
-  Otherwise the check step runs the full suite once and keeps the output as the evidence.
+- While working, run only the tests that cover what you changed. The check command runs once
+  for the committed result: the End command with `--run-command` is that run, and a passing one
+  is reused instead of run again while the result, intent, spec and guidelines do not change.
+  Otherwise the check step runs it and keeps the output as the evidence.
 {card_language}- If you delegate to subagents, wait until each one finished.
 
 {_job_type_text(job)}
@@ -574,10 +574,10 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
         lines += [f"Brief file: {ctx.folder / 'brief.md'}"]
         lines += [
             "",
-            "While you work, run only the tests that cover what you changed. The full suite runs",
-            "once for the committed result: a passing `check --run-command` is that run, and the",
-            "check step reuses it instead of running the command again. Do not run the full",
-            "suite a second time.",
+            "While you work, run only the tests that cover what you changed. The check command",
+            "runs once for the committed result: a passing `check --run-command` is that run, and",
+            "the check step reuses it instead of running the command again. Do not run the check",
+            "command a second time.",
         ]
     for path in job.inputs.get("work", []):
         lines.append(f"Work input: {path}")
@@ -656,18 +656,20 @@ def _fix_reason(job: JobState) -> str:
 def _subject_lines(ctx: Ctx) -> list[str]:
     job, target = ctx.job, ctx.job.review_target
     if target is None:
-        log = job.checks[-1]["log"] if job.checks else ""
+        record = job.checks[-1] if job.checks else {}
         lines = [
             f"Reviewed result: {ctx.workspace} (files: {', '.join(job.outputs)})",
             f"Result fingerprint: {job.fingerprint}",
-            f"Check output: {log}",
+            f"Check command: {shlex.join(job.check_command)}",
+            f"Check record: exit status {record.get('exit_code', 'none')}, "
+            f"log {record.get('log', '(none)')}",
         ]
         if job.review == "code":
             lines += [
-                "The check step ran the full suite once for this result; its record, whose",
-                "fingerprint is the result fingerprint above, is the full-suite evidence and a",
-                "check older than that fingerprint is not evidence. Run targeted tests only",
-                "where a finding needs them; do not run the full suite again.",
+                "That record is the test evidence for the result fingerprint above: it shows the",
+                "command that ran, its exit status and its log, which may show a subset of the",
+                "tests. A check older than that fingerprint is not evidence. Run targeted tests",
+                "only where a finding needs them; do not run the check command again.",
             ]
         return [
             *lines,
@@ -934,17 +936,24 @@ class Recorder:
         self._write(None)
 
     def _write(self, event: dict | None) -> None:
-        ctx = self.ctx
-
-        def build(job: JobState) -> dict:
-            now = _now()
-            changes = {"evidence_at": now, **_progress_changes(job, ctx, now)}
-            if event is not None:
-                changes["events"] = _event(job, **event)
-            return changes
-
-        if not _cas(ctx.jobs, ctx.job, {ctx.stage}, build):
+        if not _evidence(self.ctx, event):
             self.abort.set()
+
+
+def _evidence(ctx: Ctx, event: dict | None = None) -> bool:
+    """Write evidence for this attempt and say whether the job still has it.
+
+    The RPC recorder and the check slot wait both use it, so a session that gives no frames and
+    a step that waits for a slot keep the job evidence fresh."""
+
+    def build(job: JobState) -> dict:
+        now = _now()
+        changes = {"evidence_at": now, **_progress_changes(job, ctx, now)}
+        if event is not None:
+            changes["events"] = _event(job, **event)
+        return changes
+
+    return _cas(ctx.jobs, ctx.job, {ctx.stage}, build)
 
 
 def _schema_path(ctx: Ctx) -> Path:
@@ -1329,12 +1338,18 @@ def _acquire_slot(ctx: Ctx) -> int | None:
 
     The lock is an fcntl lock on a slot file, so the operating system releases it when this
     process dies and a killed holder never keeps the host limit. Waiting happens before the
-    command starts, so it does not count toward the check timeout.
+    command starts, so it does not count toward the check timeout. An open attempt refreshes its
+    evidence every third of `stall_seconds` while it waits, so a queued check is not a stalled
+    job; the wait ends with StaleAttempt when the job is cancelled or replaced.
     """
     paths = _slot_paths(ctx)
-    if paths:
-        paths[0].parent.mkdir(parents=True, exist_ok=True)
-    while paths:
+    if not paths:
+        return None
+    paths[0].parent.mkdir(parents=True, exist_ok=True)
+    step = _attempt_open(ctx.job)
+    every = ctx.config.stall_seconds / 3
+    beat_at = time.monotonic() + every
+    while True:
         for path in paths:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
             try:
@@ -1343,8 +1358,12 @@ def _acquire_slot(ctx: Ctx) -> int | None:
                 os.close(fd)
                 continue
             return fd
+        now = time.monotonic()
+        if step and now >= beat_at:
+            if not _evidence(ctx):
+                raise StaleAttempt
+            beat_at = now + every
         time.sleep(CHECK_SLOT_POLL)
-    return None
 
 
 def _release_slot(fd: int | None) -> None:
