@@ -8,7 +8,8 @@ base. CI covers required contexts and every check, status and PR workflow regist
 the exact head, using latest attempts. Path-filter-suppressed workflows are undiscoverable.
 Completed `neutral` and `skipped` check and workflow-run conclusions pass as they do for
 GitHub's required checks; empty, missing, cancelled, failed or unknown evidence is never
-green, and green still needs one successful workflow run. No runner integration or gh
+green, and green still needs one successful workflow run. The same verdict covers a merged
+commit, where only a push run on the default branch counts. No runner integration or gh
 dependency is imposed on jobs that do not import and use this module.
 """
 
@@ -837,8 +838,44 @@ class GitHub:
         head_sha = _sha(head_sha)
         exclude_apps = _apps(exclude_apps)
         pr = self.read_pull_request(repo, number, head_sha)
-        required = self._required(repo)
         runs = self._workflow_runs(repo, pr)
+        return CI(head_sha, self._ci_evidence(repo, head_sha, runs, exclude_apps))
+
+    def inspect_merged_ci(self, repo: Repository, sha: str, *, exclude_apps=()) -> CI:
+        """Read the default-branch CI registered for one exact commit.
+
+        Only a push run on the default branch proves that the merged commit was built. PR
+        runs, other branches and other events never count, so empty evidence means no push
+        workflow registered for that commit.
+        """
+        sha = _sha(sha)
+        exclude_apps = _apps(exclude_apps)
+        runs = self._merged_runs(repo, sha)
+        return CI(sha, self._ci_evidence(repo, sha, runs, exclude_apps))
+
+    def _merged_runs(self, repo: Repository, sha: str) -> list[dict]:
+        rows = self._rows(
+            repo,
+            f"{self._path(repo)}/actions/runs?head_sha={sha}&per_page=100",
+            "workflow_runs",
+        )
+        latest = {}
+        for row in rows:
+            self._validate_run(repo, row, sha)
+            if _text(row.get("event")) != "push" or (
+                _text(row.get("head_branch")) != repo.default_branch
+            ):
+                continue
+            run_id, attempt = _int(row.get("id")), _int(row.get("run_attempt"))
+            if run_id not in latest or attempt > _int(latest[run_id].get("run_attempt")):
+                latest[run_id] = row
+        return list(latest.values())
+
+    def _ci_evidence(
+        self, repo: Repository, head_sha: str, runs: list[dict], exclude_apps: tuple[str, ...]
+    ) -> tuple[CIEvidence, ...]:
+        """The shared verdict evidence: registered checks, statuses, runs and required gaps."""
+        required = self._required(repo)
         evidence = self._checks(repo, head_sha, required, runs, exclude_apps)
         evidence.extend(self._statuses(repo, head_sha, required))
         for row in runs:
@@ -878,7 +915,7 @@ class GitHub:
                         app_id=app,
                     )
                 )
-        return CI(head_sha, tuple(evidence))
+        return tuple(evidence)
 
     def inspect_bot_runs(self, repo: Repository, head_sha: str, apps) -> dict[str, list[dict]]:
         """Return every exact-head check for the requested app slugs, without supersession."""

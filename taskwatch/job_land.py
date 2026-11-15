@@ -37,6 +37,10 @@ def resume_entry(job):
     return sum(e.get("type") in {"resume", "approve"} for e in job.events)
 
 
+# How long a merged commit may take to register its default-branch push workflows.
+POST_MERGE_GRACE = 15
+
+
 class Boundary(forge.GitHub):
     def __init__(self, transaction):
         super().__init__(transaction.ctx.job.target, transaction.ctx.env)
@@ -1353,6 +1357,68 @@ class Transaction:
             raise LandStop("land_tree_mismatch", "merged/default tree differs from publication")
         self.save(tree_verified=True, phase="verified")
 
+    def post_merge_ci(self):
+        """Require the merged commit's own push CI before installation, bounded like PR CI.
+
+        Only a default-branch push run for S proves the merged work was built. No registered
+        push run after the grace means the repository has no push workflow to verify.
+        """
+        saved = self.state.get("post_merge_ci", {})
+        if saved.get("status") in {"success", "none"}:
+            return
+        sha, apps = self.state["S"], tuple(self.state.get("bot", {}).get("apps", ()))
+        entry = resume_entry(self.current())
+        if not saved.get("started_at") or (
+            self.state.get("last_error") == "land_post_merge_failed"
+            and entry > saved.get("entry", entry)
+        ):
+            now = time.time()
+            saved = {
+                "status": "observing",
+                "sha": sha,
+                "bots": list(apps),
+                "started_at": now,
+                "deadline": now + self.ctx.config.rpc_timeout,
+                "entry": entry,
+            }
+            self.save(post_merge_ci=saved, phase="post_merge_ci")
+        while True:
+            if time.time() >= saved["deadline"]:
+                raise LandStop(
+                    "land_post_merge_failed",
+                    f"post-merge CI for {sha} did not finish before the deadline: "
+                    + post_merge_problems(saved.get("evidence", [])),
+                )
+            evidence = self.api.inspect_merged_ci(self.repo, sha, exclude_apps=apps)
+            saved = {**saved, "evidence": [asdict(e) for e in evidence.evidence]}
+            if not any(e.kind == "run" for e in evidence.evidence):
+                # Absence is decided by registration grace, not by a workflow that finishes.
+                end = min(saved["started_at"] + POST_MERGE_GRACE, saved["deadline"])
+                if time.time() < end:
+                    self.wait(end - time.time())
+                if time.time() >= end:
+                    self.save(post_merge_ci={**saved, "status": "none"}, phase="post_merge_ci")
+                    return
+                continue
+            if time.time() >= saved["deadline"]:
+                raise LandStop(
+                    "land_post_merge_failed",
+                    f"post-merge CI for {sha} was not decided before the deadline: "
+                    + post_merge_problems(saved["evidence"]),
+                )
+            if evidence.state == "success":
+                self.save(post_merge_ci={**saved, "status": "success"}, phase="post_merge_ci")
+                return
+            if evidence.state in {"failed", "missing"}:
+                self.save(post_merge_ci={**saved, "status": "failed"})
+                raise LandStop(
+                    "land_post_merge_failed",
+                    f"post-merge CI for {sha} is not green: "
+                    + post_merge_problems(saved["evidence"]),
+                )
+            self.save(post_merge_ci=saved)
+            self.wait(min(20, max(0, saved["deadline"] - time.time())))
+
     def install(self):
         hook = self.state["install"]
         from .jobs import load_job_config
@@ -1424,10 +1490,21 @@ class Transaction:
                     continue
             break
         self.verify_tree()
+        self.post_merge_ci()
         self.install()
         from .job_runner import _apply
 
-        self.save(phase="complete", last_error="")
+        ci, install = self.state["post_merge_ci"], self.state["install"]
+        self.save(
+            verified={
+                "sha": self.state["S"],
+                "post_merge_ci": ci["status"],
+                "ci_evidence": ci["evidence"],
+                "install": install["status"],
+            },
+            phase="complete",
+            last_error="",
+        )
         _apply(
             self.ctx,
             lambda j: {
@@ -1489,6 +1566,25 @@ def install_argv(command, sha, target, repo):
         ):
             raise LandStop("land_hook_changed", "install source differs from transaction origin")
     return [part.replace("{sha}", sha).replace("{target}", target) for part in command]
+
+
+def post_merge_problems(evidence):
+    """Name every piece of a merged commit's CI observation that is not verified."""
+    problems = []
+    for item in evidence:
+        kind = item.get("kind")
+        conclusion = item.get("conclusion") or "no conclusion"
+        if kind == "missing":
+            problems.append(f"required check {item.get('name')} did not register")
+        elif kind == "run":
+            problems.append(
+                f"run {item.get('id')} {item.get('name')} {item.get('status')}/{conclusion}"
+            )
+        elif kind == "status":
+            problems.append(f"status {item.get('name')} {item.get('conclusion')}")
+        else:
+            problems.append(f"check {item.get('name')} {item.get('status')}/{conclusion}")
+    return "; ".join(problems) or "no successful push workflow run"
 
 
 def run_land(ctx):

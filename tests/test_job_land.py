@@ -402,11 +402,29 @@ def check_row(name="unit", conclusion="success", id=31):
     }
 
 
+def push_run(id=61, attempt=1, status="completed", conclusion="success", head="@H@"):
+    """A default-branch push run, the only evidence a merged commit was built."""
+    return {
+        "id": id,
+        "head_sha": head,
+        "run_attempt": attempt,
+        "check_suite_id": id - 10,
+        "name": "CI",
+        "path": ".github/workflows/ci.yml",
+        "status": status,
+        "conclusion": conclusion,
+        "repository": {"full_name": "sample/project"},
+        "pull_requests": [],
+        "event": "push",
+        "head_branch": "main",
+    }
+
+
 def ci(runs=(), checks=(), statuses=()):
     return {"runs": list(runs), "checks": list(checks), "statuses": list(statuses)}
 
 
-GREEN = [ci([run_row()])]
+GREEN = [ci([run_row(), push_run()])]
 PENDING = [ci([run_row(status="in_progress", conclusion=None)])]
 PARAMETERS = {"required_status_checks": [{"context": "unit"}]}
 REQUIRED_UNIT = [[{"type": "required_status_checks", "parameters": PARAMETERS}]]
@@ -1384,7 +1402,7 @@ def test_neutral_and_skipped_conclusions_never_stall_the_merge(make):
     lab.edit(
         ci=[
             ci(
-                [run_row(), run_row(52, conclusion="skipped")],
+                [run_row(), run_row(52, conclusion="skipped"), push_run()],
                 checks=[check_row(conclusion="neutral")],
             )
         ]
@@ -1405,7 +1423,7 @@ def test_ci_for_another_head_is_never_green(make):
 def test_required_check_and_a_successful_run_land(make):
     lab = make()
     lab.accept()
-    lab.edit(rules=REQUIRED_UNIT, ci=[ci([run_row()], checks=[check_row()])])
+    lab.edit(rules=REQUIRED_UNIT, ci=[ci([run_row(), push_run()], checks=[check_row()])])
     lab.finish()
     assert lab.writes() == ["pr create", "pr merge"]
 
@@ -1434,7 +1452,9 @@ def test_deadline_survives_a_crash_and_a_distinct_resume_opens_a_new_window(make
     assert lab.writes() == ["pr create", "pr merge"] and len(lab.forge()["created"]) == 1
 
 
-FAILED_PAIR = [ci([run_row(51, conclusion="failure"), run_row(52, conclusion="failure")])]
+FAILED_PAIR = [
+    ci([run_row(51, conclusion="failure"), run_row(52, conclusion="failure"), push_run()])
+]
 FIXED = {"run_attempt": 2, "conclusion": "success"}
 
 
@@ -1525,7 +1545,73 @@ def test_default_branch_moving_while_merging_is_detected_after_the_merge(make):
     assert lab.hook_calls() == [] and len(lab.forge()["merge_calls"]) == 1
 
 
-# --- L8: install -----------------------------------------------------------------------------
+# --- L8: post-merge CI -----------------------------------------------------------------------
+
+
+def test_post_merge_ci_verifies_the_squash_before_install(make):
+    lab = make()
+    lab.accept()
+    lab.finish()
+    state = lab.land()
+    squash = state["S"]
+    assert state["post_merge_ci"]["status"] == "success"
+    assert state["post_merge_ci"]["sha"] == squash
+    assert [e["id"] for e in state["post_merge_ci"]["evidence"]] == [61]
+    assert all(e["head_sha"] == squash for e in state["post_merge_ci"]["evidence"])
+    assert state["verified"] == {
+        "sha": squash,
+        "post_merge_ci": "success",
+        "ci_evidence": state["post_merge_ci"]["evidence"],
+        "install": "succeeded",
+    }
+    assert lab.hook_calls()[0]["argv"] == ["install", squash, str(lab.repo.resolve())]
+
+
+def test_a_failing_post_merge_run_parks_and_a_resume_never_merges_again(make):
+    lab = make(window=60)
+    lab.accept()
+    lab.edit(ci=[ci([run_row(), push_run(id=62, conclusion="failure")])])
+    job = lab.park("land_post_merge_failed")
+    squash = lab.land()["S"]
+    assert lab.land()["post_merge_ci"]["status"] == "failed"
+    assert squash in job.error and "62" in job.error
+    assert lab.hook_calls() == [] and len(lab.forge()["merge_calls"]) == 1
+    lab.edit(ci=[ci([run_row(), push_run()])])
+    lab.resume()
+    assert lab.finish().land_state["verified"]["post_merge_ci"] == "success"
+    assert lab.writes() == ["pr create", "pr merge"] and len(lab.forge()["merge_calls"]) == 1
+    assert len(lab.hook_calls()) == 1
+
+
+def test_no_push_workflow_on_the_default_branch_records_none(make):
+    lab = make()
+    lab.accept()
+    lab.edit(ci=[ci([run_row()])])
+    lab.finish()
+    state = lab.land()
+    assert state["post_merge_ci"]["status"] == "none"
+    assert state["post_merge_ci"]["sha"] == state["S"]
+    assert state["post_merge_ci"]["evidence"] == []
+    assert state["verified"]["post_merge_ci"] == "none"
+    assert len(lab.hook_calls()) == 1 and state["install"]["status"] == "succeeded"
+
+
+def test_an_unfinished_post_merge_run_parks_at_the_deadline(make):
+    lab = make(window=2)
+    lab.accept()
+    lab.edit(ci=[ci([run_row(), push_run(status="in_progress", conclusion=None)])])
+    job = lab.park("land_post_merge_failed")
+    squash = lab.land()["S"]
+    assert squash in job.error and "61" in job.error
+    assert lab.land()["post_merge_ci"]["status"] == "observing"
+    assert lab.hook_calls() == [] and len(lab.forge()["merge_calls"]) == 1
+    lab.edit(ci=[ci([run_row(), push_run()])])
+    lab.resume()
+    lab.finish()
+    assert len(lab.forge()["merge_calls"]) == 1 and len(lab.hook_calls()) == 1
+
+
+# --- L9: install -----------------------------------------------------------------------------
 
 
 def test_failed_install_keeps_the_squash_and_never_replays_without_a_resume(make):
@@ -1908,7 +1994,7 @@ def test_saved_pr_merged_during_ci_resumes_verification_without_remerge(make):
     git(lab.bare, "update-ref", "refs/heads/main", merged, state["M"])
     pulls = lab.forge()["pulls"]
     pulls["17"].update(state="closed", merged=True, merge_sha=merged)
-    lab.edit(pulls=pulls)
+    lab.edit(pulls=pulls, ci=GREEN)
     lab.resume()
     lab.finish()
     assert lab.land()["S"] == merged and lab.land()["tree_verified"]
