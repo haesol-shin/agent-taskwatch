@@ -102,9 +102,12 @@ def ref(name):
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
-def external_commit():
+def external_commit(extra_file=False):
     parent = ref("refs/heads/main")
-    new = git("commit-tree", parent + "^{tree}", "-p", parent, data="external change\n")
+    tree = git("rev-parse", parent + "^{tree}")
+    if extra_file:
+        tree = tree_with_extra(tree)
+    new = git("commit-tree", tree, "-p", parent, data="external change\n")
     git("update-ref", "refs/heads/main", new, parent)
 
 
@@ -266,6 +269,8 @@ def merge():
     git("update-ref", "refs/heads/main", squash, parent)
     pr.update(state="closed", merged=True, merge_sha=squash)
     save()
+    if take("advance_main_after_merge"):
+        external_commit(extra_file=True)
     if take("merge_kill_after"):
         kill_caller()
     if take("merge_lost_ack"):
@@ -1550,6 +1555,19 @@ def test_default_branch_moving_while_merging_is_detected_after_the_merge(make):
     assert lab.hook_calls() == [] and len(lab.forge()["merge_calls"]) == 1
 
 
+def test_a_default_branch_that_moved_after_the_merge_keeps_the_verified_tree(make):
+    lab = make()
+    lab.accept()
+    lab.edit(advance_main_after_merge=1)
+    lab.finish()
+    state = lab.land()
+    squash, main = state["S"], state["observed_main"]
+    assert state["tree_verified"] is True and main != squash
+    assert git(lab.bare, "rev-parse", f"{squash}^{{tree}}") == state["T"]
+    assert git(lab.bare, "merge-base", "--is-ancestor", squash, main) == ""
+    assert state["install"]["status"] == "succeeded" and len(lab.hook_calls()) == 1
+
+
 # --- L8: post-merge CI -----------------------------------------------------------------------
 
 
@@ -1624,6 +1642,47 @@ def test_an_unfinished_post_merge_run_parks_at_the_deadline(make):
     lab.resume()
     lab.finish()
     assert len(lab.forge()["merge_calls"]) == 1 and len(lab.hook_calls()) == 1
+
+
+def test_a_record_read_that_outlasts_the_grace_sleeps_no_negative_length(monkeypatch):
+    clock = [100.0]
+    transaction = object.__new__(job_land.Transaction)
+    transaction.state = {
+        "S": "a" * 40,
+        "post_merge_ci": {
+            "status": "observing",
+            "sha": "a" * 40,
+            "bots": [],
+            "started_at": 100.0,
+            "deadline": 200.0,
+            "entry": 0,
+        },
+    }
+    reads, sleeps, saved = [], [], []
+
+    def current():
+        # The entry read comes first; the wait's own read outlasts the grace.
+        if reads:
+            clock[0] += 30.0
+        reads.append(clock[0])
+        return SimpleNamespace(events=())
+
+    transaction.current = current
+    transaction.save = lambda **changes: saved.append(changes)
+    transaction.repo = SimpleNamespace()
+    transaction.api = SimpleNamespace(
+        inspect_merged_ci=lambda *args, **kwargs: SimpleNamespace(state="pending", evidence=())
+    )
+    monkeypatch.setattr(job_land.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+    monkeypatch.setattr(job_land.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    transaction.post_merge_ci()
+
+    # A negative length raised ValueError, which run_land reports as land_interrupted.
+    assert all(seconds >= 0 for seconds in sleeps)
+    assert saved[0] == {}
+    assert saved[-1]["post_merge_ci"]["status"] == "none"
 
 
 # --- L9: install -----------------------------------------------------------------------------
