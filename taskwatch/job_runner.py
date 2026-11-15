@@ -712,11 +712,20 @@ def _text_lines(job: JobState, review_root: Path) -> list[str]:
     for unit in job.public_text:
         state = job.texts.get(unit["id"], {})
         base, head = state.get("base", unit["base"]), state.get("head", unit["head"])
+        published = (
+            " This unit lands by squash: the step commit messages under commits/ are not "
+            "published, so they stay in the snapshot as context only, a defect that exists only "
+            "in one is not a finding, and the published text to judge is title.txt, body.md and "
+            "commit.txt."
+            if job.land
+            else ""
+        )
         lines.append(
             f"Unit {unit['id']} (text_contract=2): review title.txt, body.md, commit.txt "
             f"(final squash body), and the separate step messages under commits/ in "
             f"{review_root / job_text.SNAPSHOT / unit['id']}; "
             f"judge each claim against `git diff {base} {head}` and `git log {base}..{head}`."
+            + published
             + (
                 " The unit declares a blank squash body: commit.txt must be blank and the squash "
                 "message is the title alone; the body must never be inferred from the step "
@@ -1276,6 +1285,8 @@ def _squash_problems(ctx: Ctx) -> list[str]:
                 rules.append("commit.txt must be blank: the unit declares a blank squash body")
         elif not commit.strip():
             rules.append("commit.txt must contain the final squash body")
+        if job_text.repeats_title(title, commit):
+            rules.append(job_text.TITLE_REPEATED)
         problems += [f"public text {unit['id']}: squash message: {p}" for p in rules]
     return problems
 

@@ -12,7 +12,7 @@ import subprocess
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from . import forge, job_findings, job_text, job_workspace
 from .checks import message_problems
@@ -21,6 +21,12 @@ from .jobs import _json_value
 MAX_BASE_UPDATES = 3
 # premerge: the base moved, so publication, CI and the bot gate run again under one bound.
 BASE_UPDATED = object()
+# A body link to a commit that exists only locally, which never reaches GitHub. Quotes and
+# angle brackets around the URL (HTML src, angle-bracketed Markdown) are not part of the path.
+BODY_LINK = re.compile(
+    r"https://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/(?P<kind>blob|raw)/(?P<sha>[0-9a-f]{7,40})/"
+    r"(?P<path>[^\s?#)\"'<>]+)(?P<suffix>[?#][^\s)\"'<>]*)?"
+)
 
 
 class LandStop(Exception):
@@ -182,7 +188,8 @@ class Transaction:
         if code:
             raise LandStop("land_review_stale", "reviewed snapshot cannot be copied")
         self.title = (copy / "title.txt").read_bytes().decode().rstrip("\n")
-        self.body = (copy / "body.md").read_bytes().decode()
+        self.reviewed_body = (copy / "body.md").read_bytes().decode()
+        self.body = self.reviewed_body
         self.commit_file = copy / "commit.txt"
         self.body_file = copy / "body.md"
         self.commit = self.commit_file.read_bytes().decode()
@@ -223,6 +230,7 @@ class Transaction:
                 },
             )
         self.repo = repo
+        self.rewrite_body_links()
         if "base_update_enabled" not in self.state:
             self.save(base_update_enabled=bool(self.ctx.config.land_base_update))
 
@@ -919,6 +927,7 @@ class Transaction:
             metadata = self.git("show", "-s", "--format=raw", head)
             self.save(H=head, commit_metadata=metadata, phase="head")
         head = self.state["H"]
+        self.rewrite_body_links()
         if self.git("rev-parse", f"{head}^{{tree}}") != self.state["T"] or self.git(
             "rev-list", "--parents", "-n", "1", head
         ).split() != [head, self.state.get("head_parent", self.state["M"])]:
@@ -934,6 +943,54 @@ class Transaction:
             self.git("push", target, f"{head}:refs/heads/{self.state['branch']}")
         self.save(pushed=True)
 
+    def rewrite_body_links(self):
+        """Publish a link to a reviewed commit at H only when H holds the same blob.
+
+        GitHub renders blob and raw links only for commits it has, and the squash discards the
+        reviewed commits. The reviewed body and its digest stay unchanged: only the bytes the PR
+        API reads change, and `body_rewrites` records how many links moved.
+        """
+        head = self.state.get("H")
+        if not head:
+            return
+        reviewed = set(self.git("rev-list", f"{self.state['B']}..{self.state['R']}").split())
+        identity = f"{self.repo.owner}/{self.repo.name}".lower()
+        count = 0
+
+        def blob(commit, path):
+            try:
+                return self.git("rev-parse", "--verify", "--quiet", f"{commit}:{path}")
+            except subprocess.CalledProcessError:
+                return ""
+
+        def published(match):
+            nonlocal count
+            if match["repo"].lower() != identity:
+                return match[0]
+            try:
+                commit = self.git("rev-parse", "--verify", "--quiet", f"{match['sha']}^{{commit}}")
+            except subprocess.CalledProcessError:
+                return match[0]
+            if commit not in reviewed:
+                return match[0]
+            path = unquote(match["path"])
+            same = blob(commit, path)
+            if not same or same != blob(head, path):
+                return match[0]
+            count += 1
+            url = (
+                f"https://github.com/{self.repo.owner}/{self.repo.name}/"
+                f"{match['kind']}/{head}/{match['path']}"
+            )
+            return url + (match["suffix"] or "")
+
+        body = BODY_LINK.sub(published, self.reviewed_body)
+        if body != self.body:
+            self.body = body
+            self.body_file.write_text(body, encoding="utf-8")
+        if self.state.get("body_rewrites") != count:
+            self.save(body_rewrites=count)
+
     def validate_pr(self, pr):
         if (
             pr.head_sha != self.state["H"]
@@ -946,21 +1003,25 @@ class Transaction:
             raise LandStop("land_pr_mismatch", "PR identity, state or reviewed publication differs")
         return pr
 
-    def edit_republished_pr(self):
+    def edit_published_pr(self):
+        """Write the current title and body to a published PR when its bytes differ."""
         intent = self.state.get("republish", {})
-        if not intent or not intent.get("head") or not self.state.get("pr"):
+        old = self.state.get("published_text", {})
+        if not self.state.get("pr") or not old or (intent and not intent.get("head")):
+            return
+        # A body that did not change needs no edit, but a republish still waits for the new head.
+        if old.get("title") == self.title and old.get("body") == self.body and not intent:
             return
         deadline = time.monotonic() + 60
         while True:
             pr = self.api.read_pull_request(self.repo, self.state["pr"]["number"], None)
             if pr.head_sha == self.state["H"]:
                 break
-            if pr.head_sha != intent["from"] or time.monotonic() >= deadline:
+            if pr.head_sha != intent.get("from") or time.monotonic() >= deadline:
                 raise LandStop("land_pr_mismatch", "republished PR head was not observed")
             self.wait(2)
         if pr.title == self.title and pr.body == self.body:
             return
-        old = self.state.get("published_text", {})
         if pr.title != old.get("title") or pr.body != old.get("body"):
             raise LandStop("land_pr_mismatch", "PR text differs from previously published bytes")
         entry = resume_entry(self.current())
@@ -1474,18 +1535,20 @@ class Transaction:
         self.post_answers()
         self.prepare_republish()
         while True:
+            published_body = (self.state.get("published_text") or {}).get("body")
             if (
                 not self.state.get("S")
                 and self.state.get("H")
                 and not self.state.get("republish")
                 and not self.pending_base_update()
+                and published_body in (None, self.body)
             ):
                 self.pull_request(create=False)
             if not self.state.get("S") and not self.state.get("merge_intent"):
                 self.base_guard()
                 self.head()
                 self.observe_base_update()
-                self.edit_republished_pr()
+                self.edit_published_pr()
                 self.pull_request()
             if not self.state.get("S"):
                 if not self.state.get("merge_intent"):

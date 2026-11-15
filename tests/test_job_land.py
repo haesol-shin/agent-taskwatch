@@ -709,7 +709,7 @@ class Lab(Env):
     def write_text(self, name: str, text: str) -> None:
         (self.folder() / "pr" / "pr" / name).write_text(text, encoding="utf-8")
 
-    def accept(self, extra: dict[str, str] | None = None) -> None:
+    def accept(self, extra: dict[str, str] | None = None, *, body: str = "body\n") -> None:
         """Build one commit, pass the check and the review; a landing job is then in `land`."""
         assert self.run("check") == 0  # creates the work folder; nothing is built yet
         for name, text in GOOD_FILES.items():
@@ -729,6 +729,7 @@ class Lab(Env):
             path.write_text(text, encoding="utf-8")
         git(self.tree, "add", "-A")
         git(self.tree, "commit", "-m", "feat(x): add\n\nWhy it is needed.")
+        self.write_text("body.md", body.format(result=git(self.tree, "rev-parse", "HEAD")))
         self.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
         assert self.run("check") == 0
         assert list(self.get().checks[-1]["problems"]) == []
@@ -850,6 +851,50 @@ def test_accepted_result_becomes_one_head_pr_squash_install_and_card(make):
     assert [(c["argv"], c["tty"]) for c in hook] == [(["install", squash, target], False)]
     assert hook[0]["cwd"] == target
     assert len(lab.cards()) == 1 and [d["status"] for d in job.deliveries] == ["success"]
+
+
+def test_a_body_link_to_a_reviewed_commit_is_published_at_the_pushed_head(make):
+    lab = make()
+    base = git(lab.repo, "rev-parse", "main")
+    lab.accept(
+        extra={"docs/shot.png": "png\n"},
+        body=(
+            "![shot](https://github.com/sample/project/blob/{result}/docs/shot.png?raw=true)\n\n"
+            f"![outside](https://github.com/sample/project/blob/{base}/docs/shot.png)\n\n"
+            "![missing](https://github.com/sample/project/blob/{result}/docs/none.png)\n"
+        ),
+    )
+    result = git(lab.tree, "rev-parse", "HEAD")
+    reviewed = lab.reviewed_text()["body.md"]
+    assert f"blob/{result}/docs/shot.png" in reviewed
+    lab.finish()
+    state = lab.land()
+    head = state["H"]
+    expected = reviewed.replace(f"blob/{result}/docs/shot.png", f"blob/{head}/docs/shot.png")
+    assert state["body_rewrites"] == 1 and expected.count(f"/{head}/") == 1
+    assert f"blob/{base}/docs/shot.png" in expected
+    assert f"blob/{result}/docs/none.png" in expected
+    assert lab.forge()["pulls"]["17"]["body"] == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '<img src="https://github.com/sample/project/blob/{result}/docs/shot.png">\n',
+        "![shot](<https://github.com/sample/project/blob/{result}/docs/shot.png>)\n",
+    ],
+)
+def test_a_wrapped_body_link_is_published_at_the_pushed_head(make, body):
+    lab = make()
+    lab.accept(extra={"docs/shot.png": "png\n"}, body=body)
+    result = git(lab.tree, "rev-parse", "HEAD")
+    reviewed = lab.reviewed_text()["body.md"]
+    lab.finish()
+    state = lab.land()
+    head = state["H"]
+    expected = reviewed.replace(f"blob/{result}/docs/shot.png", f"blob/{head}/docs/shot.png")
+    assert state["body_rewrites"] == 1
+    assert lab.forge()["pulls"]["17"]["body"] == expected
 
 
 def test_a_declared_blank_squash_body_lands_with_the_title_alone(make):
@@ -1163,6 +1208,27 @@ def test_default_branch_moving_during_ci_updates_the_same_publication(make):
     assert git(lab.bare, "rev-parse", f"{state['H']}^{{tree}}") == state["T"]
     assert state["tree_verified"] is True and state["S"]
     assert state["pr"]["number"] == 17 and len(lab.forge()["created"]) == 1
+    assert lab.writes() == ["pr create", "pr merge"]
+
+
+def test_a_base_update_republishes_body_links_at_the_new_head(make):
+    lab = make(window=30)
+    lab.accept(
+        extra={"docs/shot.png": "png\n"},
+        body="![shot](https://github.com/sample/project/blob/{result}/docs/shot.png)\n",
+    )
+    result = git(lab.tree, "rev-parse", "HEAD")
+    reviewed = lab.reviewed_text()["body.md"]
+    lab.edit(advance_main_on_ci=1, follow_branch=True)
+    lab.finish()
+    state = lab.land()
+    update = state["base_updates"][0]
+    old, head = update["from_head"], state["H"]
+    assert head != old
+    expected = reviewed.replace(f"blob/{result}/", f"blob/{head}/")
+    assert lab.forge()["pulls"]["17"]["body"] == expected
+    assert state["published_text"]["body"] == expected and f"/{old}/" not in expected
+    assert sum(call[:2] == ["pr", "edit"] for call in lab.forge_calls()) == 1
     assert lab.writes() == ["pr create", "pr merge"]
 
 

@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from taskwatch import job_cli
+from taskwatch import job_cli, job_runner, job_text
 from taskwatch.checks import message_problems
+from taskwatch.job_env import job_environment
 from taskwatch.jobs import Jobs
 from tests.git_fixture import git, make_repo
 from tests.spec_fixture import VALID_SPEC
@@ -326,6 +327,16 @@ def test_invalid_squash_body_cannot_reach_review(unit_env, body):
     assert unit_env.get().stage == "fix" and unit_env.get().reviews == ()
 
 
+def test_a_commit_body_that_repeats_the_title_cannot_reach_review(unit_env):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    unit_env.write_text("commit.txt", "feat(x): add\n\n- Preserve the complete result\n")
+    problems = unit_env.problems()
+    assert len(problems) == 1 and "remove the title from commit.txt" in problems[0]
+    assert unit_env.get().stage == "fix" and unit_env.get().reviews == ()
+    with pytest.raises(ValueError, match="remove the title from commit.txt"):
+        job_text.collect(unit_env.get(), unit_env.tree, unit_env.folder(), job_environment({}))
+
+
 def test_blank_squash_body_is_an_error_unless_declared(unit_env):
     unit_env.commit("feat(x): add\n\nWhy.")
     unit_env.write_text("commit.txt", "")
@@ -401,6 +412,15 @@ def test_a_good_unit_reaches_review(unit_env):
     unit_env.commit("feat(x): add\n\nWhy it is needed.")
     assert unit_env.problems() == []
     assert unit_env.get().stage == "review"
+
+
+def test_a_squash_unit_reviews_the_published_text_not_the_step_messages(unit_env, tmp_path):
+    unit_env.commit("feat(x): add\n\nWhy.")
+    kept = job_runner._text_lines(unit_env.get(), tmp_path)[1]
+    assert "step messages under commits/" in kept and "not a finding" not in kept
+    squash = job_runner._text_lines(replace(unit_env.get(), land=True), tmp_path)[1]
+    assert "not published" in squash and "not a finding" in squash
+    assert "title.txt, body.md and commit.txt" in squash
 
 
 def test_a_failing_message_rule_goes_to_the_fix_round_without_a_review(unit_env):

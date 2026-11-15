@@ -44,13 +44,13 @@ Configured landing bots follow the canonical [Review bots policy](configuration.
 
 [Configuration](configuration.md#public-text) owns the submission shape, complete-result range and exact worker grants; this section owns the generated evidence and copy contract.
 
-The check requires nonblank `title.txt`, `body.md` and body-only `commit.txt`; the title must be one subject line, and the title and squash body must be UTF-8. A unit that declares `blank_squash_body` in [configuration](configuration.md#public-text) inverts the last requirement: `commit.txt` must exist and be blank, and a nonblank file fails the check. Without the declaration a blank `commit.txt` stays an error. The squash body explains the problem or reason for the change rather than replacing it with a commit list, review process or test log.
+The check requires nonblank `title.txt`, `body.md` and body-only `commit.txt`; the title must be one subject line, the first nonblank line of `commit.txt` must not repeat it, and the title and squash body must be UTF-8. A unit that declares `blank_squash_body` in [configuration](configuration.md#public-text) inverts the last requirement: `commit.txt` must exist and be blank, and a nonblank file fails the check. Without the declaration a blank `commit.txt` stays an error. The squash body explains the problem or reason for the change rather than replacing it with a commit list, review process or test log.
 
 Each new checked or reviewed publication state carries generated integer `text_contract: 2`, resolved base and head, the head tree and its text fingerprint.
 
 The text fingerprint binds the title, pull request body, squash body and ordered step commit messages; the single generated `Review evidence:` line in the pull request body is excluded.
 
-The review reads a read-only snapshot containing the three texts and the step commit messages, and the record retains the snapshot digest and publication state.
+The review reads a read-only snapshot containing the three texts and the step commit messages, and the record retains the snapshot digest and publication state. For a unit that lands by squash the step commit messages are context only, never published text.
 
 A changed title, pull request body, squash body or step commit message invalidates an earlier PASS; when the code is unchanged, the next round receives the text diff as a text-only review.
 

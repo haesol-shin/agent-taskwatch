@@ -61,7 +61,7 @@ Use these rules when the assignment names public text: the step commit messages,
 
 **K-16.** A statement about what is not in the diff, a draft, or history is a finding, unless the change needs it for a merge decision.
 
-**K-17.** The runner checks the step and proposed squash message subject shape and length, blank line, line length and trailers before the review. Do not judge them. Every other text rule of the repository stays with you, as part of the repository conventions rule of the common guidelines; review the mandatory squash body for its explanation of the problem or reason for the change.
+**K-17.** The runner checks the step and proposed squash message subject shape and length, blank line, line length and trailers before the review. Do not judge them. Every other text rule of the repository stays with you, as part of the repository conventions rule of the common guidelines; review the mandatory squash body for its explanation of the problem or reason for the change. When the unit lands by squash, the step commit messages under `commits/` are not published: they stay in the snapshot as context, and a defect that exists only in one is not a finding. Judge the title, the body and `commit.txt`. A unit that keeps its commits keeps its step messages as public text.
 
 **K-18.** The pull request body states the known limits of the change, and a missing limit is P2. It carries the evidence the repository's contributing rules ask for, and missing evidence is P3. Evidence belongs in that body, not in the squash body as a substitute for explaining why the change is needed.
 
