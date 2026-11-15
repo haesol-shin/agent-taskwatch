@@ -131,7 +131,11 @@ class Transaction:
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             self.current()
-            time.sleep(min(15, end - time.monotonic()))
+            # Reading the record can outlast a short deadline; the remaining time is clamped
+            # to zero, so a passed deadline saves and returns instead of sleeping a negative.
+            remaining = max(0, end - time.monotonic())
+            if remaining:
+                time.sleep(min(15, remaining))
             self.save()
 
     def freshness(self):
@@ -1348,13 +1352,15 @@ class Transaction:
         squash = self.state["S"]
         try:
             contains = self.git("merge-base", "--is-ancestor", squash, main) == ""
+            # Another change may land after S, so the default branch tip is not T; S must be.
             same = self.git("rev-parse", f"{squash}^{{tree}}") == self.state["T"]
-            same = same and self.git("rev-parse", f"{main}^{{tree}}") == self.state["T"]
         except subprocess.SubprocessError:
             contains = False
             same = False
         if not contains or not same:
-            raise LandStop("land_tree_mismatch", "merged/default tree differs from publication")
+            raise LandStop(
+                "land_tree_mismatch", "merged commit is absent from the default branch or differs"
+            )
         self.save(tree_verified=True, phase="verified")
 
     def post_merge_ci(self):
