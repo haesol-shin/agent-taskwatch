@@ -562,6 +562,19 @@ class Transaction:
         )
         return remote.split()[0] if remote else None
 
+    def owned_heads(self):
+        """Publication heads this job created, which a rewrite may replace."""
+        republish = self.state.get("republish") or {}
+        update = self.state.get("base_update") or {}
+        heads = [
+            self.state.get("H"),
+            republish.get("from"),
+            republish.get("head"),
+            update.get("head"),
+            *(record.get("head") for record in self.state.get("base_updates", ())),
+        ]
+        return {head for head in heads if head}
+
     def pending_base_update(self):
         update = self.state.get("base_update") or {}
         if (
@@ -615,10 +628,12 @@ class Transaction:
             self.observe_base_update()
         base = self.state["B"]
         tree = self.updated_merge(self.state["R"], main)
+        previous = self.state.get("H")
         published = self.publication_head()
+        if published is not None and published not in self.owned_heads():
+            raise LandStop("land_head_changed", "publication branch belongs to a different head")
         if published is None and (self.state.get("pushed") or self.state.get("pr")):
             raise LandStop("land_head_changed", "publication branch disappeared")
-        previous = self.state.get("H")
         head = self.git(
             "commit-tree", tree, "-p", main, stdin=job_text.squash_message(self.title, self.commit)
         )
@@ -666,7 +681,11 @@ class Transaction:
             return
         if remote_head is None and not update.get("published", False):
             lease = []
-        elif remote_head is not None and remote_head == update.get("from"):
+        elif (
+            remote_head is not None
+            and remote_head == update.get("from")
+            and remote_head in self.owned_heads()
+        ):
             lease = [f"--force-with-lease={branch}:{remote_head}"]
         elif remote_head is None:
             raise LandStop("land_head_changed", "publication branch disappeared")

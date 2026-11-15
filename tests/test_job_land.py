@@ -1168,6 +1168,24 @@ def test_first_push_interrupted_before_a_move_updates_the_base(make):
     assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
 
 
+def test_foreign_head_after_an_interrupted_first_push_is_not_overwritten(make):
+    lab = make(window=30)
+    lab.accept()
+    lab.trap("before:push")
+    lab.scan_once()
+    lab.service.wait()
+    head = lab.land()["H"]
+    main = lab.advance_remote_file("external.txt")
+    foreign = git(lab.bare, "commit-tree", f"{main}^{{tree}}", "-p", main, "-m", "foreign")
+    git(lab.bare, "update-ref", f"refs/heads/{lab.get().branch}-land", foreign)
+    job = lab.park("land_head_changed")
+    assert job.error == "publication branch belongs to a different head"
+    assert job.land_state["H"] == head
+    assert "base_updates" not in job.land_state
+    assert lab.remote_land_branch() == foreign
+    assert lab.writes() == [] and lab.hook_calls() == []
+
+
 def test_saved_update_push_is_reconciled_before_a_new_move(make):
     lab = make(window=30)
     lab.accept()
