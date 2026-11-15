@@ -176,6 +176,7 @@ class JobConfig:
     install_commands: Mapping[str, tuple[str, ...]] | None = None
     review_bots: Mapping[str, tuple[str, ...]] | None = None
     review_bot_wait: int = 600
+    land_base_update: bool = True
     check_slots: int | None = None  # None: every check command may run at once
 
     def __post_init__(self) -> None:
@@ -287,6 +288,12 @@ def _check_slots(value: object) -> int:
     return value
 
 
+def _land_base_update(value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError("land_base_update must be true or false")
+    return value
+
+
 def _worker_roles(value: object) -> tuple[str, ...] | None:
     """The roles a job may name; absent and empty both allow none."""
     if value is None:
@@ -317,6 +324,7 @@ def load_job_config(root: Path) -> JobConfig:
         "private_tmp",
         "review_bots",
         "review_bot_wait",
+        "land_base_update",
         "check_slots",
     } != {
         "version",
@@ -366,6 +374,7 @@ def load_job_config(root: Path) -> JobConfig:
     if type(private_tmp) is not bool:
         raise ValueError("private_tmp must be true or false")
     review_bot_wait = _review_bot_wait(obj.get("review_bot_wait", 600))
+    land_base_update = _land_base_update(obj.get("land_base_update", True))
     check_slots = _check_slots(obj["check_slots"]) if "check_slots" in obj else None
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
@@ -394,6 +403,7 @@ def load_job_config(root: Path) -> JobConfig:
         _install_commands(obj["install_commands"]) if "install_commands" in obj else None,
         _review_bots(obj.get("review_bots")),
         review_bot_wait,
+        land_base_update,
         check_slots,
     )
 

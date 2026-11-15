@@ -340,6 +340,7 @@ def _init(root: Path, unit_dir: Path | None) -> dict:
     data.pop("install_commands")
     data.pop("review_bots")
     data.pop("review_bot_wait")
+    data.pop("land_base_update")
     data.pop("worker_mode")
     data.pop("worker_command")
     data.pop("worker_roles")
