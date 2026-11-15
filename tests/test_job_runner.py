@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from taskwatch import job_runner, review_docs
 from taskwatch.fingerprint import files_fingerprint, head_sha
 from taskwatch.job_rpc import FrameDecoder, RpcError
 from taskwatch.job_runner import run_job
+from taskwatch.job_scan import scan_jobs
 from taskwatch.jobs import JobConfig, Jobs, JobState
 from taskwatch.rate_limit import RateLimit
 from tests.git_fixture import make_repo
@@ -500,6 +502,88 @@ def test_waiting_for_a_slot_is_outside_the_check_timeout(env, tmp_path):
     assert problems == [] and record["exit_code"] == 0
 
 
+def test_a_slot_wait_longer_than_the_stall_limit_is_not_a_stall(env):
+    env.seed({})
+    env.put("work")
+    ctx = _slot_ctx(env, 1, stall_seconds=3)
+    before = ctx.job.evidence_at
+    fd = []
+    holder = _hold_slot(ctx)
+    thread = threading.Thread(target=lambda: fd.append(job_runner._acquire_slot(ctx)))
+    try:
+        thread.start()
+        beats = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(beats) < 2:
+            seen = env.get().evidence_at
+            if seen != before and (not beats or seen != beats[-1]):
+                beats.append(seen)
+            time.sleep(0.05)
+        assert len(beats) >= 2, "the wait refreshed the evidence at most once"
+        service = _ActiveUnit()
+        scan_jobs(
+            env.jobs,
+            replace(env.config, check_slots=1, stall_seconds=3),
+            now=time.time() + 2.5,
+            boot_id="boot-a",
+            service=service,
+        )
+        assert env.get().stall_suspected is False and service.stopped == []
+    finally:
+        _kill(holder)
+        thread.join(10)
+        for handle in fd:
+            job_runner._release_slot(handle)
+    assert len(fd) == 1 and fd[0] is not None
+
+
+@pytest.mark.parametrize(
+    "change", [{"stage": "cancelled"}, {"attempt": 2}], ids=["cancelled", "replaced"]
+)
+def test_a_stale_wait_never_runs_the_check(env, tmp_path, change):
+    env.seed({})
+    env.put("work")
+    marker = tmp_path / "ran.txt"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"]
+    # A long stall limit means no beat can notice this: the slot frees and the old wait must
+    # still refuse to run the command it queued.
+    ctx = _slot_ctx(env, 1, command, stall_seconds=600)
+    outcome = []
+
+    def run() -> None:
+        try:
+            outcome.append(job_runner._run_command(ctx, tmp_path / "check.log"))
+        except job_runner.StaleAttempt as exc:
+            outcome.append(exc)
+
+    holder = _hold_slot(ctx)
+    thread = threading.Thread(target=run)
+    try:
+        thread.start()
+        env.jobs.save(replace(env.get(), **change), 3000.0)
+        _kill(holder)
+        thread.join(10)
+    finally:
+        _kill(holder)
+        thread.join(10)
+    assert len(outcome) == 1 and isinstance(outcome[0], job_runner.StaleAttempt)
+    assert not marker.exists()
+
+
+class _ActiveUnit:
+    """The service of a running unit. Stopping it is a stall, which this test rules out."""
+
+    def __init__(self) -> None:
+        self.stopped: list[str] = []
+
+    def status(self, unit: str) -> str:
+        return "active"
+
+    def stop(self, unit: str) -> bool:
+        self.stopped.append(unit)
+        return True
+
+
 def test_no_check_slots_leaves_the_host_unlimited(env):
     assert job_runner._acquire_slot(_slot_ctx(env, None)) is None
     assert not (env.jobs.state.dir / "check-slots").exists()
@@ -856,9 +940,7 @@ def test_code_job_check_reuses_the_agents_run_on_the_committed_result(tmp_path, 
     assert job.checks[-1]["reused_precheck"] is True
 
 
-def test_code_review_message_names_the_check_record_as_the_full_suite_evidence(
-    tmp_path, monkeypatch
-):
+def test_code_review_message_states_the_check_that_ran(tmp_path, monkeypatch):
     repo = make_repo(tmp_path, "repo")
     env = Env(tmp_path, monkeypatch, review="code", target=repo)
     env.scenario(
@@ -871,9 +953,26 @@ def test_code_review_message_names_the_check_record_as_the_full_suite_evidence(
     assert env.run("check") == 0
     assert env.run("review") == 0
     message = env.prompts()[1]
-    assert "The check step ran the full suite once for this result" in message
+    record = env.get().checks[-1]
+    assert f"Check command: {shlex.join(env.get().check_command)}" in message
+    assert f"Check record: exit status {record['exit_code']}, log {record['log']}" in message
     assert "check older than that fingerprint is not evidence" in message
-    assert "do not run the full suite again" in message
+    assert "full suite" not in message
+
+
+def test_review_message_for_a_true_check_names_that_command(env):
+    job = replace(
+        env.get(),
+        review="code",
+        check_command=("true",),
+        fingerprint="a" * 40,
+        checks=({"seq": 1, "exit_code": 0, "log": "/evidence/check-1.log"},),
+    )
+    ctx = job_runner.Ctx(env.jobs, env.config, job, env.folder(), env.folder() / "work")
+    message = "\n".join(job_runner._subject_lines(ctx))
+    assert "Check command: true" in message
+    assert "Check record: exit status 0, log /evidence/check-1.log" in message
+    assert "full suite" not in message
 
 
 def test_stale_attempt_cannot_create_worktree_before_base_intent_is_saved(tmp_path, monkeypatch):
