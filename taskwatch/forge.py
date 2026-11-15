@@ -6,8 +6,10 @@ repository/head/base identity before another write. Merge exit zero is not merge
 observe_merge returns the actual squash SHA. GitHub's head guard does not atomically pin
 base. CI covers required contexts and every check, status and PR workflow registered for
 the exact head, using latest attempts. Path-filter-suppressed workflows are undiscoverable.
-No empty, missing, skipped, cancelled or unknown evidence is green. No runner integration
-or gh dependency is imposed on jobs that do not import and use this module.
+Completed `neutral` and `skipped` check and workflow-run conclusions pass as they do for
+GitHub's required checks; empty, missing, cancelled, failed or unknown evidence is never
+green, and green still needs one successful workflow run. No runner integration or gh
+dependency is imposed on jobs that do not import and use this module.
 """
 
 from __future__ import annotations
@@ -93,6 +95,10 @@ class CIEvidence:
     suite_id: int | None = None
 
 
+# GitHub admits these completed conclusions for a required check; anything else blocks.
+PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+
+
 @dataclass(frozen=True)
 class CI:
     head_sha: str
@@ -107,9 +113,20 @@ class CI:
             for e in self.evidence
         ):
             return "pending"
-        if any(e.status != "completed" or e.conclusion != "success" for e in self.evidence):
+        if any(
+            e.status != "completed"
+            or e.conclusion not in PASSING_CONCLUSIONS
+            # GitHub status contexts have no neutral or skipped state.
+            or (e.kind == "status" and e.conclusion != "success")
+            for e in self.evidence
+        ):
             return "failed"
-        return "success" if any(e.kind == "run" for e in self.evidence) else "missing"
+        # A neutral or skipped run is passing evidence, not proof that CI ran.
+        return (
+            "success"
+            if any(e.kind == "run" and e.conclusion == "success" for e in self.evidence)
+            else "missing"
+        )
 
 
 def _text(value: object) -> str:

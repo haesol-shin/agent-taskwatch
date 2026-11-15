@@ -467,15 +467,18 @@ def test_ci_requires_at_least_one_successful_workflow(forge, kind):
     ("status", "conclusion", "expected"),
     [
         ("completed", "cancelled", "failed"),
-        ("completed", "skipped", "failed"),
+        ("completed", "timed_out", "failed"),
+        ("completed", "action_required", "failed"),
+        ("completed", "stale", "failed"),
+        ("completed", "startup_failure", "failed"),
+        ("completed", "failure", "failed"),
         ("completed", None, "failed"),
-        ("completed", "neutral", "failed"),
         ("in_progress", None, "pending"),
         ("queued", None, "pending"),
         ("requested", None, "pending"),
     ],
 )
-def test_non_successful_registered_evidence_cannot_be_green(
+def test_failing_or_pending_registered_evidence_cannot_be_green(
     forge,
     kind,
     status,
@@ -485,6 +488,32 @@ def test_non_successful_registered_evidence_cannot_be_green(
     row = forge.data["checks" if kind == "check" else "runs"][0][0]
     row.update(status=status, conclusion=conclusion)
     assert forge.ci().state == expected
+
+
+@pytest.mark.parametrize("kind", ["check", "run"])
+@pytest.mark.parametrize("conclusion", ["neutral", "skipped"])
+def test_neutral_and_skipped_conclusions_pass_like_github(forge, kind, conclusion):
+    row = forge.data["checks" if kind == "check" else "runs"][0][0]
+    row.update(conclusion=conclusion)
+    # A passing conclusion is not a successful run: keep one so green can be proven.
+    forge.data["runs"].append([run(forge.head, id=52)])
+    ci = forge.ci()
+    assert ci.state == "success"
+    observed = next(e for e in ci.evidence if e.id == (31 if kind == "check" else 51))
+    assert observed.conclusion == conclusion
+
+
+@pytest.mark.parametrize("conclusion", ["neutral", "skipped"])
+def test_passing_conclusions_without_a_successful_run_are_not_green(forge, conclusion):
+    forge.data["checks"] = [[check(forge.head, conclusion=conclusion)]]
+    forge.data["runs"] = [[run(forge.head, conclusion=conclusion)]]
+    assert forge.ci().state == "missing"
+
+
+@pytest.mark.parametrize("state", ["neutral", "skipped"])
+def test_status_contexts_pass_only_on_success(forge, state):
+    forge.data["statuses"] = [[{"id": 61, "context": "external", "state": state}]]
+    assert forge.ci().state == "failed"
 
 
 def test_optional_workflow_failure_blocks_even_with_required_check_success(forge):

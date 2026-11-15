@@ -1088,7 +1088,15 @@ def test_pr_text_edited_during_ci_blocks_the_merge(make):
         [ci(checks=[check_row()])],
         PENDING,
     ],
-    ids=["empty", "skipped", "cancelled", "optional-check", "optional-status", "no-run", "pending"],
+    ids=[
+        "empty",
+        "skipped-run-only",
+        "cancelled",
+        "optional-check",
+        "optional-status",
+        "no-run",
+        "pending",
+    ],
 )
 def test_ci_that_is_not_fully_green_never_merges(make, script):
     lab = make()
@@ -1096,6 +1104,21 @@ def test_ci_that_is_not_fully_green_never_merges(make, script):
     lab.edit(ci=script)
     lab.park("land_ci_failed")
     assert lab.writes() == ["pr create"] and lab.hook_calls() == [] and lab.cards() == []
+
+
+def test_neutral_and_skipped_conclusions_never_stall_the_merge(make):
+    lab = make()
+    lab.accept()
+    lab.edit(
+        ci=[
+            ci(
+                [run_row(), run_row(52, conclusion="skipped")],
+                checks=[check_row(conclusion="neutral")],
+            )
+        ]
+    )
+    lab.finish()
+    assert lab.writes() == ["pr create", "pr merge"]
 
 
 def test_ci_for_another_head_is_never_green(make):
@@ -1545,7 +1568,7 @@ def test_ci_query_finishing_after_deadline_cannot_accept_green_or_spend_a_rerun(
 
     def observation():
         clock[0] = 111.0
-        return SimpleNamespace(state=observed, evidence=())
+        return SimpleNamespace(state=observed, evidence=()), (), False
 
     transaction.observe_ci = observation
     monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
@@ -1985,6 +2008,7 @@ def test_bot_window_waits_for_late_registration_and_completes_early(
         "bot": {"apps": apps, "head": "a" * 40, "window_end": 600, "wait": 600, "outcome": {}},
     }
     tx.repo = None
+    tx.review_bots = lambda: tuple(tx.state["bot"]["apps"])
     observed = []
     tx.save = lambda **changes: tx.state.update(changes)
 
@@ -2033,6 +2057,7 @@ def test_bot_fallback_never_extends_deadline_or_skips_thread_gate(
         "H": "a" * 40,
         "bot": {"apps": apps, "head": "a" * 40, "window_end": 600, "wait": 600, "outcome": {}},
     }
+    tx.review_bots = lambda: tuple(tx.state["bot"]["apps"])
     tx.save = lambda **changes: tx.state.update(changes)
 
     def wait(seconds):
@@ -2049,6 +2074,62 @@ def test_bot_fallback_never_extends_deadline_or_skips_thread_gate(
     assert seen == [elapsed, elapsed]
     assert tx.state["bot"]["outcome"] == {APP: expected}
     assert tx.state["bot"]["window_end"] == 600
+
+
+def test_an_app_added_after_green_starts_its_window(monkeypatch):
+    clock = [0]
+    tx = object.__new__(job_land.Transaction)
+    tx.repo = None
+    tx.state = {"H": "a" * 40, "bot": {"apps": [], "wait": 600, "outcome": {}}}
+    tx.review_bots = lambda: (APP,)
+    tx.save = lambda **changes: tx.state.update(changes)
+    tx.wait = lambda seconds: pytest.fail("a completed first check needs no wait")
+    tx.bot_findings = lambda: None
+    tx.api = SimpleNamespace(
+        inspect_bot_runs=lambda *args: {APP: [{"status": "completed", "conclusion": "success"}]}
+    )
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+    tx.bot()
+    assert tx.state["bot"]["head"] == "a" * 40
+    assert tx.state["bot"]["window_end"] == 600
+    assert tx.state["bot"]["outcome"] == {APP: "complete"}
+
+
+def test_a_selection_change_reuses_the_existing_bot_window(monkeypatch):
+    clock = [100]
+    tx = object.__new__(job_land.Transaction)
+    tx.repo = None
+    tx.state = {
+        "H": "a" * 40,
+        "bot": {"apps": [APP], "head": "a" * 40, "window_end": 600, "wait": 600, "outcome": {}},
+    }
+    tx.review_bots = lambda: (APP, "second-app")
+    tx.save = lambda **changes: tx.state.update(changes)
+    tx.wait = lambda seconds: pytest.fail("completed checks need no wait")
+    tx.bot_findings = lambda: None
+    tx.api = SimpleNamespace(
+        inspect_bot_runs=lambda *args: {
+            app: [{"status": "completed", "conclusion": "success"}] for app in args[2]
+        }
+    )
+    monkeypatch.setattr(job_land.time, "time", lambda: clock[0])
+    tx.bot()
+    assert tx.state["bot"]["window_end"] == 600
+    assert tx.state["bot"]["outcome"] == {APP: "complete", "second-app": "complete"}
+
+
+def test_a_legacy_green_record_keeps_the_selection_it_observed():
+    tx = object.__new__(job_land.Transaction)
+    tx.state = {"ci_green": "a" * 64, "bot": {"apps": [APP], "threads": {}}}
+    tx.save = lambda **changes: tx.state.update(changes)
+    tx.migrate_green()
+    assert tx.state["ci_green"] == {"digest": "a" * 64, "bots": [APP]}
+    evidence = SimpleNamespace(state="success", evidence=())
+    with pytest.raises(job_land.LandStop) as stopped:
+        tx.green(evidence, (APP,), "saved green CI identity changed")
+    assert stopped.value.reason == "land_ci_failed"
+    tx.green(evidence, ("second-app",), "saved green CI identity changed")
+    assert tx.state["ci_green"]["bots"] == ["second-app"]
 
 
 @pytest.mark.parametrize("late", [False, True])
@@ -2163,7 +2244,7 @@ def test_existing_transaction_without_bot_state_keeps_legacy_behavior(make, monk
         assert "bot" not in lab.land() and lab.get().stage == "deliver_pending"
 
 
-def test_bot_selection_and_deadline_stay_frozen_across_restart_and_config_edit(make, monkeypatch):
+def test_bot_selection_follows_current_config_while_the_wait_stays_frozen(make, monkeypatch):
     with bot_lab(make, monkeypatch) as (lab, tx):
         tx.initialize()
         tx.base_guard()
@@ -2181,7 +2262,100 @@ def test_bot_selection_and_deadline_stay_frozen_across_restart_and_config_edit(m
         # Bot wait is independent of the earlier CI observation deadline.
         restarted.save(ci_deadline=time.time() - 1)
         restarted.ci()
-        assert restarted.state["bot"] == frozen
+        assert restarted.state["bot"]["apps"] == ["other-app"]
+        assert restarted.state["bot"]["wait"] == frozen["wait"]
+        assert restarted.state["ci_bots"] == ["other-app"]
+
+
+def test_a_bot_selection_change_reaches_a_job_already_landing(make, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "ORIGIN", "https://forge.invalid/sample/project.git")
+    monkeypatch.setattr(
+        sys.modules[__name__], "FAKE_GH", FAKE_GH.replace("github.com", "forge.invalid")
+    )
+    monkeypatch.setattr(sys.modules[__name__], "SHIM", SHIM.replace("github.com", "forge.invalid"))
+    lab = make(window=60, install=None)
+    lab.accept()
+    check = check_row(name="review", conclusion="action_required")
+    check["app"] = {"id": 9, "slug": APP}
+    lab.edit(ci=[ci([run_row()], checks=[check])])
+    job = lab.put("land")
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.api.authenticated_hosts = ("forge.invalid",)
+        tx.initialize()
+        tx.base_guard()
+        tx.head()
+        tx.pull_request()
+        assert tx.state["bot"]["apps"] == []
+        # The unregistered review app fails the observation before the owner adds it.
+        with pytest.raises(job_land.LandStop) as stopped:
+            tx.ci()
+        assert stopped.value.reason == "land_ci_failed"
+        lab.configure(review_bots={"forge.invalid/sample/project": [APP]})
+        tx.api.inspect_bot_runs = lambda *args: {
+            APP: [{"status": "completed", "conclusion": "action_required"}]
+        }
+        tx.api.review_threads = lambda *args: []
+        tx.ci()
+        assert tx.state["ci_bots"] == [APP]
+        assert tx.state["ci_green"]["bots"] == [APP]
+        tx.bot()
+        assert tx.state["bot"]["apps"] == [APP]
+        assert tx.state["bot"]["outcome"] == {APP: "fallback:not_success:action_required"}
+
+
+def test_a_bot_added_after_the_gate_is_observed_before_merge(make, monkeypatch):
+    with bot_lab(make, monkeypatch) as (lab, tx):
+        seen = []
+
+        def current():
+            value = () if len(seen) < 2 else (APP,)
+            seen.append(value)
+            return value
+
+        tx.review_bots = current
+        tx.run()
+        assert seen == [(), (), (APP,), (APP,), (APP,)]
+        assert lab.get().stage == "deliver_pending"
+        assert lab.land()["bot"]["outcome"] == {APP: "complete"}
+        assert lab.writes() == ["pr create", "pr merge"]
+
+
+def test_main_moving_during_the_merge_gate_blocks_the_squash(make, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "ORIGIN", "https://forge.invalid/sample/project.git")
+    monkeypatch.setattr(
+        sys.modules[__name__], "FAKE_GH", FAKE_GH.replace("github.com", "forge.invalid")
+    )
+    monkeypatch.setattr(sys.modules[__name__], "SHIM", SHIM.replace("github.com", "forge.invalid"))
+    lab = make(window=60, install=None)
+    lab.configure(review_bot_wait=1)
+    lab.accept()
+    job = lab.put("land")
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.api.authenticated_hosts = ("forge.invalid",)
+        seen, moved = [], []
+
+        def current():
+            value = () if len(seen) < 2 else (APP,)
+            seen.append(value)
+            return value
+
+        def inspect(*args):
+            if not moved:
+                moved.append(1)
+                lab.advance_remote()
+            return {APP: [{"status": "in_progress", "conclusion": None}]}
+
+        tx.review_bots = current
+        tx.api.inspect_bot_runs = inspect
+        tx.api.review_threads = lambda *args: []
+        with pytest.raises(job_land.LandStop) as stopped:
+            tx.run()
+        assert stopped.value.reason == "land_base_moved"
+        assert lab.writes() == ["pr create"]
 
 
 def test_resumed_budget_does_not_repark_retained_deferrals(make, monkeypatch):

@@ -5,6 +5,7 @@ import hashlib
 import json
 import shlex
 import subprocess
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,12 +27,27 @@ def _accepted(job: JobState, review: dict) -> bool:
     return bool(review.get("ok") and review.get("verdict") == "PASS")
 
 
+def _bound_bot_app(review: Mapping, bot: Mapping) -> str | None:
+    """The app a bot observation names, or None when the record is not bound to one."""
+    reviewer = review.get("reviewer")
+    if not isinstance(reviewer, str) or not reviewer.startswith("bot:"):
+        return None
+    app = reviewer[4:]
+    recorded = review.get("bot_apps")
+    if isinstance(recorded, (list, tuple)):
+        return app if app in recorded else None
+    # A record from before the selection was stored: the app was configured then and still
+    # owns a tracked thread. The current list may have changed since.
+    authors = {thread.get("author") for thread in bot.get("threads", {}).values()}
+    return app if app in {*bot.get("apps", ()), *authors} else None
+
+
 def accepted_review(job: JobState):
     """Select the latest actual review; only bound bot observations may be skipped."""
     if not job.reviews:
         return {}
     bot = job.land_state.get("bot", {})
-    if not (job.land and job.review == "code" and bot.get("apps")):
+    if not (job.land and job.review == "code"):
         return job.reviews[-1]
     observations = []
     for review in reversed(job.reviews):
@@ -46,7 +62,7 @@ def accepted_review(job: JobState):
         if (
             review.get("bot_observation") is not True
             or type(review.get("accepted_review_seq")) is not int
-            or review.get("reviewer") not in {f"bot:{app}" for app in bot["apps"]}
+            or _bound_bot_app(review, bot) is None
         ):
             return {}
         observations.append(review)

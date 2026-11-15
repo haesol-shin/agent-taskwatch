@@ -674,6 +674,9 @@ def test_literal_json_in_a_configured_sender_is_not_a_placeholder(board: Board):
         "name_only",
         "foreign_app",
         "no_config",
+        "replaced_app",
+        "recorded_apps",
+        "recorded_foreign",
         "newer_fail",
         "no_pass",
     ],
@@ -705,13 +708,25 @@ def test_bot_observations_cannot_replace_actual_code_review(board, control):
         observation["reviewer"] = "bot:other-example"
     elif control == "no_config":
         bot = {}
+    elif control == "replaced_app":
+        observation["reviewer"] = "bot:old-example"
+        bot = {"apps": ["new-example"], "threads": {"t1": {"author": "old-example"}}}
+    elif control == "recorded_apps":
+        observation["reviewer"] = "bot:old-example"
+        observation["bot_apps"] = ["old-example"]
+        bot = {"apps": ["new-example"]}
+    elif control == "recorded_foreign":
+        observation["reviewer"] = "bot:other-example"
+        observation["bot_apps"] = ["old-example"]
+        bot = {"apps": ["new-example"]}
     elif control == "newer_fail":
         records.append({**code, "seq": 4, "ok": False, "verdict": "FAIL"})
     elif control == "no_pass":
         records = [observation]
     job = replace(job, land=True, review="code", reviews=tuple(records), land_state={"bot": bot})
     selected = job_delivery.accepted_review(job)
-    assert bool(selected.get("ok") and selected.get("verdict") == "PASS") == (control == "bound")
+    passes = control in {"bound", "replaced_app", "recorded_apps"}
+    assert bool(selected.get("ok") and selected.get("verdict") == "PASS") == passes
 
 
 @pytest.mark.parametrize("after_merge", [False, True])
