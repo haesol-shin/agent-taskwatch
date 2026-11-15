@@ -908,13 +908,8 @@ class Recorder:
 
     def watch(self) -> None:
         """Raise the abort flag when the job leaves this attempt, even if omp is silent."""
-        ctx = self.ctx
         while not self.done.wait(WATCH_EVERY):
-            try:
-                current = ctx.jobs.load().get(ctx.job.id)
-            except (ValueError, OSError):
-                continue
-            if current is None or current.attempt != ctx.job.attempt or current.stage != ctx.stage:
+            if _stale(self.ctx):
                 self.abort.set()
                 return
 
@@ -954,6 +949,18 @@ def _evidence(ctx: Ctx, event: dict | None = None) -> bool:
         return changes
 
     return _cas(ctx.jobs, ctx.job, {ctx.stage}, build)
+
+
+def _stale(ctx: Ctx) -> bool:
+    """The job left this attempt: another stage, another attempt, or no record.
+
+    Read only, so a wait can ask often without writing. An unreadable record is no proof that
+    the job moved on; the next evidence write and the scan handle that case."""
+    try:
+        current = ctx.jobs.load().get(ctx.job.id)
+    except (ValueError, OSError):
+        return False
+    return current is None or current.attempt != ctx.job.attempt or current.stage != ctx.stage
 
 
 def _schema_path(ctx: Ctx) -> Path:
@@ -1340,7 +1347,9 @@ def _acquire_slot(ctx: Ctx) -> int | None:
     process dies and a killed holder never keeps the host limit. Waiting happens before the
     command starts, so it does not count toward the check timeout. An open attempt refreshes its
     evidence every third of `stall_seconds` while it waits, so a queued check is not a stalled
-    job; the wait ends with StaleAttempt when the job is cancelled or replaced.
+    job. The wait checks the job on each polling interval and once more while it holds the lock,
+    because the slot can free between two beats; a job that was cancelled or replaced releases
+    the slot and stops with StaleAttempt instead of running its check.
     """
     paths = _slot_paths(ctx)
     if not paths:
@@ -1348,7 +1357,9 @@ def _acquire_slot(ctx: Ctx) -> int | None:
     paths[0].parent.mkdir(parents=True, exist_ok=True)
     step = _attempt_open(ctx.job)
     every = ctx.config.stall_seconds / 3
-    beat_at = time.monotonic() + every
+    now = time.monotonic()
+    beat_at = now + every
+    check_at = now + WATCH_EVERY
     while True:
         for path in paths:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -1357,8 +1368,15 @@ def _acquire_slot(ctx: Ctx) -> int | None:
             except BlockingIOError:
                 os.close(fd)
                 continue
+            if step and _stale(ctx):
+                _release_slot(fd)
+                raise StaleAttempt
             return fd
         now = time.monotonic()
+        if step and now >= check_at:
+            if _stale(ctx):
+                raise StaleAttempt
+            check_at = now + WATCH_EVERY
         if step and now >= beat_at:
             if not _evidence(ctx):
                 raise StaleAttempt
