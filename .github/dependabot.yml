@@ -4,3 +4,28 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      python-dev:
+        update-types: [minor, patch]
+
+  - package-ecosystem: bun
+    directory: /examples/omp/taskwatch
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      bun-dev:
+        update-types: [minor, patch]

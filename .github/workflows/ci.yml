@@ -8,19 +8,62 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels the older run. main never cancels, because a
+# release verifies the successful run on the merged commit.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  quality:
+  check-lint:
+    name: "check | lint"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - run: uv sync --locked
       - run: uv run ruff check
       - run: uv run ruff format --check
-      - run: uv run pytest
+
+  check-docs:
+    name: "check | review docs"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --locked
       - run: uv run python scripts/check_review_docs.py
       - run: uv pip install --prefix "$RUNNER_TEMP/installed" .
       - run: uv run python scripts/check_review_docs.py --tree "$RUNNER_TEMP/installed/share"
+
+  test-python:
+    name: "test | python"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --locked
+      - run: uv run pytest
+
+  test-extension:
+    name: "test | omp extension"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --locked
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
@@ -32,3 +75,24 @@ jobs:
         working-directory: examples/omp/taskwatch
       - run: uv run bun run smoke
         working-directory: examples/omp/taskwatch
+
+  # The only job to mark required. A change that adds a job adds it to `needs` here and to
+  # the check below; the name stays `gate | ci` so the required check keeps matching.
+  gate:
+    name: "gate | ci"
+    if: ${{ always() }}
+    needs: [check-lint, check-docs, test-python, test-extension]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every needed job succeeded
+        env:
+          LINT: ${{ needs.check-lint.result }}
+          DOCS: ${{ needs.check-docs.result }}
+          PYTHON: ${{ needs.test-python.result }}
+          EXTENSION: ${{ needs.test-extension.result }}
+        run: |
+          for result in "$LINT" "$DOCS" "$PYTHON" "$EXTENSION"; do
+            echo "$result"
+            [ "$result" = success ] || exit 1
+          done
