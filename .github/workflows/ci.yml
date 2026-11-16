@@ -42,6 +42,20 @@ jobs:
       - run: uv pip install --prefix "$RUNNER_TEMP/installed" .
       - run: uv run python scripts/check_review_docs.py --tree "$RUNNER_TEMP/installed/share"
 
+  check-commits:
+    name: "check | commit messages"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --locked
+      - run: uv run python scripts/check_commit_messages.py --range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
   test-python:
     name: "test | python"
     runs-on: ubuntu-latest
@@ -81,14 +95,16 @@ jobs:
   gate:
     name: "gate | ci"
     if: ${{ always() }}
-    needs: [check-lint, check-docs, test-python, test-extension]
+    needs: [check-lint, check-docs, check-commits, test-python, test-extension]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Fail unless every needed job succeeded
         env:
+          EVENT: ${{ github.event_name }}
           LINT: ${{ needs.check-lint.result }}
           DOCS: ${{ needs.check-docs.result }}
+          COMMITS: ${{ needs.check-commits.result }}
           PYTHON: ${{ needs.test-python.result }}
           EXTENSION: ${{ needs.test-extension.result }}
         run: |
@@ -96,3 +112,9 @@ jobs:
             echo "$result"
             [ "$result" = success ] || exit 1
           done
+          echo "$COMMITS"
+          if [ "$EVENT" = pull_request ]; then
+            [ "$COMMITS" = success ] || exit 1
+          else
+            [ "$COMMITS" = skipped ] || exit 1
+          fi

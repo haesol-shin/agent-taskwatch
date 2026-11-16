@@ -36,7 +36,13 @@ CI enforces the Ruff rules `E`, `F`, `I`, `C901` (max complexity 15) and line le
 
 ## Commits
 
-CI does not check commit messages. The recommended form explains why the code is the way it is; the diff already shows what changed.
+CI checks the shape of every commit in a pull request with `scripts/check_commit_messages.py`. Run the same check locally before you push:
+
+```sh
+uv run python scripts/check_commit_messages.py --range origin/main..HEAD
+```
+
+A `commit-msg` hook can run the script with `--message-file "$1"` to check a message before the commit is made.
 
 - Title: [Conventional Commits](https://www.conventionalcommits.org/), `type(scope): summary` in the imperative, in English, 72 characters or fewer (about 50 is best). No trailers.
 - Body: the problem or the reason for the change, with lines of 72 characters or fewer. A rejected alternative (`Rejected: ...`) helps when another approach looks more natural.
