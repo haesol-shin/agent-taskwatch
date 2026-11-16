@@ -263,13 +263,32 @@ def test_an_ignored_output_is_copied_into_the_job_folder_before_removal(board):
 
 
 def test_an_uncommitted_output_that_cannot_be_copied_keeps_the_worktree(board):
-    job_id, path = settled(board, outputs=[".local/missing.json"])
+    job_id, path = settled(board, outputs=[".local/report.json"])
     commit_in(path, ".gitignore", ".local/\n")
-    (path / ".local").mkdir()
+    (path / ".local" / "report.json").mkdir(parents=True)
     board.finish_step(job_id, "done")
     board.scan()
     job = board.get(job_id)
     assert path.exists() and "could not copy" in job.workspace_state
+
+
+def test_a_dangling_output_link_keeps_the_worktree(board):
+    job_id, path = settled(board, outputs=[".local/report.json"])
+    commit_in(path, ".gitignore", ".local/\n")
+    (path / ".local").mkdir()
+    (path / ".local" / "report.json").symlink_to(path / ".local" / "gone.json")
+    board.finish_step(job_id, "done")
+    board.scan()
+    job = board.get(job_id)
+    assert path.exists() and "could not copy" in job.workspace_state
+
+
+def test_a_declared_output_never_written_does_not_keep_the_worktree(board):
+    job_id, path = settled(board, outputs=[".local/missing.json"])
+    commit_in(path, ".gitignore", ".local/\n")
+    board.finish_step(job_id, "done")
+    board.scan()
+    assert board.get(job_id).workspace_state == "removed" and not path.exists()
 
 
 def test_an_ignored_path_outside_the_tool_caches_keeps_the_worktree(board):

@@ -287,6 +287,8 @@ def _copy_outputs(job: JobState, path: Path, env: Mapping[str, str]) -> str:
     for relative in job.outputs:
         if _git(path, env, "cat-file", "-e", f"HEAD:{relative}").returncode == 0:
             continue
+        if not os.path.lexists(path / relative):
+            continue  # A declared output never written leaves nothing to lose.
         try:
             target = folder / relative
             target.parent.mkdir(parents=True, exist_ok=True)
