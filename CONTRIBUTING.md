@@ -41,6 +41,7 @@ CI does not check commit messages. The recommended form explains why the code is
 - Title: [Conventional Commits](https://www.conventionalcommits.org/), `type(scope): summary` in the imperative, in English, 72 characters or fewer (about 50 is best). No trailers.
 - Body: the problem or the reason for the change, with lines of 72 characters or fewer. A rejected alternative (`Rejected: ...`) helps when another approach looks more natural.
 - Avoid listing files, restating the diff, describing the review process, or pasting test results. Those go in the pull request.
+- Each body bullet gives a reason the diff does not already show. Bad: `- Verify downloaded wheels before extracting the binary`; good: `- Verify wheels before extracting so a swapped mirror file fails early`. Drop the bad one or state its reason; fewer bullets are fine.
 - Maintainers who run jobs with taskwatch may enable stricter commit checks; see [docs/checks.md](docs/checks.md).
 
 Example:
