@@ -249,6 +249,73 @@ def test_dirty_worktree_is_kept_with_the_reason_then_removed_when_clean(board):
     assert board.get(job_id).workspace_state == "removed" and not path.exists()
 
 
+def test_an_ignored_output_is_copied_into_the_job_folder_before_removal(board):
+    job_id, path = settled(board, outputs=[".local/report.json"])
+    commit_in(path, ".gitignore", ".local/\n")
+    (path / ".local").mkdir()
+    (path / ".local" / "report.json").write_text("built\n", encoding="utf-8")
+    board.finish_step(job_id, "done")
+    board.scan()
+    job = board.get(job_id)
+    assert job.workspace_state == "removed" and not path.exists()
+    copied = board.jobs.folder(job) / "outputs" / ".local" / "report.json"
+    assert copied.read_text(encoding="utf-8") == "built\n"
+
+
+def test_an_uncommitted_output_that_cannot_be_copied_keeps_the_worktree(board):
+    job_id, path = settled(board, outputs=[".local/report.json"])
+    commit_in(path, ".gitignore", ".local/\n")
+    (path / ".local" / "report.json").mkdir(parents=True)
+    board.finish_step(job_id, "done")
+    board.scan()
+    job = board.get(job_id)
+    assert path.exists() and "could not copy" in job.workspace_state
+
+
+def test_a_dangling_output_link_keeps_the_worktree(board):
+    job_id, path = settled(board, outputs=[".local/report.json"])
+    commit_in(path, ".gitignore", ".local/\n")
+    (path / ".local").mkdir()
+    (path / ".local" / "report.json").symlink_to(path / ".local" / "gone.json")
+    board.finish_step(job_id, "done")
+    board.scan()
+    job = board.get(job_id)
+    assert path.exists() and "could not copy" in job.workspace_state
+
+
+def test_a_declared_output_never_written_does_not_keep_the_worktree(board):
+    job_id, path = settled(board, outputs=[".local/missing.json"])
+    commit_in(path, ".gitignore", ".local/\n")
+    board.finish_step(job_id, "done")
+    board.scan()
+    assert board.get(job_id).workspace_state == "removed" and not path.exists()
+
+
+def test_an_ignored_path_outside_the_tool_caches_keeps_the_worktree(board):
+    job_id, path = settled(board)
+    commit_in(path, ".gitignore", "build/\n")
+    (path / "build").mkdir()
+    (path / "build" / "report.txt").write_text("result\n", encoding="utf-8")
+    board.finish_step(job_id, "done")
+    board.scan()
+    assert path.exists() and board.get(job_id).workspace_state.startswith("kept: ignored")
+    (path / "build" / "report.txt").unlink()
+    (path / "build").rmdir()
+    board.scan()
+    assert board.get(job_id).workspace_state == "removed" and not path.exists()
+
+
+def test_a_folder_git_does_not_know_is_kept_as_an_orphan(board):
+    job_id = board.add(target="repo")
+    path = board.jobs.folder(board.get(job_id)) / "worktree"
+    path.mkdir()
+    board.set(job_id, workspace=str(path), workspace_state="active")
+    board.finish_step(job_id, "done")
+    board.scan()
+    assert board.get(job_id).workspace_state == "kept: orphan"
+    assert path.exists()
+
+
 def test_live_unit_blocks_cleanup(board):
     job_id, path = settled(board)
     board.scan()

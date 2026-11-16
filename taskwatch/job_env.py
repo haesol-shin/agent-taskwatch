@@ -39,14 +39,22 @@ def _expand_path(value: str, inherited: str, home: str) -> str:
     return os.pathsep.join(entries)
 
 
-def job_environment(config_env: Mapping[str, str], base: Mapping[str, str] | None = None) -> dict:
+def job_environment(
+    config_env: Mapping[str, str],
+    base: Mapping[str, str] | None = None,
+    *,
+    private_tmp: bool = False,
+) -> dict:
     """The inherited environment plus the configured values; no shell runs.
 
     In `PATH`, `~` and `$HOME` expand and `$PATH` stands for the inherited value. Other values
-    are used as written.
+    are used as written. With `private_tmp`, `TMPDIR` is `/tmp` because the step sees its own
+    folder there, so a configured `TMPDIR` cannot point temporary files at a shared folder.
     """
     env = dict(os.environ if base is None else base)
     home = env.get("HOME") or str(Path.home())
     for key, value in config_env.items():
         env[key] = _expand_path(value, env.get("PATH", ""), home) if key == "PATH" else value
+    if private_tmp:
+        env["TMPDIR"] = "/tmp"
     return env
