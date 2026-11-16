@@ -124,7 +124,7 @@ class Ctx:
 
     @property
     def env(self) -> dict[str, str]:
-        return job_environment(self.config.env)
+        return job_environment(self.config.env, private_tmp=self.config.private_tmp)
 
 
 def run_job(jobs: Jobs, config: JobConfig, job_id: str, attempt: int) -> int:
@@ -261,7 +261,13 @@ def _stop(jobs: Jobs, job: JobState, reason: str, message: str, refund: bool = F
 
 def _context(jobs: Jobs, config: JobConfig, job: JobState) -> Ctx:
     folder = jobs.folder(job)
-    workspace, described = _workspace(job, folder, config, job_environment(config.env), jobs)
+    workspace, described = _workspace(
+        job,
+        folder,
+        config,
+        job_environment(config.env, private_tmp=config.private_tmp),
+        jobs,
+    )
     ctx = Ctx(jobs, config, replace(job, workspace=str(workspace), **described), folder, workspace)
     hashes = _prepare(ctx)
     recorded = job.guideline_hashes

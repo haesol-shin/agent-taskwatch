@@ -1,8 +1,10 @@
 """The work folder of a code job: a named branch on a fresh base, and its cleanup.
 
 Every git command runs in the job environment, never prompts, and never uses `--force`. A
-folder with uncommitted or untracked files, or a branch that is not integrated, is kept and
-the reason is recorded; nothing here deletes the job folder, records, reviews or logs.
+folder with uncommitted or untracked files, an ignored path outside the tool caches, an
+uncommitted output that cannot be copied into the job folder, or a branch that is not
+integrated is kept and the reason is recorded; nothing here deletes the job folder, records,
+reviews or logs.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import signal
 import subprocess
 from collections.abc import Mapping
@@ -20,6 +23,18 @@ from .jobs import JobConfig, Jobs, JobState
 FETCH_TIMEOUT = 5.0
 LOCAL_TIMEOUT = 30.0
 FALLBACK_BRANCH = "main"
+# Ignored folders a finished code job may rebuild. Any other ignored path may be a result.
+REBUILDABLE_DIRS = frozenset(
+    {
+        ".local",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+    }
+)
 
 
 class WorkspaceError(Exception):
@@ -226,8 +241,72 @@ def _remove(job: JobState, env: Mapping[str, str]) -> str:
     if not path.exists():
         _git(job.target, env, "worktree", "prune")
         return "removed"
+    listing = _git(job.target, env, "worktree", "list", "--porcelain")
+    if listing.returncode != 0:
+        return f"kept: {_reason(listing.stderr)}"
+    if not _listed(listing.stdout, path):
+        return "kept: orphan"
+    status = _git(path, env, "status", "--porcelain", "--untracked-files=all")
+    if status.returncode != 0:
+        return f"kept: {_reason(status.stderr)}"
+    if status.stdout:
+        return "kept: worktree has modified or untracked files"
+    problem = _copy_outputs(job, path, env)
+    if problem:
+        return f"kept: {problem}"
+    ignored = _git(path, env, "status", "--porcelain", "--ignored=traditional")
+    if ignored.returncode != 0:
+        return f"kept: {_reason(ignored.stderr)}"
+    if stray := _ignored_outside_rebuildable(ignored.stdout):
+        return f"kept: ignored paths outside the tool caches: {stray}"
     proc = _git(job.target, env, "worktree", "remove", os.fspath(path))
-    return "removed" if proc.returncode == 0 else f"kept: {_reason(proc.stderr)}"
+    if proc.returncode != 0:
+        reason = _reason(proc.stderr)
+        return "kept: orphan" if "not a working tree" in reason else f"kept: {reason}"
+    _git(job.target, env, "worktree", "prune")
+    return "removed"
+
+
+def _listed(listing: str, path: Path) -> bool:
+    """Whether git's worktree list holds this path; an orphan folder is not in it."""
+    wanted = path.resolve()
+    for line in listing.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        try:
+            if Path(line[len("worktree ") :]).resolve() == wanted:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _copy_outputs(job: JobState, path: Path, env: Mapping[str, str]) -> str:
+    """Copy each declared output HEAD does not hold into the job folder; '' when all are safe."""
+    folder = path.parent / "outputs"
+    for relative in job.outputs:
+        if _git(path, env, "cat-file", "-e", f"HEAD:{relative}").returncode == 0:
+            continue
+        try:
+            target = folder / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path / relative, target)
+        except OSError as exc:
+            return f"could not copy the uncommitted output {relative}: {exc}"
+    return ""
+
+
+def _ignored_outside_rebuildable(listing: str) -> str:
+    """The first ignored path whose parts hold no rebuildable folder, or ''."""
+    for line in listing.splitlines():
+        if not line.startswith("!! "):
+            continue
+        name = line[3:].strip().strip('"')
+        parts = [part for part in name.rstrip("/").split("/") if part]
+        if any(part in REBUILDABLE_DIRS for part in parts):
+            continue
+        return name
+    return ""
 
 
 def _delete_if_integrated(job: JobState, env: Mapping[str, str], fetched: set[str]) -> str:

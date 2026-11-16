@@ -8,7 +8,6 @@ then launches that next step under a new attempt while the job keeps its slot an
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -17,6 +16,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+from .job_cleanup import PRIVATE_TMP, remove_private_tmp, remove_review_tool_caches
 from .job_delivery import deliver_job, notify_wait
 from .job_env import job_environment
 from .job_workspace import WorkspaceError, repository_key, settle
@@ -40,8 +40,6 @@ WAKE_ACCURACY = "1s"
 # A step writes logs, sessions, git objects and temporary files. Below this much free space a
 # relaunch is likely to die on ENOSPC again, so the scan stops instead of burning a recovery.
 DISK_FLOOR_BYTES = 256 * 1024 * 1024
-# The folder, inside the job folder, that a step sees as /tmp (see `Systemd.start`).
-PRIVATE_TMP = "private-tmp"
 # systemd splits BindPaths on whitespace and ':', and unquotes and unescapes it, so such a
 # path cannot be passed through as is.
 _UNBINDABLE = frozenset(" \t\n:'\"\\")
@@ -153,21 +151,6 @@ class Systemd:
         if proc.returncode != 0 and info.get("LoadState") != "not-found":
             return None
         return info
-
-
-def _remove_tree(path: Path) -> None:
-    """Delete a step's temp folder. A tool can leave read-only folders (module caches), so
-    each is made writable first. What cannot be deleted stays and is retried at the next
-    step end. Symbolic links are never followed."""
-    if path.is_symlink() or not path.is_dir():
-        return
-    os.chmod(path, 0o700)
-    for base, dirs, _ in os.walk(path):
-        for name in dirs:
-            child = Path(base) / name
-            if not child.is_symlink():
-                os.chmod(child, 0o700)
-    shutil.rmtree(path, ignore_errors=True)
 
 
 def _cgroup_empty(cgroup: str) -> bool:
@@ -300,6 +283,7 @@ class _Scan:
         """
         if job.stage not in {"done", "cancelled"} or job.unit:
             return
+        remove_review_tool_caches(self.jobs.folder(job))
         try:
             changes = settle(job, job_environment(self.config.env), self.fetched)
         except (OSError, subprocess.SubprocessError):
@@ -311,7 +295,7 @@ class _Scan:
         """True when the job's whole old service is dead; never assumed, even after a reboot."""
         if self.service.status(job.unit) in DEAD or self.service.stop(job.unit):
             # Nothing in a step's /tmp is evidence, so it goes with the step.
-            _remove_tree(self.jobs.folder(job) / PRIVATE_TMP)
+            remove_private_tmp(self.jobs.folder(job))
             return True
         if job.error != "stop_unconfirmed":
             self._save(replace(job, error="stop_unconfirmed"))

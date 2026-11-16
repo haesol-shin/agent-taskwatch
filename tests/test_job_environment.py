@@ -71,6 +71,24 @@ def test_check_without_the_environment_does_not_see_it(tmp_path, monkeypatch):
     assert env.get().stage == "fix"
 
 
+def _tmpdir_probe(expect: str) -> tuple[str, ...]:
+    code = f"import os, sys; sys.exit(0 if os.environ.get('TMPDIR') == '{expect}' else 1)"
+    return (sys.executable, "-c", code)
+
+
+def test_a_step_with_a_private_tmp_uses_it_as_tmpdir(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    env = Env(tmp_path, monkeypatch)
+    env.config = replace(env.config, env={"TMPDIR": str(shared)})
+    env.seed(GOOD_FILES)
+    assert env.run("check", check_command=_tmpdir_probe("/tmp")) == 0
+    assert env.get().stage == "review"
+    env.config = replace(env.config, private_tmp=False)
+    env.seed(GOOD_FILES)
+    assert env.run("check", check_command=_tmpdir_probe(str(shared))) == 0
+
+
 def test_records_live_in_the_job_folder_and_the_clean_check_needs_no_exception(
     tmp_path, monkeypatch
 ):

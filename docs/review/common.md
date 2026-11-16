@@ -61,7 +61,7 @@ P0 and P1 block. P2 and P3 do not. A rule break is P0 only when it is about runt
 
 **C-14.** If a required input is missing or unreadable, or this folder did not arrive, say the review is incomplete and list what is missing. Never report an incomplete review as a pass.
 
-**C-15.** Do not edit, commit, push, publish, or comment on the deliverable, and do not run a write mode of a command on real data. Read-only inspection is allowed when the assignment permits it. You may run existing tests and read-only commands to confirm or reproduce a finding; run a command that could write files in a temporary copy. An unchecked test run is not a pass and not, by itself, a blocker.
+**C-15.** Do not edit, commit, push, publish, or comment on the deliverable, and do not run a write mode of a command on real data. Read-only inspection is allowed when the assignment permits it. You may run existing tests and read-only commands to confirm or reproduce a finding; run a command that could write files in a temporary copy. Use the host tool caches for builds, tests and installs, and do not point cache or venv paths into the review root; those folders are tool copies, not evidence, and are deleted when the job ends. An unchecked test run is not a pass and not, by itself, a blocker.
 
 ## Repository conventions
 
