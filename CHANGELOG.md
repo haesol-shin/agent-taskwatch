@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Changed
+- A code review judges each body bullet of the step commit messages and the squash body, and asks for the reason or the bullet's removal when it only restates the change ([public text](docs/review/code.md#public-text)).
 - CI runs the same commands in named jobs behind one required `gate | ci` check, so a ruleset can bind to a stable name and a lint or extension failure no longer appears only as a long Python run ([workflow](.github/workflows/ci.yml)).
 - Landing updates a moved default branch automatically when the accepted result and the new commits change disjoint paths: it reruns the job check on the three-way tree, publishes it with parent M, repeats at the merge guard up to three times with a lease-pinned branch update, and parks an overlap, a conflict or a failed check for the owner; `land_base_update: false` turns it off ([base update](docs/configuration.md#base-update)).
 - Landing verifies the merged squash commit's own default-branch push CI before the install hook, records `verified` with the SHA, evidence and install outcome, and parks a failing or unfinished observation as `land_post_merge_failed` where a resume re-observes without another push or merge ([post-merge verification](docs/configuration.md#post-merge-verification)).
