@@ -8,8 +8,8 @@
     "smoke": "bun run smoke.ts"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-coding-agent": "18.14.0",
-    "@types/bun": "1.4.2",
+    "@oh-my-pi/pi-coding-agent": "18.18.3",
+    "@types/bun": "1.4.4",
     "typescript": "5.9.3"
   }
 }
