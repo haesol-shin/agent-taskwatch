@@ -31,7 +31,7 @@ from tests.git_fixture import git, make_repo
 from tests.test_job_delivery import Sender
 from tests.test_job_runner import FAKE, GOOD_FILES, RECORDS, Env
 from tests.test_public_text import code_payload
-from tests.verdicts import CODE_PASS
+from tests.verdicts import CODE_FAIL, CODE_PASS
 
 ORIGIN = "https://github.com/sample/project.git"
 FAKE_GH = r"""
@@ -136,6 +136,7 @@ def row(pr):
         "merge_commit_sha": pr["merge_sha"],
         "mergeable_state": state.get("mergeable", "clean"),
         "auto_merge": None,
+        "draft": bool(pr.get("draft")),
     }
 
 
@@ -185,7 +186,14 @@ def api():
     parsed = urlsplit(endpoint)
     query, path, base = parse_qs(parsed.query), parsed.path, "repos/sample/project"
     if path == base:
-        emit({"full_name": REPO, "default_branch": "main", "allow_squash_merge": state["squash"]})
+        emit(
+            {
+                "full_name": REPO,
+                "default_branch": "main",
+                "allow_squash_merge": state["squash"],
+                "allow_merge_commit": state.get("merge", True),
+            }
+        )
     elif path == base + "/rules/branches/main":
         pages(state["rules"])
     elif path == base + "/branches/main":
@@ -217,7 +225,10 @@ def create():
     if option("--base") != "main":
         fail()
     body = Path(option("--body-file")).read_bytes().decode("utf-8")
-    state.setdefault("created", []).append({"head": option("--head"), "title": option("--title")})
+    draft = "--draft" in args
+    state.setdefault("created", []).append(
+        {"head": option("--head"), "title": option("--title"), "draft": draft}
+    )
     save()
     if take("create_refused"):
         fail()
@@ -234,7 +245,7 @@ def create():
         state["pulls"][str(number)] = {
             "number": number, "head_ref": option("--head"), "head_sha": sha,
             "base_sha": ref("refs/heads/main"), "title": option("--title"), "body": edited,
-            "state": "open", "merged": False, "merge_sha": None,
+            "state": "open", "merged": False, "merge_sha": None, "draft": draft,
         }
     save()
     if take("create_kill_after"):
@@ -247,13 +258,15 @@ def create():
 def merge():
     pr = state["pulls"][args[2]]
     banned = {"--admin", "--auto", "--merge-queue", "--delete-branch"}
-    if "--squash" not in args or option("--match-head-commit") != pr["head_sha"]:
+    methods = {"--squash", "--merge"} & set(args)
+    if len(methods) != 1 or option("--match-head-commit") != pr["head_sha"]:
         fail()
     if banned & set(args):
         fail()
     body = Path(option("--body-file")).read_bytes().decode("utf-8")
     call = {"number": int(args[2]), "subject": option("--subject"), "body": body}
     state.setdefault("merge_calls", []).append(call)
+    state.setdefault("merge_methods", []).append(methods.pop()[2:])
     save()
     if take("merge_refused") or pr["state"] != "open":
         fail()
@@ -265,7 +278,11 @@ def merge():
     if take("merge_extra_file"):
         tree = tree_with_extra(tree)
     parent = ref("refs/heads/main")
-    squash = git("commit-tree", tree, "-p", parent, data=call["subject"] + "\n\n" + body)
+    message = call["subject"] + "\n\n" + body
+    if state["merge_methods"][-1] == "merge":
+        squash = git("commit-tree", tree, "-p", parent, "-p", pr["head_sha"], data=message)
+    else:
+        squash = git("commit-tree", tree, "-p", parent, data=message)
     git("update-ref", "refs/heads/main", squash, parent)
     pr.update(state="closed", merged=True, merge_sha=squash)
     save()
@@ -301,6 +318,10 @@ if args[:2] == ["pr", "create"]:
     create()
 elif args[:2] == ["pr", "merge"]:
     merge()
+elif args[:2] == ["pr", "ready"]:
+    pr = state["pulls"][args[2]]
+    pr["draft"] = False
+    save()
 elif args[:2] == ["pr", "edit"]:
     pr = state["pulls"][args[2]]
     pr["title"] = option("--title")
@@ -379,7 +400,7 @@ RUN_STEP = (
     "import sys; from taskwatch import job_scan; job_scan.Systemd.wake = lambda self: None; "
     "from taskwatch.job_cli import main; raise SystemExit(main(sys.argv[1:]))"
 )
-WRITES = (["pr", "create"], ["pr", "merge"], ["run", "rerun"])
+WRITES = (["pr", "create"], ["pr", "merge"], ["pr", "ready"], ["pr", "edit"], ["run", "rerun"])
 STOPPED = {"user_wait", "done", "cancelled", "approval_wait"}
 
 
@@ -515,6 +536,7 @@ class Lab(Env):
         blank_body: bool = False,
         sender_modes: tuple[str, ...] | None = None,
         hook_modes: tuple[str, ...] | None = None,
+        host: dict | None = None,
         **extra,
     ) -> None:
         tmp_path.mkdir(exist_ok=True)
@@ -534,7 +556,7 @@ class Lab(Env):
             self.sender.modes(*sender_modes)
         if hook_modes or share is None:
             self.set_hook_modes(*(hook_modes or ("ok",)))
-        self.configure()
+        self.configure(**(host or {}))
         self.service = StepService(self.root, tmp_path / "unit-logs")
         self.blank_body = blank_body
         target = self.repo
@@ -709,18 +731,22 @@ class Lab(Env):
     def write_text(self, name: str, text: str) -> None:
         (self.folder() / "pr" / "pr" / name).write_text(text, encoding="utf-8")
 
-    def accept(self, extra: dict[str, str] | None = None) -> None:
-        """Build one commit, pass the check and the review; a landing job is then in `land`."""
+    def prepare(
+        self,
+        extra: dict[str, str] | None = None,
+        *,
+        body: str = "body\n",
+        title: str = "feat(x): add",
+        commit: str = "- Preserve the complete result\n",
+    ) -> None:
+        """Build one commit and pass the check; the caller keeps the review to itself."""
         assert self.run("check") == 0  # creates the work folder; nothing is built yet
         for name, text in GOOD_FILES.items():
             if name in RECORDS:
                 (self.folder() / name).write_text(text, encoding="utf-8")
         (self.folder() / "pr" / "pr").mkdir(parents=True, exist_ok=True)
-        self.write_text("title.txt", "feat(x): add\n")
-        self.write_text("body.md", "body\n")
-        self.write_text(
-            "commit.txt", "\n" if self.blank_body else "- Preserve the complete result\n"
-        )
+        self.write_text("title.txt", title.rstrip("\n") + "\n")
+        self.write_text("commit.txt", "\n" if self.blank_body else commit)
         (self.tree / "out.txt").write_text("ok\n", encoding="utf-8")
         (self.tree / f"{self.receipt}.txt").write_text("one\n", encoding="utf-8")
         for name, text in (extra or {}).items():
@@ -729,9 +755,21 @@ class Lab(Env):
             path.write_text(text, encoding="utf-8")
         git(self.tree, "add", "-A")
         git(self.tree, "commit", "-m", "feat(x): add\n\nWhy it is needed.")
-        self.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
+        self.write_text("body.md", body.format(result=git(self.tree, "rev-parse", "HEAD")))
         assert self.run("check") == 0
         assert list(self.get().checks[-1]["problems"]) == []
+
+    def accept(
+        self,
+        extra: dict[str, str] | None = None,
+        *,
+        body: str = "body\n",
+        title: str = "feat(x): add",
+        commit: str = "- Preserve the complete result\n",
+    ) -> None:
+        """Build one commit, pass the check and the review; a landing job is then in `land`."""
+        self.prepare(extra, body=body, title=title, commit=commit)
+        self.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
         assert self.run("review") == 0
         assert self.get().stage == ("land" if self.get().land else "deliver_pending")
 
@@ -850,6 +888,50 @@ def test_accepted_result_becomes_one_head_pr_squash_install_and_card(make):
     assert [(c["argv"], c["tty"]) for c in hook] == [(["install", squash, target], False)]
     assert hook[0]["cwd"] == target
     assert len(lab.cards()) == 1 and [d["status"] for d in job.deliveries] == ["success"]
+
+
+def test_a_body_link_to_a_reviewed_commit_is_published_at_the_pushed_head(make):
+    lab = make()
+    base = git(lab.repo, "rev-parse", "main")
+    lab.accept(
+        extra={"docs/shot.png": "png\n"},
+        body=(
+            "![shot](https://github.com/sample/project/blob/{result}/docs/shot.png?raw=true)\n\n"
+            f"![outside](https://github.com/sample/project/blob/{base}/docs/shot.png)\n\n"
+            "![missing](https://github.com/sample/project/blob/{result}/docs/none.png)\n"
+        ),
+    )
+    result = git(lab.tree, "rev-parse", "HEAD")
+    reviewed = lab.reviewed_text()["body.md"]
+    assert f"blob/{result}/docs/shot.png" in reviewed
+    lab.finish()
+    state = lab.land()
+    head = state["H"]
+    expected = reviewed.replace(f"blob/{result}/docs/shot.png", f"blob/{head}/docs/shot.png")
+    assert state["body_rewrites"] == 1 and expected.count(f"/{head}/") == 1
+    assert f"blob/{base}/docs/shot.png" in expected
+    assert f"blob/{result}/docs/none.png" in expected
+    assert lab.forge()["pulls"]["17"]["body"] == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '<img src="https://github.com/sample/project/blob/{result}/docs/shot.png">\n',
+        "![shot](<https://github.com/sample/project/blob/{result}/docs/shot.png>)\n",
+    ],
+)
+def test_a_wrapped_body_link_is_published_at_the_pushed_head(make, body):
+    lab = make()
+    lab.accept(extra={"docs/shot.png": "png\n"}, body=body)
+    result = git(lab.tree, "rev-parse", "HEAD")
+    reviewed = lab.reviewed_text()["body.md"]
+    lab.finish()
+    state = lab.land()
+    head = state["H"]
+    expected = reviewed.replace(f"blob/{result}/docs/shot.png", f"blob/{head}/docs/shot.png")
+    assert state["body_rewrites"] == 1
+    assert lab.forge()["pulls"]["17"]["body"] == expected
 
 
 def test_a_declared_blank_squash_body_lands_with_the_title_alone(make):
@@ -991,7 +1073,7 @@ def test_review_without_a_checked_publication_marker_is_not_landable(make):
     cleaned_forge(lab)
 
 
-def test_changed_text_after_publication_parks_instead_of_requeueing(make):
+def test_changed_text_after_publication_returns_to_review_on_the_same_pr(make):
     lab = make()
     lab.accept()
     lab.edit(ci=PENDING)
@@ -999,10 +1081,14 @@ def test_changed_text_after_publication_parks_instead_of_requeueing(make):
     assert lab.writes() == ["pr create"]
     lab.write_text("commit.txt", "- Reject unreviewed publication\n")
     lab.edit(ci=GREEN)
+    lab.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
     lab.resume()
-    job = lab.park("land_review_stale")
-    assert job.stage == "user_wait" and lab.writes() == ["pr create"]
-    assert lab.cards() == [] and lab.hook_calls() == []
+    job = lab.finish()
+    assert job.stage == "done"
+    assert lab.land()["returns"][0]["reason"] == "evidence_changed"
+    assert len(lab.forge()["created"]) == 1 and list(lab.forge()["pulls"]) == ["17"]
+    assert lab.forge()["pulls"]["17"]["body"] == lab.reviewed_text()["body.md"]
+    assert lab.writes() == ["pr create", "pr edit", "pr merge"]
 
 
 # --- L2: base --------------------------------------------------------------------------------
@@ -1164,6 +1250,27 @@ def test_default_branch_moving_during_ci_updates_the_same_publication(make):
     assert state["tree_verified"] is True and state["S"]
     assert state["pr"]["number"] == 17 and len(lab.forge()["created"]) == 1
     assert lab.writes() == ["pr create", "pr merge"]
+
+
+def test_a_base_update_republishes_body_links_at_the_new_head(make):
+    lab = make(window=30)
+    lab.accept(
+        extra={"docs/shot.png": "png\n"},
+        body="![shot](https://github.com/sample/project/blob/{result}/docs/shot.png)\n",
+    )
+    result = git(lab.tree, "rev-parse", "HEAD")
+    reviewed = lab.reviewed_text()["body.md"]
+    lab.edit(advance_main_on_ci=1, follow_branch=True)
+    lab.finish()
+    state = lab.land()
+    update = state["base_updates"][0]
+    old, head = update["from_head"], state["H"]
+    assert head != old
+    expected = reviewed.replace(f"blob/{result}/", f"blob/{head}/")
+    assert lab.forge()["pulls"]["17"]["body"] == expected
+    assert state["published_text"]["body"] == expected and f"/{old}/" not in expected
+    assert sum(call[:2] == ["pr", "edit"] for call in lab.forge_calls()) == 1
+    assert lab.writes() == ["pr create", "pr edit", "pr merge"]
 
 
 def test_repeated_main_movement_is_bounded(make):
@@ -1399,7 +1506,7 @@ def test_pr_text_edited_during_ci_blocks_the_merge(make):
     ],
 )
 def test_ci_that_is_not_fully_green_never_merges(make, script):
-    lab = make()
+    lab = make(ci_fix_max=0)
     lab.accept()
     lab.edit(ci=script)
     lab.park("land_ci_failed")
@@ -1481,7 +1588,7 @@ def test_rerun_round_is_frozen_and_a_lost_acknowledgement_spends_its_budget(make
 
 
 def test_a_frozen_run_that_fails_again_parks_and_keeps_its_spent_budget(make):
-    lab = make(window=60)
+    lab = make(window=60, ci_fix_max=0)
     lab.accept()
     again = {"run_attempt": 2, "conclusion": "failure"}
     lab.edit(ci=[ci([run_row(51, conclusion="failure")])], rerun_to={"51": again})
@@ -3189,3 +3296,380 @@ def test_reply_unknown_acknowledgement_requires_distinct_resume(acknowledged):
         with pytest.raises(job_land.LandStop):
             tx.reply(candidate, "answer")
         assert len(posted) == 2
+
+
+# --- the flow before review, CI fix rounds and the merge method ------------------------------
+
+
+FLOW_HOST = {"ci_before_review": {"github.com/sample/project": True}}
+CODE_FAIL_REPLY = (
+    CODE_FAIL
+    + "\n\n### F1\nThe input is wrong.\n"
+    + json.dumps(
+        {
+            "finding": "F1",
+            "severity": "P1",
+            "category": "clarity",
+            "rule": "other",
+            "location": "out.txt:1",
+        }
+    )
+)
+
+
+def fix_turn(subject="fix(x): repair CI", bullet="- Make the failing check pass", path="fixed.txt"):
+    """A fix session that adds one committed file, as the worker would."""
+    script = (
+        f"printf 'fixed\\n' > {path} && git add {path} && "
+        f"git commit -q -m '{subject}' -m '{bullet}'"
+    )
+    return {"run": [["sh", "-c", script]], "reply": "Repaired."}
+
+
+CI_FAILED = [ci([run_row(51, conclusion="failure")])]
+CI_FAILED_AGAIN = [ci([run_row(51, attempt=2, conclusion="failure")])]
+CI_GREEN_OTHER = [ci([run_row(52), push_run(62)])]
+
+
+def test_a_title_that_fits_with_the_pr_suffix_lands(make):
+    title = "feat(x): " + "a" * 59
+    assert len(title) == 68 and len(title + " (#17)") == 74
+    lab = make()
+    lab.accept(title=title)
+    lab.finish()
+    state = lab.land()
+    assert git(lab.bare, "log", "-1", "--format=%s", state["S"]) == title + " (#17)"
+    assert len(git(lab.bare, "log", "-1", "--format=%s", state["S"])) > 72
+
+
+def test_ci_before_review_fixes_the_draft_and_merges_the_same_pr(make):
+    lab = make(window=90, host=FLOW_HOST, ci_fix_max=1)
+    lab.prepare()
+    job = lab.get()
+    assert job.stage == "land" and job.reviews == ()
+    lab.edit(follow_branch=1, ci=[*CI_FAILED, *CI_FAILED_AGAIN, *CI_GREEN_OTHER])
+    lab.scenario([fix_turn(), {"reply": f"{CODE_PASS}\nNo findings."}])
+    done = lab.finish()
+    state = lab.land()
+    forge = lab.forge()
+    assert len(forge["created"]) == 1 and forge["created"][0]["draft"] is True
+    assert forge["pulls"]["17"]["draft"] is False
+    assert forge["pulls"]["17"]["body"] == lab.reviewed_text()["body.md"]
+    assert [r["reason"] for r in state["returns"]] == ["ci_failed"]
+    assert (state["returns"][0]["pr"], state["returns"][0]["round"]) == (17, 1)
+    assert [e.get("type") for e in done.events].count("ci_fix") == 1
+    assert len(done.reviews) == 1 and done.reviews_used == 1
+    assert lab.writes() == ["pr create", "run rerun", "pr edit", "pr ready", "pr merge"]
+    assert git(lab.bare, "log", "-1", "--format=%s", state["S"]) == "feat(x): add (#17)"
+
+
+def test_a_title_edited_after_the_check_returns_to_check_before_the_draft(make):
+    lab = make(window=90, host=FLOW_HOST)
+    lab.prepare()
+    assert lab.get().stage == "land"
+    lab.write_text("title.txt", "changed title\n")
+    assert lab.run("land") == 0
+    job = lab.get()
+    assert job.stage == "check" and job.texts == {} and job.fingerprint == ""
+    assert lab.forge().get("created", []) == [] and lab.writes() == []
+
+
+def test_a_review_fix_runs_ci_again_before_the_next_review(make):
+    lab = make(window=90, host=FLOW_HOST)
+    lab.prepare()
+    lab.edit(follow_branch=1)
+    lab.scenario(
+        [
+            {"reply": CODE_FAIL_REPLY},
+            fix_turn("fix(x): correct input", "- Preserve valid input"),
+            {"reply": f"{CODE_PASS}\nNo findings."},
+        ]
+    )
+    for expected in ("review", "fix", "check"):
+        lab.scan_once()
+        lab.service.wait()
+        assert lab.get().stage == expected
+    head = git(lab.tree, "rev-parse", "HEAD")
+    (lab.folder() / "findings.json").write_text(
+        json.dumps([{"id": "r1.F1", "status": "fixed", "commit": head}]), encoding="utf-8"
+    )
+    job = lab.finish()
+    assert len(job.reviews) == 2
+    assert job.reviews[0]["verdict"] == "FAIL" and job.reviews[1]["verdict"] == "PASS"
+    assert job.reviews[1]["fingerprint"] == head
+    order = [event.get("type") for event in job.events]
+    reviews = [index for index, kind in enumerate(order) if kind == "review"]
+    drafts = [index for index, kind in enumerate(order) if kind == "draft_ci"]
+    assert len(drafts) == 2 and reviews[0] < drafts[1] < reviews[1]
+    assert lab.forge()["ci_calls"] >= 2 and lab.writes()[-2:] == ["pr ready", "pr merge"]
+
+
+def test_ci_fix_and_review_budgets_are_kept_apart(make):
+    lab = make(ci_fix_max=1)
+    lab.accept()
+    job = lab.put("land")
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.state = {
+            **job.land_state,
+            "pr": {"number": 17, "url": "https://github.com/sample/project/pull/17"},
+            "H": git(lab.tree, "rev-parse", "HEAD"),
+        }
+        with pytest.raises(job_land.Routed):
+            tx.return_for_ci_fix("draft", "boom")
+        routed = lab.get()
+        assert (routed.stage, routed.reviews_used) == ("fix", 1)
+        assert [e.get("type") for e in routed.events].count("ci_fix") == 1
+        assert len(lab.land()["returns"]) == 1
+        job = lab.put("land")
+        tx.ctx = Ctx(lab.jobs, ctx.config, job, lab.folder(), lab.tree)
+        tx.state = dict(job.land_state)
+        assert tx.return_for_ci_fix("draft", "again") is False
+        assert lab.get().reviews_used == 1
+        assert len(lab.land()["returns"]) == 1
+
+
+def test_an_interrupted_ci_fix_return_writes_nothing(make):
+    from taskwatch.job_runner import StaleAttempt
+
+    lab = make(ci_fix_max=1)
+    lab.accept()
+    job = lab.put("land")
+    stale = replace(job, attempt=job.attempt + 1)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        ctx = Ctx(lab.jobs, load_job_config(lab.root), stale, lab.folder(), lab.tree)
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.state = {
+            **job.land_state,
+            "pr": {"number": 17, "url": "https://github.com/sample/project/pull/17"},
+            "H": git(lab.tree, "rev-parse", "HEAD"),
+        }
+        with pytest.raises(StaleAttempt):
+            tx.return_for_ci_fix("draft", "boom")
+    current = lab.get()
+    assert current.stage == "land" and "returns" not in current.land_state
+    assert [e.get("type") for e in current.events].count("ci_fix") == 0
+
+
+def test_the_ci_fix_budget_exhausts_to_a_stop_without_a_review(make):
+    lab = make(window=90, host=FLOW_HOST, ci_fix_max=0)
+    lab.prepare()
+    lab.edit(follow_branch=1, ci=[*CI_FAILED, *CI_FAILED_AGAIN])
+    job = lab.park("land_ci_failed")
+    assert job.reviews_used == 0 and job.reviews == ()
+    assert "returns" not in lab.land()
+    assert lab.writes() == ["pr create", "run rerun"]
+
+
+def test_a_merge_method_repository_keeps_its_commits(make):
+    lab = make(merge_method="merge")
+    lab.accept()
+    result = lab.get().reviews[-1]["fingerprint"]
+    lab.finish()
+    state = lab.land()
+    assert state["H"] == result
+    assert git(lab.bare, "rev-list", "--parents", "-n", "1", state["S"]).split() == [
+        state["S"],
+        state["M"],
+        result,
+    ]
+    assert git(lab.bare, "merge-base", "--is-ancestor", result, state["S"]) == ""
+    assert git(lab.bare, "rev-parse", f"{state['S']}^{{tree}}") == state["T"]
+    assert state["tree_verified"] is True and lab.forge()["merge_methods"] == ["merge"]
+    assert lab.writes() == ["pr create", "pr merge"]
+
+
+def test_a_merge_repository_republishes_a_same_tree_commit(make):
+    host = {**FLOW_HOST, "merge_method": {"github.com/sample/project": "merge"}}
+    lab = make(window=30, host=host)
+    lab.prepare()
+    lab.edit(follow_branch=1)
+    lab.scan_once()
+    lab.service.wait()
+    assert lab.get().stage == "review"
+    first = git(lab.tree, "rev-parse", "HEAD")
+    git(lab.tree, "commit", "--allow-empty", "-m", "chore(x): keep the head", "-m", "- Keep it")
+    second = git(lab.tree, "rev-parse", "HEAD")
+    assert git(lab.tree, "rev-parse", "HEAD^{tree}") == git(
+        lab.tree, "rev-parse", f"{first}^{{tree}}"
+    )
+    assert lab.run("check") == 0
+    assert lab.get().stage == "land"
+    lab.scan_once()
+    lab.service.wait()
+    assert lab.get().stage == "review"
+    lab.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
+    job = lab.finish()
+    state = lab.land()
+    assert job.stage == "done" and state["H"] == second
+    assert git(lab.bare, "rev-list", "--parents", "-n", "1", state["S"]).split() == [
+        state["S"],
+        state["M"],
+        second,
+    ]
+    assert lab.forge()["merge_methods"] == ["merge"]
+    assert len(lab.forge()["created"]) == 1
+
+
+def test_a_merge_method_repository_parks_a_moved_base(make):
+    lab = make(merge_method="merge", window=30)
+    lab.accept()
+    lab.edit(advance_main_on_ci=1)
+    job = lab.park("land_base_moved")
+    assert job.land_state["H"] == job.reviews[-1]["fingerprint"]
+    assert not lab.forge().get("merge_calls")
+
+
+def test_a_second_text_edit_on_the_same_head_is_not_an_unknown_ack(make):
+    lab = make()
+    lab.accept()
+    head = git(lab.tree, "rev-parse", "HEAD")
+    pr = SimpleNamespace(
+        number=17,
+        url="https://github.com/sample/project/pull/17",
+        head_sha=head,
+        title="feat(x): add",
+        body="published body\n",
+    )
+    calls = []
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        job = lab.put("land")
+        ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.state = {
+            **job.land_state,
+            "H": head,
+            "pr": {"number": 17, "url": pr.url},
+            "published_text": {"title": pr.title, "body": pr.body},
+        }
+        tx.repo = SimpleNamespace(owner="sample", name="project")
+        tx.api.read_pull_request = lambda *args: pr
+
+        def edit(repo, number, sha, title, body_file):
+            pr.title = title
+            pr.body = Path(body_file).read_text(encoding="utf-8")
+            calls.append(body_file)
+
+        tx.api.edit_pull_request = edit
+        tx.freshness = lambda: None
+        tx.validate_pr = lambda observed: observed
+        for body in ("first\n", "second\n"):
+            tx.title = "feat(x): add"
+            tx.body = body
+            tx.body_file = lab.folder() / "land-text" / "body.md"
+            tx.body_file.parent.mkdir(parents=True, exist_ok=True)
+            tx.body_file.write_text(body, encoding="utf-8")
+            tx.edit_published_pr()
+            tx.state = {**tx.state, "published_text": {"title": tx.title, "body": tx.body}}
+    assert pr.body == "second\n" and len(calls) == 2
+
+
+def test_the_final_ci_gate_opens_its_own_window_after_the_review(make):
+    lab = make(window=30, host=FLOW_HOST)
+    lab.prepare()
+    lab.edit(follow_branch=1)
+    lab.scan_once()
+    lab.service.wait()
+    assert lab.get().stage == "review"
+    with lab.jobs.state.lock():
+        job = lab.get()
+        lab.jobs.save(replace(job, land_state={**job.land_state, "ci_deadline": 0}), time.time())
+    lab.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
+    lab.finish()
+    state = lab.land()
+    assert state["S"] and len(lab.forge()["merge_calls"]) == 1
+
+
+def test_a_lost_edit_readback_clears_its_intent_on_resume(make):
+    lab = make()
+    lab.accept()
+    head = git(lab.tree, "rev-parse", "HEAD")
+    pr = SimpleNamespace(
+        number=17,
+        url="https://github.com/sample/project/pull/17",
+        head_sha=head,
+        title="feat(x): add",
+        body="first\n",
+    )
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        job = lab.put("land")
+        ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.state = {
+            **job.land_state,
+            "H": head,
+            "pr": {"number": 17, "url": pr.url},
+            "published_text": {"title": pr.title, "body": "published body\n"},
+            "edit_intent": {"head": head, "entry": 0},
+        }
+        tx.repo = SimpleNamespace(owner="sample", name="project")
+        tx.api.read_pull_request = lambda *args: pr
+        tx.freshness = lambda: None
+        tx.validate_pr = lambda observed: observed
+        tx.title, tx.body = "feat(x): add", "first\n"
+        tx.edit_published_pr()
+        assert tx.state.get("edit_intent") == {}
+        calls = []
+
+        def edit(repo, number, sha, title, body_file):
+            pr.body = Path(body_file).read_text(encoding="utf-8")
+            calls.append(pr.body)
+
+        tx.api.edit_pull_request = edit
+        tx.body = "second\n"
+        tx.body_file = lab.folder() / "land-text" / "body.md"
+        tx.body_file.parent.mkdir(parents=True, exist_ok=True)
+        tx.body_file.write_text(tx.body, encoding="utf-8")
+        tx.edit_published_pr()
+    assert pr.body == "second\n" and calls == ["second\n"]
+
+
+def test_the_ci_window_opens_per_cycle_and_keeps_a_retry(make):
+    lab = make()
+    lab.accept()
+    head = git(lab.tree, "rev-parse", "HEAD")
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        job = lab.put("land")
+        ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.state = {
+            **job.land_state,
+            "H": head,
+            "ci_gate": {"head": head, "cycle": "check:1"},
+            "ci_started_at": 1.0,
+            "ci_deadline": 0,
+        }
+        tx.observe_ci = lambda: (_ for _ in ()).throw(job_land.LandStop("land_ci_failed", "stop"))
+        with pytest.raises(job_land.LandStop):
+            tx.ci(bots=False, cycle="check:2")
+        assert tx.state["ci_gate"] == {"head": head, "cycle": "check:2"}
+        assert tx.state["ci_deadline"] > time.time()
+        deadline, started = tx.state["ci_deadline"], tx.state["ci_started_at"]
+        with pytest.raises(job_land.LandStop):
+            tx.ci(bots=False, cycle="check:2")
+        assert (tx.state["ci_deadline"], tx.state["ci_started_at"]) == (deadline, started)
+
+
+def test_the_draft_ci_observes_with_the_check_cycle(make):
+    lab = make()
+    lab.accept()
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        job = lab.put("land")
+        ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+        tx = job_land.Transaction(ctx, lock.fileno())
+        tx.state = {**job.land_state, "identity": "cycle-1"}
+        captured = {}
+        for name in (
+            "initialize_draft",
+            "republish_for_tree",
+            "base_guard",
+            "head",
+            "observe_base_update",
+            "draft_pull_request",
+            "to_review",
+        ):
+            setattr(tx, name, lambda *args, **kwargs: None)
+        tx.ci = lambda **kwargs: captured.update(kwargs)
+        tx.draft()
+    assert captured == {"bots": False, "cycle": "cycle-1"}

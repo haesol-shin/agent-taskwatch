@@ -12,7 +12,7 @@ import subprocess
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from . import forge, job_findings, job_text, job_workspace
 from .checks import message_problems
@@ -21,12 +21,39 @@ from .jobs import _json_value
 MAX_BASE_UPDATES = 3
 # premerge: the base moved, so publication, CI and the bot gate run again under one bound.
 BASE_UPDATED = object()
+# The only body a draft PR carries before the reviewed text exists.
+DRAFT_BODY = "CI is running on this draft pull request.\n"
+# The per-head observations a new publication head or a CI fix round clears.
+CI_WINDOW = frozenset(
+    {
+        "ci_green",
+        "ci_evidence",
+        "ci_bots",
+        "ci_started_at",
+        "ci_deadline",
+        "ci_entry",
+        "rerun_round",
+    }
+)
+# A body link to a commit that exists only locally, which never reaches GitHub. Quotes and
+# angle brackets around the URL (HTML src, angle-bracketed Markdown) are not part of the path.
+BODY_LINK = re.compile(
+    r"https://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/(?P<kind>blob|raw)/(?P<sha>[0-9a-f]{7,40})/"
+    r"(?P<path>[^\s?#)\"'<>]+)(?P<suffix>[?#][^\s)\"'<>]*)?"
+)
 
 
 class LandStop(Exception):
-    def __init__(self, reason, message):
+    def __init__(self, reason, message, *, fixable=False):
         self.reason = reason
+        # A failed CI conclusion the worker can fix on the same branch, not a timeout or an
+        # unregistered check.
+        self.fixable = fixable
         super().__init__(message)
+
+
+class Routed(Exception):
+    """The transaction routed the job to another stage and this step is done."""
 
 
 def digest(value):
@@ -60,6 +87,9 @@ class Transaction:
         self.lock_fd = lock_fd
         self.state = _json_value(ctx.job.land_state)
         self.api = Boundary(self)
+        # False until an accepted review is loaded: a draft publication proves CI on the
+        # checked result, which no review has judged yet.
+        self.reviewed = False
 
     def current(self):
         from .job_runner import StaleAttempt, _attempt_open
@@ -138,6 +168,10 @@ class Transaction:
                 time.sleep(min(15, remaining))
             self.save()
 
+    def method(self):
+        """The frozen merge method of this job."""
+        return self.current().merge_method
+
     def freshness(self):
         from .job_delivery import acceptance_current, accepted_review
         from .job_runner import _requeue
@@ -146,68 +180,68 @@ class Transaction:
         self.dispositions_current(job, accepted_review(job))
         if acceptance_current(self.ctx.jobs, self.ctx.config, job):
             return
-        if self.state.get("push_intent") or self.state.get("S"):
-            raise LandStop("land_review_stale", "accepted evidence changed after publication")
+        if self.state.get("S"):
+            raise LandStop("land_review_stale", "accepted evidence changed after merge")
         from .job_runner import _apply
 
+        if self.state.get("push_intent") or self.state.get("pushed") or self.state.get("pr"):
+            # Pushed or published, not merged: the job returns to its own check and review on
+            # the same branch and pull request instead of stopping for a new job. A head that
+            # was only prepared and never pushed is discarded like any unpublished transaction.
+            record = self.return_record(
+                "evidence_changed", "accepted evidence changed after publication"
+            )
+            from .job_runner import _event
+
+            state = {**self.state, "returns": [*self.state.get("returns", ()), record]}
+            self.state = state
+            _apply(
+                self.ctx,
+                lambda j: {
+                    **_requeue(
+                        j,
+                        events=_event(
+                            j,
+                            type="land_return",
+                            reason=record["reason"],
+                            pr=record["pr"],
+                            round=record["round"],
+                        ),
+                    ),
+                    "land_state": state,
+                },
+            )
+            raise FreshnessRequeued
         _apply(self.ctx, lambda j: {**_requeue(j), "land_state": {}})
         raise FreshnessRequeued
 
-    def initialize(self):
-        from .job_delivery import accepted_review
-
-        self.freshness()
+    def authority(self):
+        """The job may land, and it publishes exactly one complete-result unit."""
         job = self.current()
         if not job.land or job.review != "code" or job.review_target is not None:
             raise LandStop("land_review_stale", "landing authority is absent")
-        review = accepted_review(job)
-        self.dispositions_current(job, review)
-        texts = review.get("texts", {})
-        if len(job.public_text) != 1 or len(texts) != 1:
+        if len(job.public_text) != 1:
             raise LandStop("land_review_stale", "landing needs one complete-result publication")
-        unit = next(iter(texts))
-        text = texts[unit]
-        if (
-            text.get("text_contract") != 2
-            or text.get("head") != review.get("fingerprint")
-            or text.get("base") != job.base
-            or self.git("rev-parse", f"{text['head']}^{{tree}}") != text.get("tree")
-        ):
-            raise LandStop("land_review_stale", "checked publication does not cover accepted tree")
-        identity = digest({"review": _json_value(review), "check": _json_value(job.checks[-1])})
-        if self.state.get("identity", identity) != identity:
-            self.adopt_review(job, review, text, identity)
-        copy = self.ctx.folder / "land-text"
-        code, _ = job_text.reviewed_copy(job, self.ctx.env, self.ctx.folder, unit, copy)
-        if code:
-            raise LandStop("land_review_stale", "reviewed snapshot cannot be copied")
-        self.title = (copy / "title.txt").read_bytes().decode().rstrip("\n")
-        self.body = (copy / "body.md").read_bytes().decode()
-        self.commit_file = copy / "commit.txt"
-        self.body_file = copy / "body.md"
-        self.commit = self.commit_file.read_bytes().decode()
-        if bool(self.commit.strip()) == job_text.blank_body(job.public_text[0]):
-            raise LandStop("land_review_stale", "squash body does not match the unit declaration")
+        self.unit = job.public_text[0]["id"]
+        return job
+
+    def begin(self):
+        """The transaction identity both publication phases share."""
+        job = self.authority()
         repo = self.api.inspect_repository()
-        self.api._writable(repo)
-        if self.state.get("identity"):
-            if self.state["repo"] != asdict(repo):
+        self.api._writable(repo, job.merge_method)
+        saved = self.state.get("repo")
+        if saved is not None:
+            # A record written before a capability field existed cannot prove the new value,
+            # so only the keys it holds are compared.
+            if any(saved.get(key) != value for key, value in asdict(repo).items() if key in saved):
                 raise LandStop("land_pr_mismatch", "repository identity or capabilities changed")
         else:
             hook = selected_install_command(self.ctx.config, repo)
             self.save(
-                identity=identity,
-                phase="accepted",
-                R=text["head"],
-                T=text["tree"],
-                B=text["base"],
                 repo=asdict(repo),
                 branch=job.branch + "-land",
                 repository_key=job_workspace.repository_key(job.target, self.ctx.env),
-                review_digest=digest(_json_value(review)),
-                check_digest=digest(_json_value(job.checks[-1])),
-                snapshot_digest=review["snapshot_sha256"],
-                text_digest=digest(_json_value(text)),
                 install={
                     "status": "not_started" if hook else "disabled",
                     "command": hook,
@@ -225,6 +259,353 @@ class Transaction:
         self.repo = repo
         if "base_update_enabled" not in self.state:
             self.save(base_update_enabled=bool(self.ctx.config.land_base_update))
+
+    def initialize(self):
+        from .job_delivery import accepted_review
+
+        self.begin()
+        self.reviewed = True
+        self.freshness()
+        job = self.current()
+        review = accepted_review(job)
+        self.dispositions_current(job, review)
+        texts = review.get("texts", {})
+        if len(texts) != 1 or self.unit not in texts:
+            raise LandStop("land_review_stale", "landing needs one complete-result publication")
+        text = texts[self.unit]
+        if (
+            text.get("text_contract") != 2
+            or text.get("head") != review.get("fingerprint")
+            or text.get("base") != job.base
+            or self.git("rev-parse", f"{text['head']}^{{tree}}") != text.get("tree")
+        ):
+            raise LandStop("land_review_stale", "checked publication does not cover accepted tree")
+        identity = digest({"review": _json_value(review), "check": _json_value(job.checks[-1])})
+        if self.state.get("identity") and self.state["identity"] != identity:
+            self.adopt_review(job, review, text, identity)
+        elif not self.state.get("identity"):
+            self.save(
+                identity=identity,
+                phase="accepted",
+                R=text["head"],
+                T=text["tree"],
+                B=text["base"],
+                review_seq=review.get("seq", 0),
+                review_digest=digest(_json_value(review)),
+                check_digest=digest(_json_value(job.checks[-1])),
+                snapshot_digest=review["snapshot_sha256"],
+                text_digest=digest(_json_value(text)),
+            )
+        copy = self.ctx.folder / "land-text"
+        code, _ = job_text.reviewed_copy(job, self.ctx.env, self.ctx.folder, self.unit, copy)
+        if code:
+            raise LandStop("land_review_stale", "reviewed snapshot cannot be copied")
+        self.title = (copy / "title.txt").read_bytes().decode().rstrip("\n")
+        self.reviewed_body = (copy / "body.md").read_bytes().decode()
+        self.body = self.reviewed_body
+        self.commit_file = copy / "commit.txt"
+        self.body_file = copy / "body.md"
+        self.commit = self.commit_file.read_bytes().decode()
+        if bool(self.commit.strip()) == job_text.blank_body(job.public_text[0]):
+            raise LandStop("land_review_stale", "squash body does not match the unit declaration")
+        self.rewrite_body_links()
+
+    def draft_pending(self):
+        """A landing job that opens the draft PR and waits for CI before the review."""
+        from .job_delivery import acceptance_current
+
+        job = self.current()
+        if not (
+            job.land and job.ci_before_review and job.review == "code" and job.review_target is None
+        ):
+            return False
+        if self.state.get("S") or self.state.get("merge_intent"):
+            return False
+        return not acceptance_current(self.ctx.jobs, self.ctx.config, job)
+
+    def draft_evidence_current(self, job, state):
+        """The checked result, its texts and the check evidence still match the worktree."""
+        from .job_runner import _basis, _fingerprint
+
+        check = job.checks[-1] if job.checks else {}
+        try:
+            fingerprint = _fingerprint(job, self.ctx.workspace, self.ctx.env)
+            basis = _basis(job, self.ctx.folder)
+            changed = job_text.texts_changed(
+                job, self.ctx.workspace, self.ctx.folder, self.ctx.env, job.texts
+            )
+            log = Path(check.get("log") or "")
+            log_ok = hashlib.sha256(log.read_bytes()).hexdigest() == check.get("log_sha256")
+        except (ValueError, OSError, KeyError, TypeError):
+            return False
+        return (
+            state.get("head") == job.fingerprint
+            and state.get("base") == job.base
+            and fingerprint == job.fingerprint
+            and basis == job.basis
+            and bool(check.get("ok"))
+            and check.get("exit_code") == 0
+            and check.get("fingerprint") == job.fingerprint
+            and check.get("basis") == job.basis
+            and log_ok
+            and not changed
+        )
+
+    def requeue_check(self):
+        """Send a drifted checked result back to check before any publication write."""
+        from .job_runner import _apply, _requeue
+
+        _apply(self.ctx, lambda j: _requeue(j))
+        raise FreshnessRequeued
+
+    def initialize_draft(self):
+        """The transaction identity of the result the check accepted, before any review."""
+        self.authority()
+        job = self.current()
+        state = job.texts.get(self.unit) or {}
+        if not self.draft_evidence_current(job, state):
+            self.requeue_check()
+        self.begin()
+        if (
+            state.get("text_contract") != 2
+            or state.get("base") != job.base
+            or state.get("head") != job.fingerprint
+            or self.git("rev-parse", f"{state['head']}^{{tree}}") != state.get("tree")
+        ):
+            raise LandStop("land_review_stale", "checked publication does not cover the result")
+        try:
+            title = job_text.unit_file(self.ctx.folder, self.unit, "title.txt").read_bytes()
+            commit = job_text.unit_file(self.ctx.folder, self.unit, "commit.txt").read_bytes()
+        except OSError:
+            raise LandStop("land_review_stale", "the written publication text is missing") from None
+        self.title = title.decode().rstrip("\n")
+        self.commit = commit.decode()
+        self.reviewed_body = None
+        self.body = DRAFT_BODY
+        self.body_file = self.ctx.folder / "land-draft-body.md"
+        self.body_file.write_text(self.body, encoding="utf-8")
+        self.save(
+            R=state["head"],
+            T=state["tree"],
+            B=state["base"],
+            identity=digest({"check": _json_value(job.checks[-1]), "text": _json_value(state)}),
+            phase="draft",
+        )
+
+    def republish_for_tree(self):
+        """A changed tree after publication becomes a child of the current head."""
+        head = self.state.get("H")
+        if not head or self.state.get("S"):
+            return
+        current = self.state["R"]
+        if self.method() == "merge":
+            if current == head:
+                return
+            # A merge keeps the worker's commits, so the new head is the new accepted result.
+            # The tree may be equal when the fix only adds an empty commit.
+            metadata = self.git("show", "-s", "--format=raw", current)
+            self.reset_per_head()
+            self.save(
+                H=current,
+                commit_metadata=metadata,
+                republish={"from": head, "head": current},
+                phase="head",
+            )
+            return
+        if self.git("rev-parse", f"{head}^{{tree}}") == self.state["T"]:
+            return
+        # An earlier republication may have left an intent for an older tree; the current head
+        # is the only parent the next one may build on.
+        self.save(republish={"from": head})
+        self.prepare_republish()
+
+    def draft(self):
+        """Push the branch, open a draft PR, wait for its CI, then hand it to the review.
+
+        The flow order is machine checks, CI, then the independent review, as GitHub's own
+        workflow does. A failed CI conclusion returns to fix on this branch and pull request
+        while the CI fix budget holds.
+        """
+        self.initialize_draft()
+        self.republish_for_tree()
+        self.base_guard()
+        self.head()
+        self.observe_base_update()
+        self.draft_pull_request()
+        try:
+            self.ci(bots=False, cycle=self.state.get("identity", ""))
+        except LandStop as exc:
+            if not exc.fixable or not self.return_for_ci_fix("draft", str(exc)):
+                raise
+        self.to_review()
+
+    def draft_pull_request(self):
+        """Create the draft pull request or reconcile the one this transaction published."""
+        if self.state.get("pr"):
+            return self.draft_identity(self.wait_pr_head(self.state["pr"]["number"]))
+        matches = self.api.find_pull_requests(
+            self.repo, self.state["branch"], self.repo.default_branch, self.state["H"]
+        )
+        if len(matches) > 1:
+            raise LandStop("land_pr_mismatch", "duplicate publication PRs")
+        if matches:
+            pr = self.draft_identity(matches[0])
+            self.save(
+                pr={"number": pr.number, "url": pr.url},
+                phase="pr",
+                published_text={"title": pr.title, "body": pr.body},
+            )
+            return pr
+        entry = resume_entry(self.current())
+        if self.state.get("create_intent") and entry <= self.state.get("create_entry", entry):
+            raise LandStop("land_interrupted", "create outcome unknown; explicit resume required")
+        self.save(create_intent=True, create_entry=entry, phase="create")
+        pr = self.api.create_pull_request(
+            self.repo,
+            self.state["branch"],
+            self.state["H"],
+            self.title,
+            self.body_file,
+            draft=True,
+        )
+        pr = self.draft_identity(pr)
+        self.save(
+            pr={"number": pr.number, "url": pr.url},
+            phase="pr",
+            published_text={"title": self.title, "body": self.body},
+        )
+        return pr
+
+    def draft_identity(self, pr):
+        """A draft PR must be this open branch and base; its text is not published yet."""
+        if (
+            pr.state != "OPEN"
+            or pr.head_sha != self.state["H"]
+            or pr.head_branch != self.state["branch"]
+            or pr.base_branch != self.repo.default_branch
+        ):
+            raise LandStop("land_pr_mismatch", "draft PR identity, state or branch differs")
+        saved = self.state.get("pr")
+        if saved and saved != {"number": pr.number, "url": pr.url}:
+            raise LandStop("land_pr_mismatch", "saved PR identity differs")
+        return pr
+
+    def wait_pr_head(self, number):
+        """Wait for the published PR to observe the current publication head."""
+        deadline = time.monotonic() + 60
+        while True:
+            pr = self.api.read_pull_request(self.repo, number, None)
+            if pr.head_sha == self.state["H"]:
+                return pr
+            if pr.head_sha not in self.owned_heads() or time.monotonic() >= deadline:
+                raise LandStop("land_pr_mismatch", "publication head was not observed")
+            self.wait(2)
+
+    def return_record(self, reason, message, phase=""):
+        """One return record, keyed to its PR number and round; not yet persisted."""
+        returns = list(self.state.get("returns", ()))
+        return {
+            "reason": reason,
+            "pr": (self.state.get("pr") or {}).get("number", 0),
+            "round": sum(item.get("reason") == reason for item in returns) + 1,
+            "head": self.state.get("H", ""),
+            "message": message,
+            **({"phase": phase} if phase else {}),
+        }
+
+    def return_for_ci_fix(self, phase, message):
+        """Spend one CI fix round on the same branch and PR; False when the budget is spent.
+
+        The return record, the reset CI window and the transition to fix are one compare-and-
+        set, so an interruption cannot spend the budget without routing the job.
+        """
+        from .job_runner import StaleAttempt, _cas, _event
+
+        job = self.current()
+        used = sum(item.get("reason") == "ci_failed" for item in self.state.get("returns", ()))
+        if (
+            used >= job.ci_fix_max
+            or self.state.get("S")
+            or self.state.get("merge_intent")
+            or not self.state.get("pr")
+        ):
+            return False
+        self.reset_ci_window()
+        record = self.return_record("ci_failed", message, phase)
+        state = {**self.state, "returns": [*self.state.get("returns", ()), record]}
+        if not _cas(
+            self.ctx.jobs,
+            self.ctx.job,
+            {"land"},
+            lambda j: {
+                "land_state": state,
+                "stage": "fix",
+                "resume_stage": "fix",
+                "ended_at": time.time(),
+                "error": f"CI failed on the published head: {message}",
+                "events": _event(
+                    j,
+                    type="ci_fix",
+                    reason="ci_failed",
+                    pr=record["pr"],
+                    round=record["round"],
+                    phase=phase,
+                    message=message,
+                ),
+            },
+        ):
+            raise StaleAttempt
+        self.state = state
+        raise Routed
+
+    def to_review(self):
+        """The draft publication and its green CI hand the same result to the review step."""
+        from .job_runner import _apply, _event
+
+        self.save(phase="draft_ci")
+        _apply(
+            self.ctx,
+            lambda j: {
+                "stage": "review",
+                "resume_stage": "review",
+                "ended_at": time.time(),
+                "error": "",
+                "recoveries": 0,
+                "events": _event(
+                    j,
+                    type="draft_ci",
+                    pr=self.state.get("pr", {}).get("number", 0),
+                    head=self.state.get("H", ""),
+                ),
+            },
+        )
+
+    def ready(self):
+        """Mark the draft ready only after the reviewed text is in place."""
+        saved = self.state.get("pr")
+        if not saved:
+            return
+        current = self.api.read_pull_request(self.repo, saved["number"], self.state["H"])
+        if not current.draft:
+            return
+        entry = resume_entry(self.current())
+        intent = self.state.get("ready_intent", {})
+        if intent.get("head") == self.state["H"] and entry <= intent.get("entry", entry):
+            raise LandStop(
+                "land_interrupted", "ready acknowledgement unknown; distinct resume needed"
+            )
+        self.freshness()
+        self.save(ready_intent={"head": self.state["H"], "entry": entry}, phase="ready")
+        try:
+            self.api.ready_pull_request(self.repo, saved["number"], self.state["H"])
+        except forge.Uncertain:
+            pass
+        observed = self.api.read_pull_request(self.repo, saved["number"], self.state["H"])
+        if observed.draft:
+            raise LandStop(
+                "land_interrupted", "ready acknowledgement unknown; distinct resume needed"
+            )
+        self.save(phase="ready")
 
     def dispositions_current(self, job, review):
         """Each reviewed disposition must still describe its thread and the worker's record."""
@@ -256,24 +637,40 @@ class Transaction:
         _apply(self.ctx, build)
 
     def adopt_review(self, job, review, text, identity):
-        """Only a routed bot fix may replace a published transaction's acceptance."""
+        """Adopt a new accepted review on the same branch and pull request.
+
+        A routed bot fix and a fix or text change after publication take this path: a changed
+        tree becomes a child of the current head, and a text-only change keeps the head. The
+        reviewed text is written to the pull request after this by `edit_published_pr`.
+        """
         from .job_runner import _apply, _requeue
 
-        bot = self.state.get("bot", {})
-        round_ = bot.get("round", {})
+        published = self.state.get("H")
         if (
-            not round_.get("awaiting")
-            or review.get("seq", 0) <= round_.get("seq", 0)
+            not published
             or self.state.get("S")
+            or self.state.get("merge_intent")
+            or review.get("seq", 0) <= self.state.get("review_seq", 0)
         ):
             raise LandStop("land_review_stale", "accepted transaction identity changed")
-        candidates = job_findings.bot_dispositions(job, self.ctx.folder)
-        if candidates != _json_value(review.get("bot_dispositions", [])):
-            _apply(self.ctx, lambda j: _requeue(j))
-            raise FreshnessRequeued
-        refs = {c["finding"] for c in candidates}
-        if refs != set(round_.get("findings", ())):
-            raise LandStop("land_review_stale", "bot dispositions are incomplete")
+        bot = self.state.get("bot", {})
+        round_ = bot.get("round", {})
+        changes = {"bot": bot}
+        if round_.get("awaiting"):
+            if review.get("seq", 0) <= round_.get("seq", 0):
+                raise LandStop("land_review_stale", "accepted transaction identity changed")
+            candidates = job_findings.bot_dispositions(job, self.ctx.folder)
+            if candidates != _json_value(review.get("bot_dispositions", [])):
+                _apply(self.ctx, lambda j: _requeue(j))
+                raise FreshnessRequeued
+            refs = {c["finding"] for c in candidates}
+            if refs != set(round_.get("findings", ())):
+                raise LandStop("land_review_stale", "bot dispositions are incomplete")
+            changes["bot"] = {
+                **bot,
+                "dispositions": candidates,
+                "disposition_review": review["seq"],
+            }
         tree = text["tree"]
         updates = list(self.state.get("base_updates", ()))
         # A published transaction that already updated its base merges the fix the same way.
@@ -287,17 +684,26 @@ class Transaction:
                 self.check_updated_tree(head, self.state["M"], tree)
             if updates:
                 updates[-1] = {**updates[-1], "tree": tree, "accepted": text["tree"]}
-        changes = {
-            "identity": identity,
-            "R": text["head"],
-            "T": tree,
-            "review_digest": digest(_json_value(review)),
-            "check_digest": digest(_json_value(job.checks[-1])),
-            "snapshot_digest": review["snapshot_sha256"],
-            "text_digest": digest(_json_value(text)),
-            "bot": {**bot, "dispositions": candidates, "disposition_review": review["seq"]},
-            "republish": {"from": self.state["H"], "review": review["seq"]},
-        }
+        republish = {"from": published, "review": review["seq"]}
+        if self.method() == "merge":
+            # A merge keeps the worker's commits: the new accepted result is the next head.
+            republish["head"] = text["head"]
+            changes["H"] = text["head"]
+            changes["commit_metadata"] = self.git("show", "-s", "--format=raw", text["head"])
+        elif tree == self.state.get("T"):
+            # Only text changed, so the published head already carries the reviewed tree.
+            republish["head"] = published
+        changes.update(
+            identity=identity,
+            R=text["head"],
+            T=tree,
+            review_seq=review["seq"],
+            review_digest=digest(_json_value(review)),
+            check_digest=digest(_json_value(job.checks[-1])),
+            snapshot_digest=review["snapshot_sha256"],
+            text_digest=digest(_json_value(text)),
+            republish=republish,
+        )
         if updates:
             changes["base_updates"] = updates
         self.save(**changes)
@@ -373,19 +779,7 @@ class Transaction:
         self.state = {
             k: v
             for k, v in self.state.items()
-            if k
-            not in {
-                "ci_green",
-                "ci_evidence",
-                "ci_bots",
-                "ci_started_at",
-                "ci_deadline",
-                "ci_entry",
-                "rerun_round",
-                "push_intent",
-                "pushed",
-                "base_update",
-            }
+            if k not in CI_WINDOW | {"push_intent", "pushed", "base_update"}
         }
         bot = self.state["bot"]
         bot = {k: v for k, v in bot.items() if k not in {"head", "window_end", "outcome"}}
@@ -608,18 +1002,8 @@ class Transaction:
 
     def reset_per_head(self):
         """A new publication head restarts CI and bot observation; review evidence stays."""
-        dropped = {
-            "ci_green",
-            "ci_evidence",
-            "ci_bots",
-            "ci_started_at",
-            "ci_deadline",
-            "ci_entry",
-            "rerun_round",
-            "push_intent",
-            "pushed",
-        }
-        self.state = {k: v for k, v in self.state.items() if k not in dropped}
+        self.reset_ci_window()
+        self.state = {k: v for k, v in self.state.items() if k not in {"push_intent", "pushed"}}
         if bot := self.state.get("bot"):
             self.state = {
                 **self.state,
@@ -629,6 +1013,10 @@ class Transaction:
                 },
             }
 
+    def reset_ci_window(self):
+        """A return to fix observes CI again in a fresh bounded window and rerun round."""
+        self.state = {k: v for k, v in self.state.items() if k not in CI_WINDOW}
+
     def update_base(self, main):
         """Put the accepted result on main when the two change sets share no path.
 
@@ -636,6 +1024,10 @@ class Transaction:
         a conflict parks without changing the worktree; a failed check parks before publication.
         """
         if not self.base_update_enabled() or self.state.get("merge_intent"):
+            return False
+        if self.method() == "merge":
+            # A rewritten base would replace the reviewed lineage, so a merge-method transaction
+            # keeps the accepted result as its head and parks a moved base for the owner.
             return False
         updates = list(self.state.get("base_updates", ()))
         if len(updates) >= MAX_BASE_UPDATES:
@@ -713,7 +1105,8 @@ class Transaction:
             raise LandStop("land_head_changed", "publication branch disappeared")
         else:
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
-        self.freshness()
+        if self.reviewed:
+            self.freshness()
         self.save(push_intent=True, phase="push")
         try:
             self.git("push", *lease, target, f"{head}:{branch}")
@@ -799,6 +1192,9 @@ class Transaction:
 
     def replay(self, main):
         job = self.current()
+        if self.method() == "merge":
+            # A replay would squash the accepted result; a merge keeps its commits instead.
+            return
         prior = self.ctx.jobs.load().get(job.base_predecessor)
         state = prior.land_state if prior else {}
         entry = resume_entry(job)
@@ -912,27 +1308,89 @@ class Transaction:
         if not self.state.get("H"):
             head = pending.get("head") if pending else None
             if not head:
-                message = job_text.squash_message(self.title, self.commit)
-                head = self.git(
-                    "commit-tree", self.state["T"], "-p", self.state["M"], stdin=message
-                )
+                if self.method() == "merge":
+                    # A merge keeps the worker's commits: the publication head is the accepted
+                    # result itself, so the merge commit contains the reviewed lineage.
+                    head = self.state["R"]
+                else:
+                    message = job_text.squash_message(self.title, self.commit)
+                    head = self.git(
+                        "commit-tree", self.state["T"], "-p", self.state["M"], stdin=message
+                    )
             metadata = self.git("show", "-s", "--format=raw", head)
             self.save(H=head, commit_metadata=metadata, phase="head")
         head = self.state["H"]
-        if self.git("rev-parse", f"{head}^{{tree}}") != self.state["T"] or self.git(
-            "rev-list", "--parents", "-n", "1", head
-        ).split() != [head, self.state.get("head_parent", self.state["M"])]:
-            raise LandStop("land_head_changed", "publication object parent or tree differs")
+        self.rewrite_body_links()
+        tree = self.git("rev-parse", f"{head}^{{tree}}")
+        if self.method() == "merge":
+            if tree != self.state["T"] or head != self.state["R"]:
+                raise LandStop("land_head_changed", "merge publication head is not the result")
+        else:
+            parents = self.git("rev-list", "--parents", "-n", "1", head).split()
+            if tree != self.state["T"] or parents != [
+                head,
+                self.state.get("head_parent", self.state["M"]),
+            ]:
+                raise LandStop("land_head_changed", "publication object parent or tree differs")
         target = self.push_target()
         remote_head = self.publication_head(target)
         previous = self.state.get("republish", {}).get("from")
         if remote_head not in {None, head, previous} or (previous and remote_head is None):
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
         if remote_head != head:
-            self.freshness()
+            if self.reviewed:
+                self.freshness()
             self.save(push_intent=True, phase="push")
             self.git("push", target, f"{head}:refs/heads/{self.state['branch']}")
         self.save(pushed=True)
+
+    def rewrite_body_links(self):
+        """Publish a link to a reviewed commit at H only when H holds the same blob.
+
+        GitHub renders blob and raw links only for commits it has, and the squash discards the
+        reviewed commits. The reviewed body and its digest stay unchanged: only the bytes the PR
+        API reads change, and `body_rewrites` records how many links moved.
+        """
+        head = self.state.get("H")
+        if not head or self.reviewed_body is None:
+            return
+        reviewed = set(self.git("rev-list", f"{self.state['B']}..{self.state['R']}").split())
+        identity = f"{self.repo.owner}/{self.repo.name}".lower()
+        count = 0
+
+        def blob(commit, path):
+            try:
+                return self.git("rev-parse", "--verify", "--quiet", f"{commit}:{path}")
+            except subprocess.CalledProcessError:
+                return ""
+
+        def published(match):
+            nonlocal count
+            if match["repo"].lower() != identity:
+                return match[0]
+            try:
+                commit = self.git("rev-parse", "--verify", "--quiet", f"{match['sha']}^{{commit}}")
+            except subprocess.CalledProcessError:
+                return match[0]
+            if commit not in reviewed:
+                return match[0]
+            path = unquote(match["path"])
+            same = blob(commit, path)
+            if not same or same != blob(head, path):
+                return match[0]
+            count += 1
+            url = (
+                f"https://github.com/{self.repo.owner}/{self.repo.name}/"
+                f"{match['kind']}/{head}/{match['path']}"
+            )
+            return url + (match["suffix"] or "")
+
+        body = BODY_LINK.sub(published, self.reviewed_body)
+        if body != self.body:
+            self.body = body
+            self.body_file.write_text(body, encoding="utf-8")
+        if self.state.get("body_rewrites") != count:
+            self.save(body_rewrites=count)
 
     def validate_pr(self, pr):
         if (
@@ -946,21 +1404,28 @@ class Transaction:
             raise LandStop("land_pr_mismatch", "PR identity, state or reviewed publication differs")
         return pr
 
-    def edit_republished_pr(self):
+    def edit_published_pr(self):
+        """Write the current title and body to a published PR when its bytes differ."""
         intent = self.state.get("republish", {})
-        if not intent or not intent.get("head") or not self.state.get("pr"):
+        old = self.state.get("published_text", {})
+        if not self.state.get("pr") or not old or (intent and not intent.get("head")):
+            return
+        # A body that did not change needs no edit, but a republish still waits for the new head.
+        if old.get("title") == self.title and old.get("body") == self.body and not intent:
             return
         deadline = time.monotonic() + 60
         while True:
             pr = self.api.read_pull_request(self.repo, self.state["pr"]["number"], None)
             if pr.head_sha == self.state["H"]:
                 break
-            if pr.head_sha != intent["from"] or time.monotonic() >= deadline:
+            if pr.head_sha != intent.get("from") or time.monotonic() >= deadline:
                 raise LandStop("land_pr_mismatch", "republished PR head was not observed")
             self.wait(2)
         if pr.title == self.title and pr.body == self.body:
+            # An earlier attempt finished this edit; only its readback reply was lost. Record
+            # those bytes and clear the intent, so the next text change is a new edit.
+            self.save(edit_intent={}, published_text={"title": self.title, "body": self.body})
             return
-        old = self.state.get("published_text", {})
         if pr.title != old.get("title") or pr.body != old.get("body"):
             raise LandStop("land_pr_mismatch", "PR text differs from previously published bytes")
         entry = resume_entry(self.current())
@@ -979,6 +1444,9 @@ class Transaction:
         if observed.title == old.get("title") and observed.body == old.get("body"):
             raise LandStop("land_interrupted", "PR edit acknowledgement unknown; resume required")
         self.validate_pr(observed)
+        # The readback proves this edit; a later text change on the same head is a new edit,
+        # not a replay of an unknown acknowledgement.
+        self.save(edit_intent={})
 
     def pull_request(self, *, create=True):
         matches = self.api.find_pull_requests(
@@ -1069,7 +1537,8 @@ class Transaction:
     def green(self, evidence, apps, message):
         """A saved green identity covers only the app selection that observed it."""
         if evidence.state != "success":
-            raise LandStop("land_ci_failed", message)
+            fixable = any(e.conclusion == "failure" for e in evidence.evidence)
+            raise LandStop("land_ci_failed", message, fixable=fixable)
         current = digest([asdict(e) for e in evidence.evidence])
         saved, bots = self.saved_green()
         if saved == current:
@@ -1087,7 +1556,20 @@ class Transaction:
             return saved.get("digest"), tuple(saved.get("bots", ()))
         return saved, None
 
-    def ci(self):
+    def ci(self, *, bots=True, cycle=""):
+        """Observe CI for the publication head; `bots=False` leaves the bot window unstarted.
+
+        The draft phase proves CI before the review, so the review bots wait for a window that
+        only starts once the reviewed text is published and the pull request is ready. `cycle`
+        names the observation window: a cycle the job has not opened a window for resets it, so
+        a new draft check or a new accepted review never inherits a spent deadline, while a
+        retry under the same cycle keeps the window it opened.
+        """
+        if cycle:
+            gate = {"head": self.state["H"], "cycle": cycle}
+            if self.state.get("ci_gate") != gate:
+                self.reset_ci_window()
+                self.save(ci_gate=gate)
         bot = self.state.get("bot", {})
         if self.state.get("ci_green") and bot.get("apps") and bot.get("head") == self.state["H"]:
             evidence, apps, _ = self.observe_ci()
@@ -1115,7 +1597,7 @@ class Transaction:
             if evidence.state == "success":
                 self.green(evidence, apps, "CI became green under a new selection")
                 bot = self.state.get("bot", {})
-                if bot.get("apps") and bot.get("head") != self.state["H"]:
+                if bots and bot.get("apps") and bot.get("head") != self.state["H"]:
                     self.save(
                         bot={
                             **bot,
@@ -1137,9 +1619,12 @@ class Transaction:
 
     def rerun(self, evidence):
         failed = [e for e in evidence.evidence if e.kind == "run" and e.conclusion == "failure"]
+        # Only a conclusion the worker's code can fix returns to a fix round; a cancelled run,
+        # a timeout, an action-required gate or a missing check stays an owner-visible stop.
+        fixable = any(e.conclusion == "failure" for e in evidence.evidence)
         if "rerun_round" not in self.state:
             if not failed:
-                raise LandStop("land_ci_failed", "registered CI is not successful")
+                raise LandStop("land_ci_failed", "registered CI is not successful", fixable=fixable)
             self.save(
                 rerun_round={str(e.id): {"attempt": e.attempt, "issued": False} for e in failed}
             )
@@ -1147,9 +1632,9 @@ class Transaction:
         for failure in failed:
             saved = frozen.get(str(failure.id))
             if not saved or (saved["issued"] and failure.attempt > saved["attempt"]):
-                raise LandStop("land_ci_failed", "CI failed after frozen rerun round")
+                raise LandStop("land_ci_failed", "CI failed after frozen rerun round", fixable=True)
         if not failed:
-            raise LandStop("land_ci_failed", "non-rerunnable CI failure")
+            raise LandStop("land_ci_failed", "non-rerunnable CI failure", fixable=fixable)
         for run_id, saved in frozen.items():
             if saved["issued"]:
                 continue
@@ -1284,13 +1769,15 @@ class Transaction:
         repo = self.api.inspect_repository()
         if repo != self.repo:
             raise LandStop("land_pr_mismatch", "repository capabilities changed")
-        self.api._writable(repo)
+        self.api._writable(repo, self.current().merge_method)
         pr = self.validate_pr(
             self.api.read_pull_request(repo, self.state["pr"]["number"], self.state["H"])
         )
         if pr.state == "MERGED":
             self.save(S=pr.merge_sha, phase="merged")
             return None
+        if pr.draft:
+            raise LandStop("land_merge_failed", "the pull request is still a draft")
         if pr.mergeability not in {"clean", "has_hooks"} or pr.auto_merge is not False:
             raise LandStop("land_merge_failed", "direct mergeability is not proven")
         if not self.state.get("ci_green"):
@@ -1327,16 +1814,22 @@ class Transaction:
             if changed:
                 raise LandStop("land_interrupted", "review bot selection changed during the gate")
         self.bot_findings()
+        method = self.current().merge_method
         subject = self.title + f" (#{pr.number})"
+        # Only the written title is measured: the generated suffix that GitHub appends to the
+        # squash or merge subject is not part of the text the worker wrote or the review saw.
         problems = message_problems(
             job_text.squash_message(subject, self.commit),
             bullet_one_line=self.ctx.config.bullet_one_line,
+            generated_suffix=f" (#{pr.number})",
         )
         if problems:
             raise LandStop("land_merge_failed", "; ".join(problems))
         self.save(merge_intent=True, phase="merge")
         try:
-            self.api.squash_merge(repo, pr.number, self.state["H"], subject, self.commit_file)
+            self.api.merge_pull_request(
+                repo, pr.number, self.state["H"], subject, self.commit_file, method=method
+            )
         except forge.Uncertain:
             pass
         try:
@@ -1469,29 +1962,45 @@ class Transaction:
     def run(self):
         if self.state.get("replay"):
             self.finish_replay()
+        if self.draft_pending():
+            self.draft()
+            return
         self.initialize()
         self.owner_reasons()
         self.post_answers()
         self.prepare_republish()
         while True:
+            published_body = (self.state.get("published_text") or {}).get("body")
             if (
                 not self.state.get("S")
                 and self.state.get("H")
                 and not self.state.get("republish")
                 and not self.pending_base_update()
+                and published_body in (None, self.body)
             ):
                 self.pull_request(create=False)
             if not self.state.get("S") and not self.state.get("merge_intent"):
                 self.base_guard()
                 self.head()
                 self.observe_base_update()
-                self.edit_republished_pr()
+                self.edit_published_pr()
                 self.pull_request()
+                self.ready()
             if not self.state.get("S"):
                 if not self.state.get("merge_intent"):
-                    self.ci()
+                    try:
+                        self.ci(cycle=self.state.get("identity", ""))
+                    except LandStop as exc:
+                        if not exc.fixable or not self.return_for_ci_fix("reviewed", str(exc)):
+                            raise
                     self.bot()
-                if self.merge():
+                try:
+                    updated = self.merge()
+                except LandStop as exc:
+                    if not exc.fixable or not self.return_for_ci_fix("merge", str(exc)):
+                        raise
+                    updated = False
+                if updated:
                     continue
             break
         self.verify_tree()
@@ -1606,6 +2115,8 @@ def run_land(ctx):
         transaction = Transaction(ctx, lock.fileno())
         try:
             transaction.run()
+            return 0
+        except Routed:
             return 0
         except FreshnessRequeued:
             return 0
