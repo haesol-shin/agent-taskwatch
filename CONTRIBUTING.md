@@ -13,14 +13,13 @@ Thank you for your interest in agent-taskwatch. The rules are short.
 The project uses [uv](https://docs.astral.sh/uv/).
 
 ```sh
-uv sync --locked
-uv run ruff check
-uv run ruff format --check
-uv run pytest
-uv run python scripts/check_review_docs.py
+uv run python scripts/check_fast.py
 ```
 
-CI runs the same commands. A pull request must pass all of them.
+The command runs CI's lint, docs, commit message, Python test and extension checks with the same
+arguments, and selects only the test files of changed modules. The commit check reads the range
+from the merge base to `HEAD`; the measured slow test, paths it cannot map and the extension
+smoke stay in CI, which still runs the full suite on the pull request.
 
 CI also installs the package into a temporary prefix and runs the same script with `--tree <prefix>/share`: every relative link of a shipped document must resolve inside the installed tree, so a guide that names a file the install lacks fails before merge.
 
@@ -36,7 +35,7 @@ CI enforces the Ruff rules `E`, `F`, `I`, `C901` (max complexity 15) and line le
 
 ## Commits
 
-CI checks the shape of every commit in a pull request with `scripts/check_commit_messages.py`. Run the same check locally before you push:
+CI checks the shape of every commit in a pull request with `scripts/check_commit_messages.py`. The fast check already runs it against the merge base of `origin/main` and `HEAD`. To run only that check:
 
 ```sh
 uv run python scripts/check_commit_messages.py --range origin/main..HEAD
