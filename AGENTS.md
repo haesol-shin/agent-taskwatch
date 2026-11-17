@@ -5,14 +5,13 @@ Instructions for coding agents working in this repository.
 ## Commands
 
 ```sh
-uv sync --locked
-uv run ruff check
-uv run ruff format --check
-uv run pytest
-uv run python scripts/check_review_docs.py
+uv run python scripts/check_fast.py
 ```
 
-Run all four before you report a change as done.
+The command runs CI's lint, docs, commit message, Python test and extension checks with the same
+arguments, and selects only the test files of changed modules. The commit check reads the range
+from the merge base to `HEAD`; the measured slow test, paths it cannot map and the extension
+smoke stay in CI. Run it before you report a change as done.
 
 ## Rules
 
