@@ -12,7 +12,7 @@ When the result fingerprint and the basis (intent, spec, guidelines) equal those
 
 The checklist is a JSON file with a nonempty `items` list. Each item has a boolean `passes`. A `false` item, a missing file, invalid JSON, or an empty list blocks progress.
 
-The commit message of every step commit in the publication range is checked: the title is `type(scope): summary` or `type: summary` and at most 72 characters, one blank line follows it, no body line is over 72 characters, and no line is a trailer such as `Co-authored-by:`. The proposed squash message uses `title.txt` as its subject and the body-only `commit.txt` as its body (the title alone for a unit that declares `blank_squash_body`), and passes the same rules. With `commit_rules.bullet_one_line` on in [jobs-config.json](configuration.md#commit-rules), a body bullet (a line that starts with `- ` or `* `) also fails when an indented text line follows it: `line N continues the bullet on line M`. The switch is off by default; a nested bullet and a blank line after a bullet are not continuations.
+The commit message of every step commit in the publication range is checked: the title is `type(scope): summary` or `type: summary` and at most 72 characters, one blank line follows it, no body line is over 72 characters, and no line is a trailer such as `Co-authored-by:`. The proposed squash message uses `title.txt` as its subject and the body-only `commit.txt` as its body (the title alone for a unit that declares `blank_squash_body`), and passes the same rules. The 72 character subject limit measures the written subject; the ` (#n)` suffix that GitHub appends to a squash or merge subject is generated, never counted here or at merge, so a title that passes this check cannot fail the merge-time length rule. With `commit_rules.bullet_one_line` on in [jobs-config.json](configuration.md#commit-rules), a body bullet (a line that starts with `- ` or `* `) also fails when an indented text line follows it: `line N continues the bullet on line M`. The switch is off by default; a nested bullet and a blank line after a bullet are not continuations.
 
 Work and review sessions must settle and report no pending asynchronous work through public RPC state before the runner advances. Child transcripts and manifests are not acceptance evidence.
 
@@ -44,13 +44,13 @@ Configured landing bots follow the canonical [Review bots policy](configuration.
 
 [Configuration](configuration.md#public-text) owns the submission shape, complete-result range and exact worker grants; this section owns the generated evidence and copy contract.
 
-The check requires nonblank `title.txt`, `body.md` and body-only `commit.txt`; the title must be one subject line, and the title and squash body must be UTF-8. A unit that declares `blank_squash_body` in [configuration](configuration.md#public-text) inverts the last requirement: `commit.txt` must exist and be blank, and a nonblank file fails the check. Without the declaration a blank `commit.txt` stays an error. The squash body explains the problem or reason for the change rather than replacing it with a commit list, review process or test log.
+The check requires nonblank `title.txt`, `body.md` and body-only `commit.txt`; the title must be one subject line, the first nonblank line of `commit.txt` must not repeat it, and the title and squash body must be UTF-8. A unit that declares `blank_squash_body` in [configuration](configuration.md#public-text) inverts the last requirement: `commit.txt` must exist and be blank, and a nonblank file fails the check. Without the declaration a blank `commit.txt` stays an error. The squash body explains the problem or reason for the change rather than replacing it with a commit list, review process or test log. These bytes are what a final publication writes: a [draft CI](configuration.md#draft-ci-before-review) pull request opens with a fixed one-line body and receives the reviewed title and body only after an accepted review.
 
 Each new checked or reviewed publication state carries generated integer `text_contract: 2`, resolved base and head, the head tree and its text fingerprint.
 
 The text fingerprint binds the title, pull request body, squash body and ordered step commit messages; the single generated `Review evidence:` line in the pull request body is excluded.
 
-The review reads a read-only snapshot containing the three texts and the step commit messages, and the record retains the snapshot digest and publication state.
+The review reads a read-only snapshot containing the three texts and the step commit messages, and the record retains the snapshot digest and publication state. For a unit that lands by squash the step commit messages are context only, never published text.
 
 A changed title, pull request body, squash body or step commit message invalidates an earlier PASS; when the code is unchanged, the next round receives the text diff as a text-only review.
 

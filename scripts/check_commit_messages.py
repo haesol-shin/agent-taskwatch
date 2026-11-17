@@ -9,11 +9,21 @@ reject, and the commits it brings in are checked on their own.
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from taskwatch.checks import message_problems
+
+_PR_SUFFIX = re.compile(r" \(#\d+\)$")
+
+
+def _generated_suffix(message: str) -> str:
+    """The ` (#N)` a squash or merge appends to the written subject, if present."""
+    subject = message.split("\n", 1)[0]
+    match = _PR_SUFFIX.search(subject)
+    return match.group(0) if match else ""
 
 
 def _git(*args: str) -> str:
@@ -37,7 +47,7 @@ def check_range(rev_range: str) -> int:
         except subprocess.CalledProcessError as error:
             print(f"git log failed for {sha}: {error.stderr.strip()}", file=sys.stderr)
             return 2
-        for problem in message_problems(message):
+        for problem in message_problems(message, generated_suffix=_generated_suffix(message)):
             print(f"{sha}: {problem}")
             failed = True
     if failed:
@@ -52,7 +62,7 @@ def check_message_file(path: str) -> int:
     except (OSError, UnicodeError) as error:
         print(f"{path}: cannot read: {error}", file=sys.stderr)
         return 2
-    problems = message_problems(message)
+    problems = message_problems(message, generated_suffix=_generated_suffix(message))
     for problem in problems:
         print(f"{path}: {problem}")
     if problems:

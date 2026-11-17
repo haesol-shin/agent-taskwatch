@@ -165,9 +165,11 @@ if args[:2] == ["pr", "create"]:
         fail()
     body = Path(option("--body-file")).read_bytes()
     state["created_body"] = body.hex()
+    state["created_draft"] = "--draft" in args
     pr = state["new_pull"]
     pr["title"] = option("--title")
     pr["body"] = body.decode("utf-8")
+    pr["draft"] = state["created_draft"]
     state["pulls"][str(pr["number"])] = pr
     state["pull_pages"] = [[pr]]
     save()
@@ -176,6 +178,14 @@ if args[:2] == ["pr", "create"]:
     if state.get("create_lost_ack"):
         fail()
     print(pr["html_url"])
+elif args[:2] == ["pr", "ready"]:
+    pr = state["pulls"][args[2]]
+    state["ready_calls"] = state.get("ready_calls", 0) + 1
+    if state.get("ready_observed", True):
+        pr["draft"] = False
+    save()
+    if state.get("ready_lost_ack"):
+        fail()
 elif args[:2] == ["pr", "edit"]:
     pr = state["pulls"][args[2]]
     body = Path(option("--body-file")).read_bytes()
@@ -193,11 +203,15 @@ elif args[:2] == ["pr", "edit"]:
     if state.get("edit_lost_ack"):
         fail()
 elif args[:2] == ["pr", "merge"]:
-    if "--squash" not in args or option("--match-head-commit") != state["head"]:
+    methods = {"--squash", "--merge"} & set(args)
+    if len(methods) != 1 or option("--match-head-commit") != state["head"]:
+        fail()
+    if state["pulls"][args[2]].get("draft"):
         fail()
     pr = state["pulls"][args[2]]
     state["merged_body"] = Path(option("--body-file")).read_bytes().hex()
     state["merged_subject"] = option("--subject")
+    state["merged_method"] = methods.pop()[2:]
     if state.get("merge_observed", True):
         pr.update(state="closed", merged=True, merge_commit_sha=state["squash"])
     save()
@@ -228,6 +242,7 @@ def pull(head, number=17, **updates):
         "merge_commit_sha": None,
         "mergeable_state": "clean",
         "auto_merge": None,
+        "draft": False,
     }
     value.update(updates)
     return value
@@ -278,6 +293,7 @@ class ForgeFixture:
                 "full_name": "sample/project",
                 "default_branch": "main",
                 "allow_squash_merge": True,
+                "allow_merge_commit": True,
             },
             "branch": {"name": "main", "protected": False},
             "rules": [[]],
@@ -385,27 +401,64 @@ def test_create_consumes_body_bytes_and_observes_created_identity(forge):
 def test_merge_consumes_body_and_requires_observed_squash_sha(forge):
     body = forge.body_file()
     assert (
-        forge.client.squash_merge(
+        forge.client.merge_pull_request(
             forge.repo,
             17,
             forge.head,
             "fix: deterministic landing (#17)",
             body,
+            method="squash",
         )
         is None
     )
     state = forge.observed()
     assert bytes.fromhex(state["merged_body"]) == body.read_bytes()
     assert state["merged_subject"] == "fix: deterministic landing (#17)"
+    assert state["merged_method"] == "squash"
     merged = forge.client.observe_merge(forge.repo, 17, forge.head)
     assert (merged.number, merged.head_sha, merged.merge_sha) == (17, forge.head, SQUASH_SHA)
     assert merged.merge_sha != merged.head_sha
 
 
+def test_merge_method_commit_passes_the_requested_flag(forge):
+    forge.client.merge_pull_request(
+        forge.repo,
+        17,
+        forge.head,
+        "fix: deterministic landing (#17)",
+        forge.body_file(),
+        method="merge",
+    )
+    assert forge.observed()["merged_method"] == "merge"
+
+
+def test_create_draft_and_mark_ready_before_merge(forge):
+    forge.data["pulls"] = {}
+    forge.data["pull_pages"] = [[]]
+    forge.save()
+    pr = forge.client.create_pull_request(
+        forge.repo, "topic", forge.head, "fix: draft", forge.body_file(), draft=True
+    )
+    assert pr.draft is True and forge.observed()["created_draft"] is True
+    ready = forge.client.ready_pull_request(forge.repo, pr.number, forge.head)
+    assert ready.draft is False
+    forge.client.merge_pull_request(
+        forge.repo, pr.number, forge.head, "fix: draft (#17)", forge.body_file()
+    )
+    assert forge.observed()["merged_subject"] == "fix: draft (#17)"
+
+
+def test_ready_needs_an_open_draft(forge):
+    with pytest.raises(Mismatch):
+        forge.client.ready_pull_request(forge.repo, 17, forge.head)
+
+
 def test_successful_merge_command_is_not_observed_merge_proof(forge):
     forge.data["merge_observed"] = False
     forge.save()
-    forge.client.squash_merge(forge.repo, 17, forge.head, "fix: guarded (#17)", forge.body_file())
+    forge.client.merge_pull_request(
+        forge.repo, 17, forge.head, "fix: guarded (#17)", forge.body_file()
+    )
     with pytest.raises(Pending):
         forge.client.observe_merge(forge.repo, 17, forge.head)
 
@@ -426,7 +479,7 @@ def test_lost_write_acknowledgement_requires_reconciliation(forge, operation):
         if operation == "create":
             forge.client.create_pull_request(forge.repo, "topic", forge.head, "fix: body", body)
         else:
-            forge.client.squash_merge(forge.repo, 17, forge.head, "fix: body (#17)", body)
+            forge.client.merge_pull_request(forge.repo, 17, forge.head, "fix: body (#17)", body)
     if operation == "create":
         (pr,) = forge.client.find_pull_requests(forge.repo, "topic", "main", forge.head)
         assert (pr.number, pr.head_sha, pr.state) == (17, forge.head, "OPEN")
@@ -769,22 +822,28 @@ def test_latest_failed_attempt_is_not_hidden_by_earlier_success(forge):
     assert (workflow.id, workflow.attempt, workflow.conclusion) == (51, 2, "failure")
 
 
-@pytest.mark.parametrize("capability", ["squash", "queue"])
-def test_unsupported_repository_cannot_create_or_merge(forge, capability):
-    if capability == "squash":
-        forge.data["repository"]["allow_squash_merge"] = False
-    else:
+@pytest.mark.parametrize("capability", ["squash", "merge", "queue"])
+def test_unsupported_repository_cannot_merge(forge, capability):
+    if capability == "queue":
         forge.data["rules"] = [[{"type": "merge_queue"}]]
+        method = "squash"
+    else:
+        key = "allow_squash_merge" if capability == "squash" else "allow_merge_commit"
+        forge.data["repository"][key] = False
+        method = capability
     forge.save()
     repo = forge.client.inspect_repository()
     body = forge.body_file()
     with pytest.raises(Unsupported):
-        forge.client.create_pull_request(repo, "topic", forge.head, "fix: body", body)
-    with pytest.raises(Unsupported):
-        forge.client.squash_merge(repo, 17, forge.head, "fix: body (#17)", body)
+        forge.client.merge_pull_request(
+            repo, 17, forge.head, "fix: body (#17)", body, method=method
+        )
     state = forge.observed()
-    assert "created_body" not in state
     assert "merged_body" not in state
+    if capability == "queue":
+        with pytest.raises(Unsupported):
+            forge.client.create_pull_request(repo, "topic", forge.head, "fix: body", body)
+        assert "created_body" not in state
 
 
 def test_ambiguous_duplicate_checks_do_not_discard_failure(forge):
@@ -890,7 +949,7 @@ def test_timeout_after_write_is_reconciled_without_repeating_write(forge, operat
         if operation == "create":
             forge.client.create_pull_request(forge.repo, "topic", forge.head, "fix: body", body)
         else:
-            forge.client.squash_merge(forge.repo, 17, forge.head, "fix: body (#17)", body)
+            forge.client.merge_pull_request(forge.repo, 17, forge.head, "fix: body (#17)", body)
     if operation == "create":
         (found,) = forge.client.find_pull_requests(forge.repo, "topic", "main", forge.head)
         assert found.body.encode() == body.read_bytes()

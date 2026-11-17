@@ -26,6 +26,7 @@ from .jobs import BLANK_SQUASH_BODY, UNIT_FILES, JobState
 SNAPSHOT = "text"
 EXIT_CHANGED = 2
 EXIT_NOT_REVIEWED = 3
+TITLE_REPEATED = "commit.txt repeats the title; remove the title from commit.txt, land adds it"
 
 
 def unit_file(folder: Path, unit_id: str, name: str) -> Path:
@@ -41,6 +42,12 @@ def squash_message(title: str, commit: str) -> str:
     """Title, one blank line and the body; the title alone when the body is blank."""
     subject = title.rstrip("\n")
     return f"{subject}\n\n{commit}" if commit.strip() else f"{subject}\n"
+
+
+def repeats_title(title: str, commit: str) -> bool:
+    """The body starts with the title, which land writes as the squash subject already."""
+    first = next((line.strip() for line in commit.splitlines() if line.strip()), "")
+    return bool(first) and first == title.strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +100,8 @@ def collect(
             raise ValueError(
                 f"commit.txt must be nonblank unless the unit declares {BLANK_SQUASH_BODY}"
             )
+        if repeats_title(title, commit):
+            raise ValueError(TITLE_REPEATED)
         units[unit["id"]] = UnitText(
             unit["id"],
             base,

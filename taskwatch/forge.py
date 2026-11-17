@@ -58,6 +58,7 @@ class Repository:
     default_branch: str
     squash_supported: bool | None
     queue_required: bool | None
+    merge_supported: bool | None = None
 
     @property
     def identity(self) -> str:
@@ -78,6 +79,8 @@ class PullRequest:
     mergeability: str | None
     auto_merge: bool | None
     head_branch: str
+    # A draft PR exists before its reviewed text and CI evidence do, and merges only once ready.
+    draft: bool = False
 
 
 @dataclass(frozen=True)
@@ -408,12 +411,18 @@ class GitHub:
             branch,
             _bool(data.get("allow_squash_merge")),
             any(_text(rule.get("type")) == "merge_queue" for rule in rules),
+            _bool(data.get("allow_merge_commit", False)),
         )
 
     @staticmethod
-    def _writable(repo: Repository):
-        if repo.squash_supported is not True or repo.queue_required is not False:
-            raise Unsupported("direct squash requires known squash support and no merge queue")
+    def _writable(repo: Repository, method: str | None = None):
+        """Fail closed on an unsupported or queued merge path; None only requires no queue."""
+        if repo.queue_required is not False:
+            raise Unsupported("direct merge requires a repository without a merge queue")
+        if method == "squash" and repo.squash_supported is not True:
+            raise Unsupported("direct squash requires known squash support")
+        if method == "merge" and repo.merge_supported is not True:
+            raise Unsupported("direct merge requires known merge commit support")
 
     def _pr(self, repo: Repository, data: dict, head_sha: str | None = None) -> PullRequest:
         head, base = _object(data.get("head")), _object(data.get("base"))
@@ -454,6 +463,7 @@ class GitHub:
             mergeability,
             auto is not None,
             _text(head.get("ref")),
+            _bool(data.get("draft", False)),
         )
 
     def read_pull_request(self, repo: Repository, number: int, head_sha: str) -> PullRequest:
@@ -585,7 +595,14 @@ class GitHub:
         )
 
     def create_pull_request(
-        self, repo: Repository, head_branch: str, head_sha: str, title: str, body_file: str | Path
+        self,
+        repo: Repository,
+        head_branch: str,
+        head_sha: str,
+        title: str,
+        body_file: str | Path,
+        *,
+        draft: bool = False,
     ) -> PullRequest:
         """Issue one create and reconcile its identity; any lost acknowledgement is uncertain."""
         self._writable(repo)
@@ -605,12 +622,13 @@ class GitHub:
                 _text(title),
                 "--body-file",
                 str(Path(body_file).resolve()),
+                *(["--draft"] if draft else []),
             ],
             write=True,
         )
         try:
             matches = self.find_pull_requests(repo, head_branch, repo.default_branch, head_sha)
-            if not matches or matches[0].state != "OPEN":
+            if not matches or matches[0].state != "OPEN" or matches[0].draft != draft:
                 raise Mismatch("created pull request is not uniquely open")
             return matches[0]
         except ForgeError:
@@ -1032,14 +1050,42 @@ class GitHub:
             write=True,
         )
 
-    def squash_merge(
-        self, repo: Repository, number: int, head_sha: str, subject: str, body_file: str | Path
+    def ready_pull_request(self, repo: Repository, number: int, head_sha: str) -> PullRequest:
+        """Mark a draft PR ready; the caller persists intent and reconciles uncertainty."""
+        pr = self.read_pull_request(repo, number, head_sha)
+        if pr.state != "OPEN" or not pr.draft:
+            raise Mismatch("ready requires an open draft pull request")
+        self._command(
+            ["gh", "pr", "ready", str(number), "--repo", repo.identity],
+            write=True,
+        )
+        try:
+            observed = self.read_pull_request(repo, number, head_sha)
+        except ForgeError:
+            raise Uncertain("ready acknowledgement requires pinned readback") from None
+        if observed.state != "OPEN" or observed.draft:
+            raise Uncertain("ready acknowledgement requires a ready readback")
+        return observed
+
+    def merge_pull_request(
+        self,
+        repo: Repository,
+        number: int,
+        head_sha: str,
+        subject: str,
+        body_file: str | Path,
+        *,
+        method: str = "squash",
     ) -> None:
-        """Request squash only; always call observe_merge to establish actual MERGED and S."""
-        self._writable(repo)
+        """Request one merge; always call observe_merge to establish actual MERGED and S."""
+        if method not in {"squash", "merge"}:
+            raise ForgeError("unsupported merge method")
+        self._writable(repo, method)
         pr = self.read_pull_request(repo, number, head_sha)
         if pr.state != "OPEN" or pr.auto_merge is not False:
             raise Mismatch("merge requires open PR without auto merge")
+        if pr.draft:
+            raise Mismatch("merge requires a ready pull request")
         if not subject.endswith(f" (#{number})"):
             raise Mismatch("merge subject must include the pull request suffix")
         self._command(
@@ -1050,7 +1096,7 @@ class GitHub:
                 str(number),
                 "--repo",
                 repo.identity,
-                "--squash",
+                f"--{method}",
                 "--match-head-commit",
                 head_sha,
                 "--subject",

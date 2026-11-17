@@ -1079,3 +1079,95 @@ def test_check_slots_rejects_nonpositive_noninteger_values(tmp_path, value):
     path.write_text(json.dumps(config), encoding="utf-8")
     with pytest.raises(ValueError, match="check_slots"):
         load_job_config(root)
+
+
+# --- the landing flow settings ---------------------------------------------------------------
+
+
+def _land_payload(tmp_path: Path, receipt: str, **extra: object) -> dict:
+    repo = make_repo(tmp_path, f"repo-{receipt}")
+    git(repo, "remote", "add", "origin", "https://github.com/sample/project.git")
+    return _code_payload(
+        tmp_path,
+        receipt,
+        target=str(repo),
+        land=True,
+        public_text=[{"id": "pr", "base": "main"}],
+        **extra,
+    )
+
+
+def test_landing_flow_defaults_come_from_the_repository_and_a_submission(tmp_path):
+    root = tmp_path / "root"
+    host_config(
+        root,
+        ci_before_review={"github.com/sample/project": True},
+        merge_method={"github.com/sample/project": "merge"},
+        ci_fix_max={"github.com/sample/project": 1},
+    )
+    jobs = Jobs(root)
+    data = _land_payload(tmp_path, "flow")
+    job = jobs.submit(data, 10)
+    assert (job.ci_before_review, job.merge_method, job.ci_fix_max) == (True, "merge", 1)
+    override = jobs.submit(
+        {
+            **data,
+            "receipt_key": "flow2",
+            "ci_before_review": False,
+            "merge_method": "squash",
+            "ci_fix_max": 0,
+        },
+        11,
+    )
+    assert (override.ci_before_review, override.merge_method, override.ci_fix_max) == (
+        False,
+        "squash",
+        0,
+    )
+
+
+def test_an_omitted_landing_flow_keeps_todays_order(tmp_path):
+    root = tmp_path / "root"
+    host_config(root)
+    job = Jobs(root).submit(_land_payload(tmp_path, "plain"), 10)
+    assert (job.ci_before_review, job.merge_method, job.ci_fix_max) == (False, "squash", 2)
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("ci_before_review", "yes", "ci_before_review"),
+        ("merge_method", "rebase", "merge_method"),
+        ("ci_fix_max", 11, "ci_fix_max"),
+        ("ci_fix_max", -1, "ci_fix_max"),
+    ],
+)
+def test_a_landing_flow_setting_must_be_valid(tmp_path, field, value, error):
+    jobs = Jobs(tmp_path / "root")
+    with pytest.raises(ValueError, match=error):
+        jobs.submit({**_land_payload(tmp_path, "bad"), field: value}, 10)
+    assert jobs.load() == {}
+
+
+def test_a_flow_setting_needs_a_landing_job(tmp_path):
+    jobs = Jobs(tmp_path / "root")
+    data = _code_payload(tmp_path, "plain")
+    data["ci_fix_max"] = 1
+    with pytest.raises(ValueError, match="landing job"):
+        jobs.submit(data, 10)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("ci_before_review", {"github.com/sample/project": "yes"}),
+        ("merge_method", {"github.com/sample/project": "rebase"}),
+        ("ci_fix_max", {"github.com/sample/project": 11}),
+        ("ci_fix_max", {"Sample/Project": 1}),
+    ],
+)
+def test_the_host_flow_settings_are_validated(tmp_path, key, value):
+    root = tmp_path / "root"
+    host_config(root, **{key: value})
+    with pytest.raises(ValueError, match=key):
+        load_job_config(root)

@@ -63,6 +63,16 @@ def test_a_long_line_fails_with_its_number(tmp_path: Path) -> None:
     assert f"{sha}: line 3 is 73 characters, the limit is 72" in done.stdout
 
 
+def test_a_generated_squash_suffix_is_not_counted(tmp_path: Path) -> None:
+    repo = good_repo(tmp_path)
+    title = f"feat(cli): {'x' * 57}"
+    assert len(title) == 68
+    head_commit(repo, f"{title} (#94)")
+    done = run(repo, "--range", "HEAD~1..HEAD")
+    assert done.returncode == 0
+    assert done.stdout.strip() == "ok"
+
+
 def test_a_trailer_fails_with_its_number(tmp_path: Path) -> None:
     repo = good_repo(tmp_path)
     sha = head_commit(repo, "feat: add a flag\n\nCo-authored-by: A <a@example.invalid>")

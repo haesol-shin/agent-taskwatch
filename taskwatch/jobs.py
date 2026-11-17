@@ -41,6 +41,8 @@ MIN_REVIEWS = 1
 MAX_REVIEWS = 5
 DEFAULT_MAX_REVIEWS = 3
 MAX_RECOVERIES = 3
+MERGE_METHODS = ("squash", "merge")
+MAX_CI_FIXES = 10
 
 DEFAULT_BRANCH_PREFIX = "taskwatch/"
 _PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*(/[A-Za-z0-9][A-Za-z0-9_-]*)*[/-]?")
@@ -136,6 +138,12 @@ class JobState:
     texts: Mapping[str, Mapping] = field(default_factory=dict)
     land: bool = False
     land_state: Mapping = field(default_factory=dict)
+    # Landing flow, frozen at submit from the host setting of the target repository and a
+    # per-submission override. `ci_before_review` opens a draft PR and waits for CI first;
+    # `merge_method` is squash or merge; `ci_fix_max` bounds fix rounds per publication.
+    ci_before_review: bool = False
+    merge_method: str = "squash"
+    ci_fix_max: int = 2
     # Code jobs: "full" answers every spec heading, "task_file" only SPEC_TASK_FILE_HEADINGS.
     spec_mode: str = "full"
     # Attempts already present when upgrading pre-print records remain RPC.
@@ -178,10 +186,16 @@ class JobConfig:
     review_bot_wait: int = 600
     land_base_update: bool = True
     check_slots: int | None = None  # None: every check command may run at once
+    # Per repository identity; a submission may override each value. Omitted keeps today's
+    # order, a squash merge and two CI fix rounds.
+    ci_before_review: Mapping[str, bool] | None = None
+    merge_method: Mapping[str, str] | None = None
+    ci_fix_max: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
-        if self.review_bots is not None:
-            object.__setattr__(self, "review_bots", _freeze(self.review_bots))
+        for name in ("review_bots", "ci_before_review", "merge_method", "ci_fix_max"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, _freeze(getattr(self, name)))
 
 
 COMMIT_RULES = ("bullet_one_line",)
@@ -276,6 +290,45 @@ def _review_bots(value: object) -> Mapping[str, tuple[str, ...]] | None:
     return MappingProxyType(bots)
 
 
+def _repository_settings(value: object, label: str, check) -> Mapping | None:
+    """An object from canonical repository identity to one validated value."""
+    from . import forge
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object of repository identities to values")
+    settings = {}
+    for key, item in value.items():
+        try:
+            host = key.split("/", 1)[0].lower()
+            identity = "/".join(forge.parse_origin(f"https://{key}", (host,))).lower()
+            if identity != key.lower() or identity in settings:
+                raise ValueError("noncanonical or duplicate repository identity")
+            settings[identity] = check(item)
+        except (ValueError, forge.ForgeError) as exc:
+            raise ValueError(f"invalid {label} entry {key!r}: {exc}") from exc
+    return MappingProxyType(settings)
+
+
+def _flow_order(value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError("ci_before_review must be true or false")
+    return value
+
+
+def _merge_method(value: object) -> str:
+    if value not in MERGE_METHODS:
+        raise ValueError(f"merge_method must be one of: {', '.join(MERGE_METHODS)}")
+    return value
+
+
+def _ci_fix_max(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= MAX_CI_FIXES:
+        raise ValueError(f"ci_fix_max must be an integer from 0 to {MAX_CI_FIXES}")
+    return value
+
+
 def _review_bot_wait(value: object) -> int:
     if type(value) is not int or value < 1:
         raise ValueError("review_bot_wait must be a positive integer")
@@ -326,6 +379,9 @@ def load_job_config(root: Path) -> JobConfig:
         "review_bot_wait",
         "land_base_update",
         "check_slots",
+        "ci_before_review",
+        "merge_method",
+        "ci_fix_max",
     } != {
         "version",
         "slots",
@@ -376,6 +432,11 @@ def load_job_config(root: Path) -> JobConfig:
     review_bot_wait = _review_bot_wait(obj.get("review_bot_wait", 600))
     land_base_update = _land_base_update(obj.get("land_base_update", True))
     check_slots = _check_slots(obj["check_slots"]) if "check_slots" in obj else None
+    ci_before_review = _repository_settings(
+        obj.get("ci_before_review"), "ci_before_review", _flow_order
+    )
+    merge_method = _repository_settings(obj.get("merge_method"), "merge_method", _merge_method)
+    ci_fix_max = _repository_settings(obj.get("ci_fix_max"), "ci_fix_max", _ci_fix_max)
     _strings(obj["deliver_command"], "deliver_command", nonempty=True)
     command = obj["deliver_command"]
     if command.count("{message}") != 1 or any(
@@ -405,6 +466,9 @@ def load_job_config(root: Path) -> JobConfig:
         review_bot_wait,
         land_base_update,
         check_slots,
+        ci_before_review,
+        merge_method,
+        ci_fix_max,
     )
 
 
@@ -445,6 +509,13 @@ class Jobs:
             data = _submission(payload)
             host = _host_config(self.state.root)
             data.setdefault("max_reviews", host.max_reviews)
+            if data.get("land"):
+                identity = _origin_identity(data["target"])
+                data.setdefault(
+                    "ci_before_review", bool((host.ci_before_review or {}).get(identity, False))
+                )
+                data.setdefault("merge_method", (host.merge_method or {}).get(identity, "squash"))
+                data.setdefault("ci_fix_max", (host.ci_fix_max or {}).get(identity, 2))
             _worker_role_allowed(data, host)
             _resolve_receipt_tokens(data, existing, host.branch_prefix)
             _public_text_base(data, existing)
@@ -518,6 +589,9 @@ _OPTIONAL_FIELDS = {
     "land",
     "spec_mode",
     "worker_role",
+    "ci_before_review",
+    "merge_method",
+    "ci_fix_max",
 }
 UNIT_FILES = ("title.txt", "body.md", "commit.txt")
 # Optional public_text key: the repository requires the squash commit body to be blank.
@@ -603,6 +677,39 @@ def _land_field(data: dict, review_only: bool) -> None:
         raise ValueError("land requires a result-building code job with one public_text unit")
 
 
+def _flow_fields(data: dict) -> None:
+    """The landing flow keys apply only to a landing job; a submission may override them."""
+    keys = {"ci_before_review", "merge_method", "ci_fix_max"} & data.keys()
+    if keys and not data["land"]:
+        raise ValueError(f"{', '.join(sorted(keys))} applies only to a landing job")
+    if "ci_before_review" in data:
+        _flow_order(data["ci_before_review"])
+    if "merge_method" in data:
+        _merge_method(data["merge_method"])
+    if "ci_fix_max" in data:
+        _ci_fix_max(data["ci_fix_max"])
+
+
+def _origin_identity(target: str) -> str:
+    """The canonical identity of the target's origin, or empty when it cannot be read."""
+    from . import forge
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", target, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode:
+            return ""
+        host, owner, name = forge.parse_origin(proc.stdout.removesuffix("\n"))
+        return f"{host}/{owner}/{name}".lower()
+    except (OSError, subprocess.SubprocessError, ValueError, forge.ForgeError):
+        return ""
+
+
 def _submission(payload: dict) -> dict:
     # A review target replaces the work contract: there is no work stage to describe.
     review_only = isinstance(payload, dict) and "review_target" in payload
@@ -634,6 +741,7 @@ def _submission(payload: dict) -> dict:
     if "public_text" in data:
         _public_text_field(data, review_only)
     _land_field(data, review_only)
+    _flow_fields(data)
     if "worker_role" in data:
         _worker_role_field(data, review_only)
     data.setdefault("predecessors", [])
@@ -968,6 +1076,13 @@ def _validate_land(job: dict) -> None:
         raise RecordError("jobs.jsonl: invalid land")
     if not isinstance(job.get("land_state", {}), dict):
         raise RecordError("jobs.jsonl: invalid land_state")
+    if type(job.get("ci_before_review", False)) is not bool:
+        raise RecordError("jobs.jsonl: invalid ci_before_review")
+    if job.get("merge_method", "squash") not in MERGE_METHODS:
+        raise RecordError("jobs.jsonl: invalid merge_method")
+    fixes = job.get("ci_fix_max", 2)
+    if type(fixes) is not int or not 0 <= fixes <= MAX_CI_FIXES:
+        raise RecordError("jobs.jsonl: invalid ci_fix_max")
     predecessor = job.get("base_predecessor", "")
     if not isinstance(predecessor, str) or (
         predecessor and re.fullmatch(r"[0-9a-f]{32}", predecessor) is None
