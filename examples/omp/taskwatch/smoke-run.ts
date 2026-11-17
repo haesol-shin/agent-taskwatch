@@ -90,7 +90,7 @@ async function boot(flag: string | undefined) {
   runner.initialize(
     {
       sendMessage: () => void sent.push("sendMessage"),
-      sendUserMessage: () => void sent.push("sendUserMessage"),
+      sendUserMessage: async () => void sent.push("sendUserMessage"),
       appendEntry: () => void sent.push("appendEntry"),
       setLabel: () => undefined,
       getActiveTools: () => [],
