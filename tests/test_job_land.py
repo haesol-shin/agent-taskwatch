@@ -39,6 +39,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -48,6 +49,11 @@ state = json.loads(state_file.read_text(encoding="utf-8"))
 args = sys.argv[1:]
 with Path(os.environ["FORGE_LOG"]).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(args) + "\n")
+slow_file = Path(__file__).with_name("slow-gh")
+if slow_file.exists():
+    slow = json.loads(slow_file.read_text(encoding="utf-8"))
+    if args[: len(slow["argv"])] == slow["argv"]:
+        time.sleep(slow["seconds"])
 
 
 def save():
@@ -333,9 +339,11 @@ else:
     fail()
 """
 SHIM = r"""
+import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 real, bare = os.environ["REAL_GIT"], os.environ["REMOTE_BARE"]
@@ -344,6 +352,11 @@ index = 0
 while index < len(args) and args[index].startswith("-"):
     index += 2 if args[index] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") else 1
 command = args[index] if index < len(args) else ""
+slow_file = Path(__file__).with_name("slow-git")
+if slow_file.exists():
+    slow = json.loads(slow_file.read_text(encoding="utf-8"))
+    if args[: len(slow["argv"])] == slow["argv"]:
+        time.sleep(slow["seconds"])
 prefix = []
 if command in {"fetch", "push", "ls-remote"}:
     prefix = ["-c", f"url.{bare}.insteadOf=https://github.com/sample/project.git"]
@@ -839,6 +852,12 @@ def cleaned_forge(lab: Lab) -> None:
     """Nothing was published: no forge write, no landing branch on the remote."""
     assert lab.writes() == []
     assert git(lab.bare, "branch", "--list", "*-land") == ""
+
+
+def slow_command(lab: Lab, argv: list[str], seconds: float, *, gh: bool = False) -> None:
+    """Make the git or gh call with this argv prefix sleep instead of answering at once."""
+    name = "slow-gh" if gh else "slow-git"
+    (lab.bin / name).write_text(json.dumps({"argv": argv, "seconds": seconds}), encoding="utf-8")
 
 
 # --- the full path ---------------------------------------------------------------------------
@@ -3673,3 +3692,93 @@ def test_the_draft_ci_observes_with_the_check_cycle(make):
         tx.ci = lambda **kwargs: captured.update(kwargs)
         tx.draft()
     assert captured == {"bots": False, "cycle": "cycle-1"}
+
+
+# --- command limits --------------------------------------------------------------------------
+
+
+def test_land_command_timeout_defaults_to_300_seconds(tmp_path):
+    root = tmp_path / "root"
+    assert cli_main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config.pop("land_command_timeout", None)
+    path.write_text(json.dumps(config), encoding="utf-8")
+    assert load_job_config(root).land_command_timeout == 300
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, "300", True, None])
+def test_land_command_timeout_is_a_positive_integer(tmp_path, value):
+    root = tmp_path / "root"
+    assert cli_main(["--root", str(root), "init"]) == 0
+    path = root / "taskwatch" / "jobs-config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["land_command_timeout"] = value
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="land_command_timeout"):
+        load_job_config(root)
+
+
+def test_a_slow_land_git_command_stops_with_the_full_command(make):
+    lab = make()
+    lab.accept()
+    slow_command(lab, ["remote", "get-url"], 0.5)
+    job = lab.put("land")
+    ctx = Ctx(
+        lab.jobs,
+        replace(load_job_config(lab.root), land_command_timeout=0.2),
+        job,
+        lab.folder(),
+        lab.tree,
+    )
+    assert job_land.run_land(ctx) == 1
+    stopped = lab.get()
+    assert (stopped.stage, stopped.wait_reason) == ("user_wait", "land_interrupted")
+    assert stopped.error == "command timed out after 0.2 seconds: git remote get-url --all origin"
+
+
+def test_a_slow_land_gh_command_stops_with_the_full_command(make):
+    lab = make()
+    lab.accept()
+    slow_command(lab, ["auth", "status"], 0.5, gh=True)
+    job = lab.put("land")
+    ctx = Ctx(
+        lab.jobs,
+        replace(load_job_config(lab.root), land_command_timeout=0.2),
+        job,
+        lab.folder(),
+        lab.tree,
+    )
+    assert job_land.run_land(ctx) == 1
+    stopped = lab.get()
+    assert (stopped.stage, stopped.wait_reason) == ("user_wait", "land_interrupted")
+    assert stopped.error == (
+        "command timed out after 0.2 seconds: gh auth status --hostname github.com"
+    )
+
+
+def test_a_land_git_timeout_reaches_the_stop_with_the_command(make, monkeypatch):
+    lab = make()
+    lab.accept()
+    job = lab.put("land")
+    argv = ["git", "push", "origin", "topic:topic-land"]
+
+    def timeout(self):
+        raise subprocess.TimeoutExpired(argv, 300)
+
+    monkeypatch.setattr(job_land.Transaction, "run", timeout)
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    assert job_land.run_land(ctx) == 1
+    stopped = lab.get()
+    assert (stopped.stage, stopped.wait_reason) == ("user_wait", "land_interrupted")
+    assert stopped.error == "command timed out after 300 seconds: git push origin topic:topic-land"
+    assert stopped.land_state["last_error"] == "land_interrupted"
+
+
+def test_a_land_command_inside_the_limit_lets_landing_finish(make):
+    lab = make(host={"land_command_timeout": 2})
+    lab.accept()
+    slow_command(lab, ["remote", "get-url"], 0.5)
+    lab.finish()
+    assert lab.writes() == ["pr create", "pr merge"]
+    assert lab.land()["install"]["status"] == "succeeded"

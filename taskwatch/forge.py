@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import time
@@ -48,6 +49,12 @@ class Pending(ForgeError):
 
 class Uncertain(ForgeError):
     """A write may have happened; reconcile stable identity before issuing it again."""
+
+
+def command_timeout(exc: subprocess.TimeoutExpired) -> str:
+    """A timeout that names the whole shell-joined command, so a stop record says what hung."""
+    argv = exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd]
+    return f"command timed out after {exc.timeout:g} seconds: {shlex.join(map(str, argv))}"
 
 
 @dataclass(frozen=True)
@@ -389,8 +396,8 @@ class GitHub:
         # The shared helper supplies local tracking evidence, never its main fallback as truth.
         try:
             local = default_branch(str(self.target), self.env, timeout=self._remaining())
-        except subprocess.TimeoutExpired:
-            raise Pending("local default branch lookup timed out") from None
+        except subprocess.TimeoutExpired as exc:
+            raise Pending(command_timeout(exc)) from None
         except OSError:
             raise ForgeError("local default branch lookup failed") from None
         tracked = self._command(
