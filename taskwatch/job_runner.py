@@ -1689,21 +1689,39 @@ def _check_step(ctx: Ctx) -> int:
 
 def _check_route(job: JobState, problems: list[str]) -> dict:
     ended = {"ended_at": _now()}
+    message = "; ".join(problems)
     if not problems:
         # Machine checks run before the review. A landing job with CI before review publishes
         # a draft PR and waits for its CI in the land step, then returns to this review.
         stage = "land" if job.land and job.ci_before_review and _builds_commits(job) else "review"
-        return {**ended, "stage": stage, "resume_stage": stage, "recoveries": 0, "error": ""}
-    message = "; ".join(problems)
-    if job.recoveries < MAX_RECOVERIES:
-        return {
+        route = {**ended, "stage": stage, "resume_stage": stage, "recoveries": 0, "error": ""}
+    elif job.recoveries < MAX_RECOVERIES:
+        route = {
             **ended,
             "stage": "fix",
             "resume_stage": "fix",
             "recoveries": job.recoveries + 1,
             "error": message,
         }
-    return {**ended, "stage": "user_wait", "wait_reason": "check_failed", "error": message}
+    else:
+        route = {**ended, "stage": "user_wait", "wait_reason": "check_failed", "error": message}
+    # Every check step of the cycle counts, the one that reaches the budget included, so a
+    # pass cannot reset the loop and the owner decides whether another cycle is worth it.
+    spent = len(job.checks) + 1 - job.check_cycle_start
+    if spent < job.max_checks:
+        return route
+    counts = f"{spent} of {job.max_checks} checks used in this cycle"
+    error = f"check budget exhausted: {counts}"
+    if message:
+        error = f"{message}; {error}"
+    return {
+        **route,
+        "stage": "user_wait",
+        "wait_reason": "check_budget_exhausted",
+        # A failed check still needs the worker, while a pass continues to its own next stage.
+        "resume_stage": "fix" if problems else route["resume_stage"],
+        "error": error,
+    }
 
 
 # --- review --------------------------------------------------------------------------------

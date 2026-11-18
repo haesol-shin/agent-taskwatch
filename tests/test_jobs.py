@@ -503,6 +503,30 @@ def test_max_reviews_is_per_job_over_host_over_built_in_and_frozen_at_submit(tmp
     assert stored == {"a": 3, "b": 2, "c": 1}  # a later host change leaves a stored job alone
 
 
+def test_max_checks_is_the_host_default_frozen_at_submit(tmp_path):
+    root = tmp_path / "root"
+    jobs = Jobs(root)
+    assert jobs.submit(payload(tmp_path, "a"), 1).max_checks == 8  # built-in default
+    path = host_config(root, max_checks=2)
+    assert jobs.submit(payload(tmp_path, "b"), 2).max_checks == 2
+    path.write_text(
+        json.dumps({**json.loads(path.read_text(encoding="utf-8")), "max_checks": 5}),
+        encoding="utf-8",
+    )
+    stored = {job.receipt_key: job.max_checks for job in Jobs(root).load().values()}
+    assert stored == {"a": 8, "b": 2}  # a later host change leaves a stored job alone
+
+
+@pytest.mark.parametrize("value", [True, None, "2", 2.0, 0, -1])
+def test_an_invalid_host_max_checks_is_a_config_error_and_blocks_submission(tmp_path, value):
+    root = tmp_path / "root"
+    host_config(root, max_checks=value)
+    with pytest.raises(ValueError, match="max_checks"):
+        load_job_config(root)
+    with pytest.raises(ValueError, match="max_checks"):
+        Jobs(root).submit(payload(tmp_path), 1)
+
+
 BAD_COUNTS = [True, None, "2", 2.0, 0, 6, -1, [2]]
 
 
@@ -578,6 +602,17 @@ def test_landing_defaults_history_and_frozen_state(tmp_path):
         saved.land_state["install"]["status"] = "succeeded"
     assert saved.land_state["runs"] == (1,)
     assert saved.to_json()["land_state"] == {"install": {"status": "disabled"}, "runs": [1]}
+
+
+def test_an_older_record_starts_its_check_cycle_at_the_current_check_record(tmp_path):
+    job = Jobs(tmp_path / "root").submit(payload(tmp_path))
+    data = job.to_json()
+    data["checks"] = [{"seq": 1, "ok": True}, {"seq": 2, "ok": True}]
+    for key in ("max_checks", "check_cycle_start"):
+        del data[key]
+    older = decode_job(data)
+    # History cannot prove which run belongs to the current cycle, so it is not charged.
+    assert (older.max_checks, older.check_cycle_start) == (8, 2)
 
 
 @pytest.mark.parametrize("value", [0, 1, None, "true", [], {}])

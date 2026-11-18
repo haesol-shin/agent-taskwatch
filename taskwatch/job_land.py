@@ -64,6 +64,35 @@ def resume_entry(job):
     return sum(e.get("type") in {"resume", "approve"} for e in job.events)
 
 
+def green_outcome(evidence):
+    """What a saved green proves: the head and the stable identity of every passing check.
+
+    A re-report, a new run or check id, a changed attempt or status, and the order of the
+    evidence all move while the CI result stays green, so none of them belongs here.
+    """
+    return {
+        "head": evidence.head_sha,
+        "checks": sorted(
+            json.dumps([item.kind, item.name, item.app_id, item.workflow])
+            for item in evidence.evidence
+        ),
+    }
+
+
+def green_changed(saved, current):
+    """True when the observed success no longer covers the saved one.
+
+    Every observation that reaches here is green, so a stop means a saved check disappeared or
+    the head moved, not that a field changed. A record without the outcome shape is not
+    comparable and is re-recorded instead of trusted.
+    """
+    if not isinstance(saved, dict) or "head" not in saved or "checks" not in saved:
+        return False
+    if saved["head"] != current["head"]:
+        return True
+    return bool(set(saved["checks"]) - set(current["checks"]))
+
+
 # How long a merged commit may take to register its default-branch push workflows.
 POST_MERGE_GRACE = 15
 
@@ -937,6 +966,28 @@ class Transaction:
             raise LandStop("land_base_moved", "automatic base update conflicts: " + detail)
         return tree
 
+    def link_dependencies(self, path):
+        """Give the detached tree the job worktree's ignored paths.
+
+        A fresh worktree holds no built dependencies, so a check that needs `node_modules`, a
+        virtual environment or another ignored folder fails there although it passed in the job
+        worktree. A symlink shares them without copying, does not touch the result workspace and
+        goes away with the tree, so running the check here keeps the smallest surface.
+        """
+        workspace = Path(self.ctx.job.workspace)
+        listing = self.command(
+            ["git", "-C", str(workspace), "status", "--porcelain", "--ignored=traditional", "-z"]
+        )
+        for entry in listing.split("\0"):
+            if not entry.startswith("!! "):
+                continue
+            relative = Path(entry[3:].rstrip("/"))
+            source, target = workspace / relative, path / relative
+            if target.exists() or target.is_symlink():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(source, target_is_directory=source.is_dir())
+
     def check_updated_tree(self, head, main, tree):
         """Run the accepted check command on the updated tree before publication.
 
@@ -950,6 +1001,7 @@ class Transaction:
         record = {"exit_code": 0, "log": str(log)}
         try:
             self.git("worktree", "add", "--detach", str(path), head)
+            self.link_dependencies(path)
             slot = None
             try:
                 slot = _acquire_slot(self.ctx)
@@ -1303,6 +1355,7 @@ class Transaction:
                 "recoveries": 0,
                 "reviews_used": 0,
                 "review_cycle_start": len(j.reviews),
+                "check_cycle_start": len(j.checks),
                 "events": _event(j, type="land_replay", entry=resume_entry(j), **replay),
             },
         )
@@ -1571,21 +1624,20 @@ class Transaction:
         if evidence.state != "success":
             fixable = any(e.conclusion == "failure" for e in evidence.evidence)
             raise LandStop("land_ci_failed", message, fixable=fixable)
-        current = digest([asdict(e) for e in evidence.evidence])
+        current = green_outcome(evidence)
         saved, bots = self.saved_green()
-        if saved == current:
-            if bots is not None and bots != tuple(apps):
-                self.save(ci_green={"digest": current, "bots": list(apps)})
+        # A record from before selections were stored cannot prove which apps it excluded, and
+        # a legacy digest of every field cannot tell an id or status change from a real one.
+        if saved is not None and bots is not None and bots == tuple(apps):
+            if green_changed(saved, current):
+                raise LandStop("land_ci_failed", message)
             return
-        # A record from before selections were stored cannot prove which apps it excluded.
-        if saved and bots is not None and bots == tuple(apps):
-            raise LandStop("land_ci_failed", message)
-        self.save(ci_green={"digest": current, "bots": list(apps)})
+        self.save(ci_green={"outcome": current, "bots": list(apps)})
 
     def saved_green(self):
         saved = self.state.get("ci_green")
         if isinstance(saved, dict):
-            return saved.get("digest"), tuple(saved.get("bots", ()))
+            return saved.get("outcome"), tuple(saved.get("bots", ()))
         return saved, None
 
     def ci(self, *, bots=True, cycle=""):
