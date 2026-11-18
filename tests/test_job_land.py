@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from taskwatch import job_land
+from taskwatch.forge import CI, CIEvidence
 from taskwatch.job_cli import main as cli_main
 from taskwatch.job_runner import Ctx, run_job
 from taskwatch.job_scan import scan_jobs
@@ -1257,6 +1258,28 @@ def test_the_update_check_waits_for_a_host_check_slot(make):
         os.close(held)
     worker.join(30)
     assert not worker.is_alive() and result == {"exit_code": 0} and log.is_file()
+
+
+def test_the_update_check_reuses_the_job_worktrees_ignored_dependencies(make):
+    lab = make(window=30)
+    lab.prepare(extra={".gitignore": "deps/\n"})
+    script = (
+        "import sys\n"
+        "ready = open('deps/value.txt').read().strip() == 'ready'\n"
+        "sys.exit(0 if ready else 1)\n"
+    )
+    lab.jobs.save(replace(lab.get(), check_command=(sys.executable, "-c", script)), time.time())
+    (lab.tree / "deps").mkdir()
+    (lab.tree / "deps" / "value.txt").write_text("ready\n", encoding="utf-8")
+    head = git(lab.tree, "rev-parse", "HEAD")
+    tree = git(lab.tree, "rev-parse", "HEAD^{tree}")
+    job = lab.put("land")
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    with (lab.repo / ".git" / "HEAD").open() as lock:
+        tx = job_land.Transaction(ctx, lock.fileno())
+        assert tx.check_updated_tree(head, head, tree)["exit_code"] == 0
+    assert (lab.tree / "deps" / "value.txt").read_text(encoding="utf-8") == "ready\n"
+    assert not (lab.folder() / "base-update-tree").exists()
 
 
 def test_base_update_can_be_turned_off(make):
@@ -2731,18 +2754,89 @@ def test_a_selection_change_reuses_the_existing_bot_window(monkeypatch):
     assert tx.state["bot"]["outcome"] == {APP: "complete", "second-app": "complete"}
 
 
-def test_a_legacy_green_record_keeps_the_selection_it_observed():
+def ci_row(name, *, kind="check", app_id=None, workflow=None, conclusion="success", check_id=1):
+    return CIEvidence(
+        kind,
+        check_id,
+        "a" * 40,
+        name,
+        workflow,
+        "completed",
+        conclusion,
+        True,
+        check_id,
+        app_id,
+    )
+
+
+def green_tx():
+    tx = object.__new__(job_land.Transaction)
+    tx.state = {}
+    tx.save = lambda **changes: tx.state.update(changes)
+    return tx
+
+
+def green_ci(*rows, head="a" * 40):
+    run = ci_row("CI", kind="run", workflow=".github/workflows/ci.yml")
+    return CI(head, (*rows, run))
+
+
+def test_a_legacy_green_digest_is_recorded_in_the_outcome_shape():
     tx = object.__new__(job_land.Transaction)
     tx.state = {"ci_green": "a" * 64, "bot": {"apps": [APP], "threads": {}}}
     tx.save = lambda **changes: tx.state.update(changes)
     tx.migrate_green()
     assert tx.state["ci_green"] == {"digest": "a" * 64, "bots": [APP]}
-    evidence = SimpleNamespace(state="success", evidence=())
+    tx.green(green_ci(ci_row("build")), (APP,), "saved green CI identity changed")
+    # The old digest covered ids and statuses, so it cannot prove a changed result.
+    assert tx.state["ci_green"]["bots"] == [APP]
+    assert tx.state["ci_green"]["outcome"]["head"] == "a" * 40
+
+
+def test_a_re_report_or_a_new_successful_check_keeps_a_saved_green():
+    tx = green_tx()
+    tx.green(green_ci(ci_row("build", app_id=1)), (APP,), "saved green")
+    later = green_ci(
+        # The same check re-reported with a new id and attempt.
+        ci_row("build", app_id=1, check_id=77),
+        ci_row("lint", app_id=2),  # a check added after the first green
+    )
+    assert later.state == "success"
+    tx.green(later, (APP,), "saved green CI identity changed")
+    assert tx.state["ci_green"] == {
+        "outcome": job_land.green_outcome(green_ci(ci_row("build", app_id=1))),
+        "bots": [APP],
+    }
+
+
+def test_a_disappeared_check_or_a_new_head_stops_a_saved_green():
+    tx = green_tx()
+    tx.green(
+        green_ci(ci_row("build"), ci_row("lint", app_id=2)),
+        (APP,),
+        "saved green CI identity changed",
+    )
     with pytest.raises(job_land.LandStop) as stopped:
-        tx.green(evidence, (APP,), "saved green CI identity changed")
+        tx.green(green_ci(ci_row("build")), (APP,), "saved green CI identity changed")
     assert stopped.value.reason == "land_ci_failed"
-    tx.green(evidence, ("second-app",), "saved green CI identity changed")
-    assert tx.state["ci_green"]["bots"] == ["second-app"]
+    with pytest.raises(job_land.LandStop) as stopped:
+        tx.green(
+            green_ci(ci_row("build"), ci_row("lint", app_id=2), head="b" * 40),
+            (APP,),
+            "saved green CI identity changed",
+        )
+    assert stopped.value.reason == "land_ci_failed"
+
+
+def test_a_saved_green_from_another_selection_is_not_compared():
+    tx = green_tx()
+    tx.green(green_ci(ci_row("build")), (APP,), "saved green")
+    changed = green_ci(ci_row("review", app_id=9))
+    tx.green(changed, ("second-app",), "saved green CI identity changed")
+    assert tx.state["ci_green"] == {
+        "outcome": job_land.green_outcome(changed),
+        "bots": ["second-app"],
+    }
 
 
 @pytest.mark.parametrize("late", [False, True])

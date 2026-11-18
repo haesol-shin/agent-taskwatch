@@ -296,6 +296,8 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
                 reviews_used=job.reviews_used if landing else 0,
                 review_cycle_start=job.review_cycle_start if landing else len(job.reviews),
                 review_inflight=job.review_inflight if landing else 0,
+                # A new cycle opens a new check budget too; landing keeps the one it has.
+                check_cycle_start=job.check_cycle_start if landing else len(job.checks),
             )
         entry = sum(e.get("type") in {"resume", "approve"} for e in job.events) + 1
         event = {"type": command, "at": now, "reason": args.reason}

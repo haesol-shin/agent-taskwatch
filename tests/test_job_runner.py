@@ -17,6 +17,7 @@ import pytest
 
 from taskwatch import job_runner, review_docs
 from taskwatch.fingerprint import files_fingerprint, head_sha
+from taskwatch.job_cli import main as cli_main
 from taskwatch.job_rpc import FrameDecoder, RpcError
 from taskwatch.job_runner import run_job
 from taskwatch.job_scan import scan_jobs
@@ -893,6 +894,43 @@ def test_a_passing_check_resets_recoveries_and_leaves_the_review_cycle(env):
         2,
         0,
     )
+
+
+def test_the_check_budget_counts_passes_and_stops_a_failing_run(env):
+    with env.jobs.state.lock():
+        env.jobs.save(replace(env.get(), max_checks=2), 1500.0)
+    env.seed(GOOD_FILES)
+    assert env.run("check") == 0  # a pass does not reset the budget
+    assert env.get().stage == "review"
+    (env.folder() / "work" / "out.txt").write_text("bad\n", encoding="utf-8")
+    assert env.run("check") == 0
+    job = env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "check_budget_exhausted")
+    assert job.resume_stage == "fix" and len(job.checks) == 2
+    assert "exited 1" in job.error and "2 of 2 checks used in this cycle" in job.error
+
+
+def test_a_check_budget_stop_on_a_pass_resumes_to_review_with_a_new_budget(env):
+    with env.jobs.state.lock():
+        env.jobs.save(replace(env.get(), max_checks=2), 1500.0)
+    env.seed({**GOOD_FILES, "out.txt": "bad\n"})
+    assert env.run("check") == 0
+    assert env.get().stage == "fix"
+    (env.folder() / "work" / "out.txt").write_text("ok\n", encoding="utf-8")
+    assert env.run("check") == 0
+    job = env.get()
+    assert (job.stage, job.wait_reason) == ("user_wait", "check_budget_exhausted")
+    assert job.resume_stage == "review" and "2 of 2 checks used" in job.error
+    assert cli_main(["--root", str(env.tmp / "root"), "resume", job.id, "--reason", "owner"]) == 0
+    resumed = env.get()
+    assert (resumed.stage, resumed.check_cycle_start, resumed.recoveries, resumed.error) == (
+        "queued",
+        len(job.checks),
+        0,
+        "",
+    )
+    assert env.run("check") == 0
+    assert env.get().stage == "review"
 
 
 def test_whole_review_text_survives_chunked_frames(env):

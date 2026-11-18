@@ -40,6 +40,7 @@ _OLD_KINDS = {"code": "code", "design": "design", "document": "source", "researc
 MIN_REVIEWS = 1
 MAX_REVIEWS = 5
 DEFAULT_MAX_REVIEWS = 3
+DEFAULT_MAX_CHECKS = 8
 MAX_RECOVERIES = 3
 MERGE_METHODS = ("squash", "merge")
 MAX_CI_FIXES = 10
@@ -108,6 +109,11 @@ class JobState:
     reviews_used: int = 0
     review_cycle_start: int = 0
     review_inflight: int = 0
+    # Check budget. Every check step of the current cycle counts, the first included, and a
+    # pass does not reset it; `check_cycle_start` indexes `checks`, so an explicit resume opens
+    # a new budget without rewriting the records.
+    max_checks: int = DEFAULT_MAX_CHECKS
+    check_cycle_start: int = 0
     # A terminal HTTP 429 parks the saved stage until this epoch second; 0 is no deadline.
     retry_not_before: float = 0.0
     resume_stage: str = "work"
@@ -193,6 +199,7 @@ class JobConfig:
     ci_before_review: Mapping[str, bool] | None = None
     merge_method: Mapping[str, str] | None = None
     ci_fix_max: Mapping[str, int] | None = None
+    max_checks: int = DEFAULT_MAX_CHECKS  # check steps per cycle, the first included
 
     def __post_init__(self) -> None:
         for name in ("review_bots", "ci_before_review", "merge_method", "ci_fix_max"):
@@ -343,6 +350,12 @@ def _check_slots(value: object) -> int:
     return value
 
 
+def _max_checks(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("max_checks must be a positive integer")
+    return value
+
+
 def _land_command_timeout(value: object) -> int:
     if type(value) is not int or value < 1:
         raise ValueError("land_command_timeout must be a positive integer")
@@ -391,6 +404,7 @@ def load_job_config(root: Path) -> JobConfig:
         "ci_before_review",
         "merge_method",
         "ci_fix_max",
+        "max_checks",
     } != {
         "version",
         "slots",
@@ -442,6 +456,7 @@ def load_job_config(root: Path) -> JobConfig:
     land_base_update = _land_base_update(obj.get("land_base_update", True))
     land_command_timeout = _land_command_timeout(obj.get("land_command_timeout", 300))
     check_slots = _check_slots(obj["check_slots"]) if "check_slots" in obj else None
+    max_checks = _max_checks(obj["max_checks"]) if "max_checks" in obj else DEFAULT_MAX_CHECKS
     ci_before_review = _repository_settings(
         obj.get("ci_before_review"), "ci_before_review", _flow_order
     )
@@ -480,6 +495,7 @@ def load_job_config(root: Path) -> JobConfig:
         ci_before_review,
         merge_method,
         ci_fix_max,
+        max_checks,
     )
 
 
@@ -520,6 +536,7 @@ class Jobs:
             data = _submission(payload)
             host = _host_config(self.state.root)
             data.setdefault("max_reviews", host.max_reviews)
+            data.setdefault("max_checks", host.max_checks)
             if data.get("land"):
                 identity = _origin_identity(data["target"])
                 data.setdefault(
@@ -1026,6 +1043,9 @@ def decode_job(data: dict) -> JobState:
     _validate_record(data)
     upgraded = dict(upgrade(data, DEFAULT_MAX_REVIEWS))
     upgraded.setdefault("legacy_worker_attempt", data["attempt"])
+    # A record written before the check budget starts a fresh cycle: its history cannot prove
+    # which runs belonged to the current cycle, and charging them would stop it retroactively.
+    upgraded.setdefault("check_cycle_start", len(data["checks"]))
     return JobState(**upgraded)
 
 
@@ -1134,7 +1154,13 @@ def _validate_review_target(job: dict) -> None:
 
 
 def _validate_budget(job: dict) -> None:
-    """The review budget: the older `fix_rounds`, or the current fields, never both."""
+    """The review budget and the check budget: older fields, or the current ones, never both."""
+    maximum = job.get("max_checks", DEFAULT_MAX_CHECKS)
+    if type(maximum) is not int or maximum < 1:
+        raise RecordError("jobs.jsonl: invalid max_checks")
+    start = job.get("check_cycle_start", len(job["checks"]))
+    if type(start) is not int or not 0 <= start <= len(job["checks"]):
+        raise RecordError("jobs.jsonl: invalid check_cycle_start")
     if "reviews_used" not in job:
         if type(job.get("fix_rounds", 0)) is not int or job.get("fix_rounds", 0) < 0:
             raise RecordError("jobs.jsonl: invalid fix_rounds")
