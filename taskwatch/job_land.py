@@ -70,12 +70,19 @@ POST_MERGE_GRACE = 15
 
 class Boundary(forge.GitHub):
     def __init__(self, transaction):
-        super().__init__(transaction.ctx.job.target, transaction.ctx.env)
+        super().__init__(
+            transaction.ctx.job.target,
+            transaction.ctx.env,
+            timeout=transaction.ctx.config.land_command_timeout,
+        )
         self.transaction = transaction
 
     def _command(self, argv, *, write=False):
         try:
             return self.transaction.command(argv, timeout=self._remaining())
+        except subprocess.TimeoutExpired as exc:
+            error = forge.Uncertain if write else forge.ForgeError
+            raise error(forge.command_timeout(exc)) from None
         except (OSError, subprocess.SubprocessError):
             error = forge.Uncertain if write else forge.ForgeError
             raise error("command failed; reconcile saved operation identity") from None
@@ -117,8 +124,10 @@ class Transaction:
             raise StaleAttempt
         self.state = state
 
-    def command(self, argv, *, timeout=30, cwd=None, stdin=None):
+    def command(self, argv, *, timeout=None, cwd=None, stdin=None):
         self.current()
+        if timeout is None:
+            timeout = self.ctx.config.land_command_timeout
         deadline = time.monotonic() + timeout
         with subprocess.Popen(
             argv,
@@ -137,7 +146,7 @@ class Transaction:
                     self.current()
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise subprocess.TimeoutExpired(argv[0], timeout)
+                        raise subprocess.TimeoutExpired(argv, timeout)
                     try:
                         out, err = proc.communicate(
                             input=stdin if first else None, timeout=min(15, remaining)
@@ -2126,5 +2135,10 @@ def run_land(ctx):
             reason = exc.reason if isinstance(exc, LandStop) else "land_interrupted"
             if isinstance(exc, forge.Mismatch):
                 reason = "land_pr_mismatch"
-            transaction.save(last_error=reason, error=str(exc))
-            return _stop(ctx.jobs, ctx.job, reason, str(exc))
+            message = (
+                forge.command_timeout(exc)
+                if isinstance(exc, subprocess.TimeoutExpired)
+                else str(exc)
+            )
+            transaction.save(last_error=reason, error=message)
+            return _stop(ctx.jobs, ctx.job, reason, message)

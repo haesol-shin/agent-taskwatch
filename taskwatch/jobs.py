@@ -168,6 +168,8 @@ class JobConfig:
     stall_seconds: int = 1800
     omp_command: tuple[str, ...] = ("omp",)
     rpc_timeout: int = 3600
+    # Landing starts every git and gh command under this limit; a timeout still stops.
+    land_command_timeout: int = 300
     deliver_command: tuple[str, ...] = ("false", "{message}")
     review_command: tuple[str, ...] | None = None
     env: Mapping[str, str] = field(default_factory=dict)
@@ -341,6 +343,12 @@ def _check_slots(value: object) -> int:
     return value
 
 
+def _land_command_timeout(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("land_command_timeout must be a positive integer")
+    return value
+
+
 def _land_base_update(value: object) -> bool:
     if type(value) is not bool:
         raise ValueError("land_base_update must be true or false")
@@ -378,6 +386,7 @@ def load_job_config(root: Path) -> JobConfig:
         "review_bots",
         "review_bot_wait",
         "land_base_update",
+        "land_command_timeout",
         "check_slots",
         "ci_before_review",
         "merge_method",
@@ -431,6 +440,7 @@ def load_job_config(root: Path) -> JobConfig:
         raise ValueError("private_tmp must be true or false")
     review_bot_wait = _review_bot_wait(obj.get("review_bot_wait", 600))
     land_base_update = _land_base_update(obj.get("land_base_update", True))
+    land_command_timeout = _land_command_timeout(obj.get("land_command_timeout", 300))
     check_slots = _check_slots(obj["check_slots"]) if "check_slots" in obj else None
     ci_before_review = _repository_settings(
         obj.get("ci_before_review"), "ci_before_review", _flow_order
@@ -448,6 +458,7 @@ def load_job_config(root: Path) -> JobConfig:
         obj["stall_seconds"],
         tuple(obj["omp_command"]),
         obj["rpc_timeout"],
+        land_command_timeout,
         tuple(command),
         tuple(obj["review_command"]) if "review_command" in obj else None,
         env,

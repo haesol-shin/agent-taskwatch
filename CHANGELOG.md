@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Changed
+- Landing starts every git and gh command under `land_command_timeout` seconds (default 300, optional in `jobs-config.json`), so a busy host no longer stops a job at the old 30 second limit, and a timeout names the shell-joined command in the stop record ([configuration](docs/configuration.md#job-config)).
 - CI checks the commit messages of a pull request with a script contributors can also run before pushing ([commit messages](CONTRIBUTING.md#commits)).
 - A code review judges each body bullet of the step commit messages and the squash body, and asks for the reason or the bullet's removal when it only restates the change ([public text](docs/review/code.md#public-text)).
 - CI runs the same commands in named jobs behind one required `gate | ci` check, so a ruleset can bind to a stable name and a lint or extension failure no longer appears only as a long Python run ([workflow](.github/workflows/ci.yml)).
