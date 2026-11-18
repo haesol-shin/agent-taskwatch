@@ -1172,7 +1172,8 @@ def test_failed_check_on_the_updated_base_parks_before_publication(make):
     script = (
         "import os, sys\n"
         "ok = os.path.exists('out.txt') and open('out.txt').read().strip() == 'ok'\n"
-        "sys.exit(0 if ok and not os.path.exists('raised.txt') else 1)\n"
+        "repaired = os.path.exists('fixed.txt')\n"
+        "sys.exit(0 if ok and (not os.path.exists('raised.txt') or repaired) else 1)\n"
     )
     lab.jobs.save(replace(lab.get(), check_command=(sys.executable, "-c", script)), time.time())
     lab.accept()
@@ -1182,7 +1183,46 @@ def test_failed_check_on_the_updated_base_parks_before_publication(make):
     assert failure["exit_code"] == 1 and failure["M"] == main
     assert "base_updates" not in job.land_state and "H" not in job.land_state
     assert Path(failure["log"]).is_file()
-    cleaned_forge(lab)
+    assert job.resume_stage == "fix"
+
+    reason = "the updated base check needs a repair"
+    lab.resume(reason)
+    lab.scenario([fix_turn(), {"reply": f"{CODE_PASS}\nNo findings."}])
+    done = lab.finish()
+    prompt = next(p for p in lab.prompts() if "This is a fix round." in p)
+    assert main in prompt and failure["log"] in prompt and reason in prompt
+    assert done.stage == "done"
+    state = lab.land()
+    assert state["base_update"]["check"]["exit_code"] == 0
+    assert git(lab.bare, "rev-parse", "refs/heads/main") == state["S"]
+    assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
+
+
+@pytest.mark.parametrize(
+    "decided, resume",
+    [
+        ({"S": "a" * 40}, "land"),
+        ({"merge_intent": True}, "land"),
+        ({"pr": {"number": 17}}, "fix"),
+        ({"pr": {"number": 17}, "returns": [{"reason": "ci_failed"}] * 2}, "land"),
+    ],
+)
+def test_a_failed_base_update_returns_to_fix_only_while_the_same_pr_takes_it(
+    make, monkeypatch, decided, resume
+):
+    lab = make()
+    lab.accept()
+    job = lab.put("land", land_state={**lab.land(), **decided})
+
+    def stop(self):
+        raise job_land.LandStop("land_base_update_failed", "check command exited 1")
+
+    monkeypatch.setattr(job_land.Transaction, "run", stop)
+    ctx = Ctx(lab.jobs, load_job_config(lab.root), job, lab.folder(), lab.tree)
+    assert job_land.run_land(ctx) == 1
+    stopped = lab.get()
+    assert (stopped.stage, stopped.wait_reason) == ("user_wait", "land_base_update_failed")
+    assert stopped.resume_stage == resume
 
 
 def test_the_update_check_waits_for_a_host_check_slot(make):

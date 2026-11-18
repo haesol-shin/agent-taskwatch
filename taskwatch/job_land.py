@@ -291,8 +291,14 @@ class Transaction:
             raise LandStop("land_review_stale", "checked publication does not cover accepted tree")
         identity = digest({"review": _json_value(review), "check": _json_value(job.checks[-1])})
         if self.state.get("identity") and self.state["identity"] != identity:
-            self.adopt_review(job, review, text, identity)
-        elif not self.state.get("identity"):
+            if self.state.get("pushed") or self.state.get("pr"):
+                self.adopt_review(job, review, text, identity)
+            else:
+                # Nothing reached the remote, so there is no head to adopt onto: a fix or a
+                # text change that parked before publication starts a new transaction.
+                self.state = {}
+                self.begin()
+        if not self.state.get("identity"):
             self.save(
                 identity=identity,
                 phase="accepted",
@@ -566,6 +572,22 @@ class Transaction:
             raise StaleAttempt
         self.state = state
         raise Routed
+
+    def resume_fix(self):
+        """Whether a stop may send the resumed job back to the worker on the same branch.
+
+        Before a pull request exists nothing is published, so the worker can fix the same
+        result. After publication the return path of `return_for_ci_fix` decides, with its
+        same-branch, same-PR conditions and budget. A recorded squash or merge intent keeps
+        the stop on the land stage, because the merge already decided the lineage.
+        """
+        job = self.current()
+        if self.state.get("S") or self.state.get("merge_intent"):
+            return False
+        if not self.state.get("pr"):
+            return True
+        used = sum(item.get("reason") == "ci_failed" for item in self.state.get("returns", ()))
+        return used < job.ci_fix_max
 
     def to_review(self):
         """The draft publication and its green CI hand the same result to the review step."""
@@ -958,6 +980,7 @@ class Transaction:
                     "M": main,
                     "T": self.state["T"],
                     "tree": tree,
+                    "at": time.time(),
                     **record,
                 }
             )
@@ -2141,4 +2164,9 @@ def run_land(ctx):
                 else str(exc)
             )
             transaction.save(last_error=reason, error=message)
-            return _stop(ctx.jobs, ctx.job, reason, message)
+            # The owner still sees the stop once, but a resume repairs the check on the
+            # worker's side while the same branch and pull request can take the fix.
+            resume = (
+                "fix" if reason == "land_base_update_failed" and transaction.resume_fix() else None
+            )
+            return _stop(ctx.jobs, ctx.job, reason, message, resume_stage=resume)

@@ -236,8 +236,19 @@ def _refund(job: JobState) -> dict:
     return {}
 
 
-def _stop(jobs: Jobs, job: JobState, reason: str, message: str, refund: bool = False) -> int:
-    """Wait for the user. `refund` returns a review reservation the step never used."""
+def _stop(
+    jobs: Jobs,
+    job: JobState,
+    reason: str,
+    message: str,
+    refund: bool = False,
+    resume_stage: str | None = None,
+) -> int:
+    """Wait for the user. `refund` returns a review reservation the step never used.
+
+    `resume_stage` routes the next resume to a stage other than the stopped one, in the same
+    compare-and-set, so an interrupted stop cannot lose the worker-side repair.
+    """
 
     def build(current: JobState) -> dict:
         changes = {
@@ -249,6 +260,8 @@ def _stop(jobs: Jobs, job: JobState, reason: str, message: str, refund: bool = F
         }
         if refund:
             changes.update(_refund(current))
+        if resume_stage:
+            changes["resume_stage"] = resume_stage
         if current.stage == "review":
             changes["review_inflight"] = 0
         return changes
@@ -593,6 +606,8 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
     if ctx.stage == "fix":
         lines += ["", "This is a fix round. Fix exactly what follows, then finish."]
         lines.append(_fix_reason(job))
+        if reason := _resume_reason(job):
+            lines += ["", f"The owner resumed the job with: {reason}"]
         lines += _record_lines(ctx)
     if resumed:
         lines += [
@@ -658,6 +673,14 @@ def _fix_reason(job: JobState) -> str:
         if event.get("type") in {"check", "review"}:
             break
     record = _latest(job)
+    failure = job.land_state.get("base_update_failure")
+    if failure and (record is None or failure.get("at", 0) >= record.get("at", 0)):
+        return (
+            "The check failed on the accepted result merged onto a moved default branch.\n"
+            f"New main: {failure.get('M', '(not recorded)')}\n"
+            f"Exit code: {failure.get('exit_code', '(not recorded)')}\n"
+            f"Full output: {failure.get('log', '(not recorded)')}"
+        )
     if record is None:
         return "No failure is recorded. Re-verify the result against the spec."
     if "exit_code" in record:
@@ -665,6 +688,14 @@ def _fix_reason(job: JobState) -> str:
         return f"The deterministic check failed.\n{problems}\nFull output: {record['log']}"
     problems = "\n".join(f"- {p}" for p in record["problems"])
     return f"The independent review did not pass.\n{problems}\n\nReview:\n{record['body']}"
+
+
+def _resume_reason(job: JobState) -> str:
+    """The owner's last resume note, which a fix prompt repeats to the worker."""
+    for event in reversed(job.events):
+        if event.get("type") == "resume":
+            return str(event.get("reason", "")).strip()
+    return ""
 
 
 def _subject_lines(ctx: Ctx) -> list[str]:
