@@ -1147,14 +1147,75 @@ def test_moved_default_branch_updates_the_publication_base(make):
     assert len(lab.hook_calls()) == 1 and len(lab.cards()) == 1
 
 
-def test_moved_default_branch_with_an_overlapping_path_parks(make):
+def seed_shared_file(lab, name="shared.txt"):
+    (lab.repo / name).write_text("a\nb\nc\n", encoding="utf-8")
+    git(lab.repo, "add", name)
+    git(lab.repo, "commit", "-m", "chore(repo): seed shared file")
+    git(lab.repo, "push", "origin", "main")
+    base = git(lab.repo, "rev-parse", "HEAD")
+    job = lab.get()
+    lab.jobs.save(
+        replace(job, base=base, public_text=[{**job.public_text[0], "base": base}]), time.time()
+    )
+    return base
+
+
+def test_moved_default_branch_checks_and_lands_a_clean_overlap(make):
+    lab = make(window=30)
+    base = seed_shared_file(lab)
+    script = "from pathlib import Path; print(Path('shared.txt').read_text(), end='')"
+    lab.jobs.save(replace(lab.get(), check_command=(sys.executable, "-c", script)), time.time())
+    lab.accept({"shared.txt": "A\nb\nc\n"})
+    reviews = lab.get().reviews
+    main = lab.advance_remote_file("shared.txt", "a\nb\nC\n")
+    assert lab.finish().reviews == reviews
+    state = lab.land()
+    assert (state["B"], state["M"]) == (base, main)
+    assert git(lab.bare, "show", f"{state['S']}:shared.txt") == "A\nb\nC"
+    assert Path(state["base_update"]["check"]["log"]).read_text(encoding="utf-8") == "A\nb\nC\n"
+
+
+def test_base_update_stops_before_publishing_a_link_to_changed_snapshot_bytes(make):
+    lab = make(window=30)
+    seed_shared_file(lab)
+    lab.accept(
+        {"shared.txt": "A\nb\nc\n"},
+        body=f"[reviewed file]({ORIGIN.removesuffix('.git')}/blob/{{result}}/shared.txt)\n",
+    )
+    lab.advance_remote_file("shared.txt", "a\nb\nC\n")
+    job = lab.park("land_pr_mismatch")
+    assert "base update changed reviewed PR link target shared.txt" in job.error
+    assert "H" not in lab.land()
+    cleaned_forge(lab)
+
+
+def test_moved_default_branch_with_an_overlapping_conflict_parks(make):
     lab = make()
-    lab.accept()
-    main = lab.advance_remote_file("out.txt", "main\n")
+    path = "config~deadbee"
+    lab.accept({path: "result\n"})
+    main = lab.advance_remote_file(path, "main\n")
     job = lab.park("land_base_moved")
-    assert "out.txt" in job.error
+    assert "automatic base update conflicts: config~deadbee" in job.error
     assert "base_updates" not in job.land_state and "H" not in job.land_state
     assert git(lab.bare, "rev-parse", "refs/heads/main") == main
+    cleaned_forge(lab)
+
+
+def test_rename_conflict_reports_the_original_name_even_with_a_hash_suffix(make):
+    lab = make(window=30)
+    original = "original~deadbee"
+    seed_shared_file(lab, original)
+    lab.prepare()
+    git(lab.tree, "mv", original, "result.txt")
+    git(lab.tree, "commit", "-m", "fix(repo): rename in the result")
+    assert lab.run("check") == 0
+    lab.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
+    assert lab.run("review") == 0
+    git(lab.repo, "mv", original, "main.txt")
+    git(lab.repo, "commit", "-m", "fix(repo): rename on main")
+    git(lab.repo, "push", "origin", "main")
+    job = lab.park("land_base_moved")
+    assert "main.txt, original~deadbee, result.txt" in job.error
     cleaned_forge(lab)
 
 
@@ -1993,7 +2054,7 @@ def test_worktree_alias_of_one_repository_lands_one_job_at_a_time(make):
     first = make()
     first.accept()
     second = make(share=first, receipt="k2", alias=True)
-    second.accept()
+    second.accept({"k1.txt": "second\n"})
     first.scan_once()
     assert len(first.service.started) == 1
     first.service.wait()
@@ -2010,7 +2071,7 @@ def test_an_orphan_of_a_finished_install_keeps_other_roots_out_of_the_repository
     first = make(hook_modes=("orphan",))
     first.accept()
     second = make(share=first, receipt="k2", alias=True, where=tmp_path / "two")
-    second.accept()
+    second.accept({"k1.txt": "second\n"})
     first.finish()
     assert (first.hook_dir / "orphan.pid").exists()
     for _ in range(3):
@@ -3543,6 +3604,141 @@ def test_ci_before_review_fixes_the_draft_and_merges_the_same_pr(make):
     assert len(done.reviews) == 1 and done.reviews_used == 1
     assert lab.writes() == ["pr create", "run rerun", "pr edit", "pr ready", "pr merge"]
     assert git(lab.bare, "log", "-1", "--format=%s", state["S"]) == "feat(x): add (#17)"
+
+
+@pytest.mark.parametrize(("draft", "main_moved"), [(True, False), (True, True), (False, True)])
+def test_ci_fix_checks_the_overlap_against_current_main(make, draft, main_moved):
+    lab = make(window=90, host=FLOW_HOST if draft else None, ci_fix_max=1)
+    seed_shared_file(lab)
+    build = lab.prepare if draft else lab.accept
+    build({"shared.txt": "A\nb\nc\n"})
+    old_main = lab.advance_remote_file("shared.txt", "a\nb\nC\n")
+    lab.edit(follow_branch=True, ci=[*CI_FAILED, *CI_FAILED_AGAIN, *CI_GREEN_OTHER])
+    fix = fix_turn()
+    if main_moved:
+        fix["run"][0][-1] += (
+            " && printf 'A\\nb\\nF\\n' > shared.txt && git add shared.txt"
+            " && git commit -q -m 'fix(x): restore shared output' -m '- Align the shared output'"
+        )
+    lab.scenario([fix, {"reply": f"{CODE_PASS}\nNo findings."}])
+    lab.drive(lambda j: j.stage == "fix")
+    failed_head = lab.land()["H"]
+    lab.drive(lambda j: j.stage == "land")
+    main = lab.advance_remote_file("shared.txt", "a\nb\nF\n") if main_moved else old_main
+    if draft:
+        lab.drive(lambda j: j.stage == "review")
+        green_draft = lab.land()["H"]
+        assert green_draft != failed_head
+    lab.finish()
+    state = lab.land()
+    assert state["M"] == main
+    assert state["H"] != failed_head
+    if draft:
+        assert state["H"] == green_draft
+    expected = "A\nb\nF" if main_moved else "A\nb\nC"
+    assert git(lab.bare, "show", f"{state['S']}:shared.txt") == expected
+    assert git(lab.bare, "show", f"{state['S']}:fixed.txt") == "fixed"
+    assert len(lab.forge()["created"]) == 1
+
+
+@pytest.mark.parametrize("draft", [True, False])
+def test_published_ci_fix_can_resume_after_the_first_base_update_check_fails(make, draft):
+    lab = make(window=90, host=FLOW_HOST if draft else None, ci_fix_max=2)
+    seed_shared_file(lab)
+    script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "sys.exit(Path('shared.txt').read_text().endswith('C\\n') "
+        "and not Path('fixed2.txt').exists())"
+    )
+    lab.jobs.save(replace(lab.get(), check_command=(sys.executable, "-c", script)), time.time())
+    build = lab.prepare if draft else lab.accept
+    build({"shared.txt": "A\nb\nc\n"})
+    lab.edit(follow_branch=True, ci=[*CI_FAILED, *CI_FAILED_AGAIN, *CI_GREEN_OTHER])
+    passed = {"reply": f"{CODE_PASS}\nNo findings."}
+    first = [fix_turn()] if draft else [fix_turn(), passed]
+    lab.scenario([*first, fix_turn(path="fixed2.txt"), passed])
+    lab.drive(lambda j: j.stage == "fix")
+    published = lab.remote_land_branch()
+    lab.drive(lambda j: j.stage == "land")
+    main = lab.advance_remote_file("shared.txt", "a\nb\nC\n")
+    assert lab.park("land_base_update_failed").resume_stage == "fix"
+    assert lab.remote_land_branch() == published
+    lab.resume()
+    lab.finish()
+    state = lab.land()
+    assert state["M"] == main
+    assert git(lab.bare, "show", f"{state['S']}:fixed2.txt") == "fixed"
+    assert git(lab.bare, "show", f"{state['S']}:shared.txt") == "A\nb\nC"
+    assert len(lab.forge()["created"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("stop", "change"),
+    [("check", ""), ("before:push", ""), ("before:push", "title"), ("after:push", "result")],
+)
+def test_draft_base_update_reuses_only_a_current_checked_push_intent(make, stop, change):
+    lab = make(window=90, host=FLOW_HOST)
+    seed_shared_file(lab)
+    checked = lab.base / "checked-heads"
+    marker = lab.base / "interrupt"
+    script = (
+        "import os, signal, subprocess\n"
+        "from pathlib import Path\n"
+        "if Path('shared.txt').read_text().endswith('C\\n'):\n"
+        "    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True)\n"
+        f"    with Path({str(checked)!r}).open('a') as log: log.write(head)\n"
+        f"marker = Path({str(marker)!r})\n"
+        "if marker.exists():\n"
+        "    marker.unlink()\n"
+        "    os.kill(os.getppid(), signal.SIGKILL)\n"
+    )
+    lab.jobs.save(replace(lab.get(), check_command=(sys.executable, "-c", script)), time.time())
+    lab.prepare({"shared.txt": "A\nb\nc\n"})
+    main = lab.advance_remote_file("shared.txt", "a\nb\nC\n")
+    lab.edit(follow_branch=True)
+    if stop == "check":
+        marker.touch()
+    else:
+        lab.trap(stop)
+    lab.scan_once()
+    lab.service.wait()
+    assert lab.get().stage == "land"
+    (first_check,) = checked.read_text(encoding="utf-8").splitlines()
+    candidate = lab.land().get("base_update", {}).get("head")
+    if stop == "after:push":
+        assert candidate == lab.remote_land_branch()
+    else:
+        assert not git(lab.bare, "for-each-ref", "refs/heads/*-land")
+    if stop != "check":
+        assert first_check == candidate
+
+    if change == "title":
+        lab.write_text("title.txt", "fix(x): update the publication title\n")
+    if change == "result":
+        (lab.tree / "out.txt").write_text("repaired\n", encoding="utf-8")
+        git(lab.tree, "add", "out.txt")
+        git(lab.tree, "commit", "-m", "fix(x): repair output", "-m", "- Match the intended output")
+    lab.drive(lambda j: j.stage == "review")
+    head = lab.land()["H"]
+    assert lab.remote_land_branch() == head
+    assert git(lab.bare, "show", f"{head}:shared.txt") == "A\nb\nC"
+    assert git(lab.bare, "rev-parse", f"{head}^") == main
+    if change == "title":
+        subject = git(lab.bare, "log", "-1", "--format=%s", head)
+        assert subject == "fix(x): update the publication title"
+    if change == "result":
+        assert git(lab.bare, "show", f"{head}:out.txt") == "repaired"
+    # A normal check can be reused after a title edit; only the merged candidate matters.
+    expected = [first_check]
+    if change or stop == "check":
+        expected.append(head)
+    else:
+        assert head == candidate
+    assert checked.read_text(encoding="utf-8").splitlines() == expected
+    lab.scenario([{"reply": f"{CODE_PASS}\nNo findings."}])
+    lab.finish()
+    assert lab.land()["H"] == head
 
 
 def test_a_title_edited_after_the_check_returns_to_check_before_the_draft(make):
