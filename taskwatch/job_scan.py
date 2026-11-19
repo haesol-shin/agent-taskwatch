@@ -464,13 +464,7 @@ class _Scan:
             holders = (
                 other
                 for other in self.all.values()
-                if other.id != job.id
-                and other.unit
-                and (
-                    other.stage == "land"
-                    or other.resume_stage == "land"
-                    or other.land_state.get("repository_key")
-                )
+                if other.id != job.id and other.unit and _land_unit(other)
             )
             blocked = any(
                 (other.land_state.get("repository_key") or repository_key(other.target, env)) == key
@@ -481,7 +475,7 @@ class _Scan:
             return None
         if blocked:
             # Launch paths run only after the old unit is proven dead, so none is left to free.
-            if job.wait_reason != "repository":
+            if job.unit or job.wait_reason != "repository":
                 self._save(replace(job, unit="", wait_reason="repository"))
             return None
         return replace(job, land_state={**job.land_state, "repository_key": key})
@@ -579,6 +573,17 @@ def _shared_target(job: JobState) -> bool:
 def _holds(job: JobState) -> bool:
     # Any recorded unit may still be running, whatever the stage says, so it holds.
     return bool(job.unit)
+
+
+def _land_unit(job: JobState) -> bool:
+    # A runner can set its next stage before its current unit drops the repository lock.
+    for event in reversed(job.events):
+        if event.get("source") == "scan" and event.get("kind") == "launched":
+            if event.get("attempt") == job.attempt and event.get("stage"):
+                return event["stage"] == "land"
+            break
+    # Without a launch record, keep a possibly live legacy reservation.
+    return "land" in (job.stage, job.resume_stage) or bool(job.land_state.get("repository_key"))
 
 
 def _launch_stage(job: JobState) -> str:

@@ -222,10 +222,9 @@ class Transaction:
             raise LandStop("land_review_stale", "accepted evidence changed after merge")
         from .job_runner import _apply
 
-        if self.state.get("push_intent") or self.state.get("pushed") or self.state.get("pr"):
-            # Pushed or published, not merged: the job returns to its own check and review on
-            # the same branch and pull request instead of stopping for a new job. A head that
-            # was only prepared and never pushed is discarded like any unpublished transaction.
+        if any(self.state.get(key) for key in ("push_intent", "pushed", "pr", "base_update")):
+            # Keep branch ownership evidence across check/review, including a checked head
+            # that may have reached the remote without an acknowledgement.
             record = self.return_record(
                 "evidence_changed", "accepted evidence changed after publication"
             )
@@ -318,21 +317,22 @@ class Transaction:
             or self.git("rev-parse", f"{text['head']}^{{tree}}") != text.get("tree")
         ):
             raise LandStop("land_review_stale", "checked publication does not cover accepted tree")
+        self.result_tree = text["tree"]
         identity = digest({"review": _json_value(review), "check": _json_value(job.checks[-1])})
         if self.state.get("identity") and self.state["identity"] != identity:
             if self.state.get("pushed") or self.state.get("pr"):
                 self.adopt_review(job, review, text, identity)
-            else:
-                # Nothing reached the remote, so there is no head to adopt onto: a fix or a
-                # text change that parked before publication starts a new transaction.
+            elif not self.state.get("base_update"):
+                # A prepared base update may have reached the remote without a response.
+                # Keep its ownership evidence even when the accepted inputs change.
                 self.state = {}
                 self.begin()
-        if not self.state.get("identity"):
+        if self.state.get("identity") != identity:
             self.save(
                 identity=identity,
                 phase="accepted",
                 R=text["head"],
-                T=text["tree"],
+                T=self.state.get("T", self.result_tree),
                 B=text["base"],
                 review_seq=review.get("seq", 0),
                 review_digest=digest(_json_value(review)),
@@ -417,6 +417,7 @@ class Transaction:
             or self.git("rev-parse", f"{state['head']}^{{tree}}") != state.get("tree")
         ):
             raise LandStop("land_review_stale", "checked publication does not cover the result")
+        self.result_tree = state["tree"]
         try:
             title = job_text.unit_file(self.ctx.folder, self.unit, "title.txt").read_bytes()
             commit = job_text.unit_file(self.ctx.folder, self.unit, "commit.txt").read_bytes()
@@ -430,7 +431,7 @@ class Transaction:
         self.body_file.write_text(self.body, encoding="utf-8")
         self.save(
             R=state["head"],
-            T=state["tree"],
+            T=self.state.get("T", self.result_tree),
             B=state["base"],
             identity=digest({"check": _json_value(job.checks[-1]), "text": _json_value(state)}),
             phase="draft",
@@ -457,6 +458,9 @@ class Transaction:
             )
             return
         if self.git("rev-parse", f"{head}^{{tree}}") == self.state["T"]:
+            intent = self.state.get("republish") or {}
+            if intent and not intent.get("head"):
+                self.save(republish={**intent, "head": head})
             return
         # An earlier republication may have left an intent for an older tree; the current head
         # is the only parent the next one may build on.
@@ -471,7 +475,6 @@ class Transaction:
         while the CI fix budget holds.
         """
         self.initialize_draft()
-        self.republish_for_tree()
         self.base_guard()
         self.head()
         self.observe_base_update()
@@ -731,52 +734,15 @@ class Transaction:
                 "dispositions": candidates,
                 "disposition_review": review["seq"],
             }
-        tree = text["tree"]
-        updates = list(self.state.get("base_updates", ()))
-        # A published transaction that already updated its base merges the fix the same way.
-        if self.state.get("M") and self.state["M"] != self.state["B"]:
-            tree = self.updated_merge(text["head"], self.state["M"])
-            if tree != self.state["T"]:
-                # The repository check reads commit messages, so the check commit carries the
-                # unit's written title and body, as the squash commit will.
-                try:
-                    title = (
-                        job_text.unit_file(self.ctx.folder, self.unit, "title.txt")
-                        .read_bytes()
-                        .decode()
-                    )
-                    commit = (
-                        job_text.unit_file(self.ctx.folder, self.unit, "commit.txt")
-                        .read_bytes()
-                        .decode()
-                    )
-                except OSError:
-                    raise LandStop(
-                        "land_review_stale", "the written publication text is missing"
-                    ) from None
-                head = self.git(
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    self.state["M"],
-                    stdin=job_text.squash_message(title, commit),
-                )
-                self.check_updated_tree(head, self.state["M"], tree)
-            if updates:
-                updates[-1] = {**updates[-1], "tree": tree, "accepted": text["tree"]}
-        republish = {"from": published, "review": review["seq"]}
-        if self.method() == "merge":
-            # A merge keeps the worker's commits: the new accepted result is the next head.
-            republish["head"] = text["head"]
-            changes["H"] = text["head"]
-            changes["commit_metadata"] = self.git("show", "-s", "--format=raw", text["head"])
-        elif tree == self.state.get("T"):
-            # Only text changed, so the published head already carries the reviewed tree.
-            republish["head"] = published
+        # The current main, not the last published base, determines the next tree and head.
+        # Keep the prior intent until the base guard can reconcile its remote ownership.
+        republish = self.state.get("republish") or {"from": published}
+        if text["head"] == self.state.get("R") and not self.pending_base_update():
+            republish = {**republish, "head": published}
         changes.update(
             identity=identity,
             R=text["head"],
-            T=tree,
+            B=text["base"],
             review_seq=review["seq"],
             review_digest=digest(_json_value(review)),
             check_digest=digest(_json_value(job.checks[-1])),
@@ -784,8 +750,6 @@ class Transaction:
             text_digest=digest(_json_value(text)),
             republish=republish,
         )
-        if updates:
-            changes["base_updates"] = updates
         self.save(**changes)
 
     def owner_reasons(self):
@@ -933,20 +897,16 @@ class Transaction:
     def base_update_enabled(self):
         return bool(self.state.get("base_update_enabled", self.ctx.config.land_base_update))
 
-    def changed_paths(self, older, newer):
-        """Every side of a rename counts, so a rename cannot hide an overlap."""
-        out = self.command(["git", "diff", "--name-only", "--no-renames", "-z", older, newer])
-        return {path for path in out.split("\0") if path}
-
     def merge_tree(self, base, main, result):
-        """The tree of result rebased onto main, or the conflict paths."""
+        """The three-way tree of result onto main, or Git's conflict paths."""
         try:
             out = self.command(
                 [
                     "git",
                     "merge-tree",
                     "--write-tree",
-                    "--no-messages",
+                    "--name-only",
+                    "-z",
                     f"--merge-base={base}",
                     main,
                     result,
@@ -956,15 +916,20 @@ class Transaction:
             if exc.returncode != 1:
                 raise
             return None, self.conflict_paths(exc.stdout or "")
-        return out.splitlines()[0].strip(), None
+        return out.split("\0", 1)[0], None
 
     def conflict_paths(self, output):
-        paths = set()
-        for line in output.splitlines()[1:]:
-            if "\t" in line:
-                path = line.split("\t", 1)[1]
-                # A directory/file conflict renames the merged path with a blob suffix.
-                paths.add(re.sub(r"~[0-9a-f]{7,64}$", "", path))
+        # Git's NUL format separates the unmerged names from the logical conflict records.
+        fields = output.split("\0")[1:]
+        split = fields.index("") if "" in fields else len(fields)
+        paths = set(fields[:split])
+        index = split + 1
+        while index < len(fields) and fields[index]:
+            count = int(fields[index])
+            end = index + count + 1
+            if fields[end].startswith("CONFLICT"):
+                paths.update(fields[index + 1 : end])
+            index = end + 2
         return sorted(paths)
 
     def names(self, paths):
@@ -972,15 +937,8 @@ class Transaction:
         return shown + (f" (+{len(paths) - 10} more)" if len(paths) > 10 else "")
 
     def updated_merge(self, result, main):
-        """The three-way tree of result onto main; park when the paths are not disjoint."""
-        base = self.state["B"]
-        shared = sorted(self.changed_paths(base, main) & self.changed_paths(base, result))
-        if shared:
-            raise LandStop(
-                "land_base_moved",
-                "fresh default branch changed paths of the result: " + self.names(shared),
-            )
-        tree, conflicts = self.merge_tree(base, main, result)
+        """Use Git's three-way merge, including when paths overlap."""
+        tree, conflicts = self.merge_tree(self.state["B"], main, result)
         if conflicts is not None:
             detail = self.names(conflicts) if conflicts else "no merged tree"
             raise LandStop("land_base_moved", "automatic base update conflicts: " + detail)
@@ -1090,16 +1048,16 @@ class Transaction:
             republish.get("from"),
             republish.get("head"),
             update.get("head"),
+            update.get("from"),
+            update.get("previous"),
             *(record.get("head") for record in self.state.get("base_updates", ())),
         ]
         return {head for head in heads if head}
 
     def pending_base_update(self):
         update = self.state.get("base_update") or {}
-        if (
-            update.get("head")
-            and update["head"] != self.state.get("H")
-            and update.get("tree") == self.state.get("T")
+        if update.get("head") and (
+            update["head"] != self.state.get("H") or not self.state.get("pushed")
         ):
             return update
         return {}
@@ -1122,11 +1080,7 @@ class Transaction:
         self.state = {k: v for k, v in self.state.items() if k not in CI_WINDOW}
 
     def update_base(self, main):
-        """Put the accepted result on main when the two change sets share no path.
-
-        True means state now carries the new tree and a head for the new base. A shared path or
-        a conflict parks without changing the worktree; a failed check parks before publication.
-        """
+        """Check and stage the publication for main before changing its branch."""
         if not self.base_update_enabled() or self.state.get("merge_intent"):
             return False
         if self.method() == "merge":
@@ -1134,36 +1088,44 @@ class Transaction:
             # keeps the accepted result as its head and parks a moved base for the owner.
             return False
         updates = list(self.state.get("base_updates", ()))
-        if len(updates) >= MAX_BASE_UPDATES:
+        advancing = not updates or main != self.state.get("M")
+        if advancing and len(updates) >= MAX_BASE_UPDATES:
             raise LandStop(
                 "land_base_moved",
                 f"default branch moved more than {MAX_BASE_UPDATES} times during landing",
             )
-        pending = self.pending_base_update()
-        if pending and self.publication_head() == pending.get("head"):
-            # The previous update reached the remote before its adoption was saved.
-            self.adopt_base_update(pending)
-            self.observe_base_update()
-        base = self.state["B"]
         tree = self.updated_merge(self.state["R"], main)
         previous = self.state.get("H")
         published = self.publication_head()
         if published is not None and published not in self.owned_heads():
             raise LandStop("land_head_changed", "publication branch belongs to a different head")
-        if published is None and (self.state.get("pushed") or self.state.get("pr")):
+        old = self.state.get("base_update") or {}
+        if published is None and (
+            self.state.get("pushed") or self.state.get("pr") or old.get("published")
+        ):
             raise LandStop("land_head_changed", "publication branch disappeared")
-        head = self.git(
-            "commit-tree", tree, "-p", main, stdin=job_text.squash_message(self.title, self.commit)
-        )
+        # On the same base, append to the observed PR head unless an unpublished intent must
+        # be replaced. An unchanged draft promoted to ready does not need a new head.
+        append = not advancing and not self.pending_base_update() and published == previous
+        if append and published and tree == self.state["T"]:
+            self.state.pop("base_update_failure", None)
+            self.save(base_updates=[*updates[:-1], {**updates[-1], "R": self.state["R"]}])
+            return False
+        parent = published if append and published else main
+        message = job_text.squash_message(self.title, self.commit)
+        head = self.git("commit-tree", tree, "-p", parent, stdin=message)
         check = self.check_updated_tree(head, main, tree)
         record = {
-            "B": base,
+            "B": self.state["B"],
             "M": main,
+            "R": self.state["R"],
             "T": self.state["T"],
             "tree": tree,
             "from_head": published,
             "head": head,
         }
+        if not advancing:
+            updates.pop()
         if published is not None:
             self.reset_per_head()
         self.state = {
@@ -1178,6 +1140,8 @@ class Transaction:
                 "previous": previous,
                 "head": head,
                 "tree": tree,
+                "parent": parent,
+                "identity": self.state["identity"],
                 "check": check,
                 "published": published is not None,
             },
@@ -1185,12 +1149,14 @@ class Transaction:
         return True
 
     def publish_base_update(self, update):
-        """Replace a published head on its branch, lease-pinned to the observed previous head."""
+        """Push the checked candidate, leasing a branch rewrite to the observed head."""
         head = update["head"]
+        parent = update.get("parent", self.state["M"])
         if self.git("rev-parse", f"{head}^{{tree}}") != update.get("tree") or self.git(
             "rev-list", "--parents", "-n", "1", head
-        ).split() != [head, self.state["M"]]:
+        ).split() != [head, parent]:
             raise LandStop("land_head_changed", "updated publication object differs")
+        self.rewrite_body_links(head)
         target = self.push_target()
         branch = f"refs/heads/{self.state['branch']}"
         remote_head = self.publication_head(target)
@@ -1225,14 +1191,11 @@ class Transaction:
         head = update["head"]
         changes = {
             "H": head,
-            "head_parent": self.state["M"],
+            "head_parent": update.get("parent", self.state["M"]),
             "commit_metadata": self.git("show", "-s", "--format=raw", head),
             "pushed": True,
         }
-        republish = self.state.get("republish")
-        if republish and republish.get("from") == update.get("from"):
-            changes["republish"] = {**republish, "head": head}
-        self.save(**changes)
+        self.save(**changes, republish={})
 
     def observe_base_update(self):
         """The same pull request follows a rewritten branch before its guards run again."""
@@ -1273,7 +1236,14 @@ class Transaction:
             else:
                 self.replay(main)
                 raise LandStop("land_base_moved", "fresh default branch differs from accepted base")
-        self.save(M=main)
+        elif updates := self.state.get("base_updates"):
+            pending = self.pending_base_update()
+            if updates[-1].get("R") != self.state["R"] or (
+                pending and pending.get("identity") != self.state["identity"]
+            ):
+                return self.update_base(main)
+            return False
+        self.save(M=main, T=self.result_tree)
         return False
 
     def predecessor_base(self, main):
@@ -1408,24 +1378,23 @@ class Transaction:
 
     def head(self):
         pending = self.pending_base_update()
-        if pending and self.state.get("H"):
+        if pending:
             self.publish_base_update(pending)
+            return
+        self.republish_for_tree()
         if not self.state.get("H"):
-            head = pending.get("head") if pending else None
-            if not head:
-                if self.method() == "merge":
-                    # A merge keeps the worker's commits: the publication head is the accepted
-                    # result itself, so the merge commit contains the reviewed lineage.
-                    head = self.state["R"]
-                else:
-                    message = job_text.squash_message(self.title, self.commit)
-                    head = self.git(
-                        "commit-tree", self.state["T"], "-p", self.state["M"], stdin=message
-                    )
+            if self.method() == "merge":
+                # A merge keeps the worker's commits, so publish the reviewed lineage itself.
+                head = self.state["R"]
+            else:
+                message = job_text.squash_message(self.title, self.commit)
+                head = self.git(
+                    "commit-tree", self.state["T"], "-p", self.state["M"], stdin=message
+                )
             metadata = self.git("show", "-s", "--format=raw", head)
             self.save(H=head, commit_metadata=metadata, phase="head")
         head = self.state["H"]
-        self.rewrite_body_links()
+        self.rewrite_body_links(head)
         tree = self.git("rev-parse", f"{head}^{{tree}}")
         if self.method() == "merge":
             if tree != self.state["T"] or head != self.state["R"]:
@@ -1449,14 +1418,12 @@ class Transaction:
             self.git("push", target, f"{head}:refs/heads/{self.state['branch']}")
         self.save(pushed=True)
 
-    def rewrite_body_links(self):
-        """Publish a link to a reviewed commit at H only when H holds the same blob.
+    def rewrite_body_links(self, candidate=None):
+        """Move a reviewed link only to a head with the same blob."""
 
-        GitHub renders blob and raw links only for commits it has, and the squash discards the
-        reviewed commits. The reviewed body and its digest stay unchanged: only the bytes the PR
-        API reads change, and `body_rewrites` records how many links moved.
-        """
-        head = self.state.get("H")
+        # Before writing a branch or PR, refuse to publish a link that the base update made
+        # unresolvable. Reading the old head during initialization is not a publication.
+        head = candidate or self.state.get("H")
         if not head or self.reviewed_body is None:
             return
         reviewed = set(self.git("rev-list", f"{self.state['B']}..{self.state['R']}").split())
@@ -1481,7 +1448,19 @@ class Transaction:
                 return match[0]
             path = unquote(match["path"])
             same = blob(commit, path)
-            if not same or same != blob(head, path):
+            at_head = blob(head, path)
+            if not same or same != at_head:
+                if (
+                    same
+                    and candidate
+                    and self.state.get("base_updates")
+                    and blob(self.state["R"], path) != at_head
+                ):
+                    raise LandStop(
+                        "land_pr_mismatch",
+                        f"base update changed reviewed PR link target {path}; "
+                        "use a link to an already published revision",
+                    )
                 return match[0]
             count += 1
             url = (
@@ -2072,7 +2051,6 @@ class Transaction:
         self.initialize()
         self.owner_reasons()
         self.post_answers()
-        self.prepare_republish()
         while True:
             published_body = (self.state.get("published_text") or {}).get("body")
             if (

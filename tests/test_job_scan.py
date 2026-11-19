@@ -1241,6 +1241,38 @@ def test_landing_serializes_common_repository_but_not_independent_work(
     assert board.get(first).unit == ""
 
 
+def test_ci_fix_releases_land_only_after_the_old_service_exits(tmp_path: Path) -> None:
+    board = Board(tmp_path)
+    repo = make_repo(tmp_path)
+    first = board.add(target=str(repo))
+    second = board.add(target=str(repo))
+    for identifier in (first, second):
+        board.set(identifier, stage="land")
+    assert board.scan() == [first]
+    assert board.get(second).wait_reason == "repository"
+
+    board.finish_step(first, "fix", alive=True)
+    board.set(first, resume_stage="fix")
+    board.service.stop_ok = False
+    assert board.scan() == []
+    assert board.get(first).error == "stop_unconfirmed"
+    assert not board.get(second).unit
+
+    board.kill(first)
+    assert board.scan() == [first, second]
+    fixing = board.get(first)
+    landing = board.get(second)
+    assert fixing.unit and fixing.stage == "fix"
+    assert landing.unit and landing.stage == "land"
+    assert fixing.land_state["repository_key"] == landing.land_state["repository_key"]
+
+    board.finish_step(first, "land")
+    assert board.scan() == []
+    assert board.get(first).wait_reason == "repository"
+    board.finish_step(second, "done")
+    assert board.scan() == [first]
+
+
 def test_landing_gap_and_dead_service_recover_without_new_owner_entry(tmp_path: Path) -> None:
     board = Board(tmp_path)
     repo = make_repo(tmp_path)
