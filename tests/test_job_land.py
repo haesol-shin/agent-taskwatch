@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from taskwatch import job_land
+from taskwatch import job_land, job_text
 from taskwatch.forge import CI, CIEvidence
 from taskwatch.job_cli import main as cli_main
 from taskwatch.job_runner import Ctx, run_job
@@ -3238,6 +3238,35 @@ def test_bot_fix_after_a_base_update_republishes_the_merged_tree(make, monkeypat
         assert state["tree_verified"] is True
         assert git(lab.bare, "rev-parse", f"{state['S']}^{{tree}}") == state["T"]
         assert replies == []
+
+
+def test_a_fix_after_a_base_update_checks_a_commit_with_the_written_message(make, monkeypatch):
+    with bot_lab(make, monkeypatch, exhausted=False) as (lab, tx):
+        visible = [bot_thread(severity="P1")]
+        tx.api.review_threads = lambda *args: visible
+        lab.advance_remote_file("external.txt")
+        with pytest.raises(job_land.BotParked):
+            tx.run()
+        lab.jobs.save(replace(lab.get(), max_reviews=lab.get().reviews_used + 1), time.time())
+        accept_bot_fix(lab, change_text=True)
+        visible[0]["resolved"] = True
+        tx = restart_bot_tx(lab, tx)
+        tx.api.find_review_reply = lambda *args: False
+        tx.api.post_review_reply = lambda *args: None
+        checked = []
+        original = job_land.Transaction.check_updated_tree
+
+        def record(self, head, main, tree):
+            checked.append(git(lab.tree, "log", "-1", "--format=%B", head))
+            return original(self, head, main, tree)
+
+        monkeypatch.setattr(job_land.Transaction, "check_updated_tree", record)
+        lab.edit(follow_branch=True)
+        tx.run()
+        unit = lab.get().public_text[0]["id"]
+        title = job_text.unit_file(lab.folder(), unit, "title.txt").read_text()
+        commit = job_text.unit_file(lab.folder(), unit, "commit.txt").read_text()
+        assert checked and checked[-1].strip() == job_text.squash_message(title, commit).strip()
 
 
 def test_bot_not_fixed_needs_exact_owner_acceptance_before_publication(make, monkeypatch):

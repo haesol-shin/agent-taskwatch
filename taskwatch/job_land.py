@@ -737,9 +737,29 @@ class Transaction:
         if self.state.get("M") and self.state["M"] != self.state["B"]:
             tree = self.updated_merge(text["head"], self.state["M"])
             if tree != self.state["T"]:
-                # Only the tree matters here; the reviewed message is loaded after this check.
+                # The repository check reads commit messages, so the check commit carries the
+                # unit's written title and body, as the squash commit will.
+                try:
+                    title = (
+                        job_text.unit_file(self.ctx.folder, self.unit, "title.txt")
+                        .read_bytes()
+                        .decode()
+                    )
+                    commit = (
+                        job_text.unit_file(self.ctx.folder, self.unit, "commit.txt")
+                        .read_bytes()
+                        .decode()
+                    )
+                except OSError:
+                    raise LandStop(
+                        "land_review_stale", "the written publication text is missing"
+                    ) from None
                 head = self.git(
-                    "commit-tree", tree, "-p", self.state["M"], stdin="base update check\n"
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    self.state["M"],
+                    stdin=job_text.squash_message(title, commit),
                 )
                 self.check_updated_tree(head, self.state["M"], tree)
             if updates:
