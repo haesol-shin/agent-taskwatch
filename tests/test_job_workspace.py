@@ -262,14 +262,19 @@ def test_an_ignored_output_is_copied_into_the_job_folder_before_removal(board):
     assert copied.read_text(encoding="utf-8") == "built\n"
 
 
-def test_an_uncommitted_output_that_cannot_be_copied_keeps_the_worktree(board):
-    job_id, path = settled(board, outputs=[".local/report.json"])
-    commit_in(path, ".gitignore", ".local/\n")
-    (path / ".local" / "report.json").mkdir(parents=True)
+@pytest.mark.parametrize("tracked", [False, True])
+def test_a_declared_output_directory_that_cannot_be_copied_keeps_the_worktree(board, tracked):
+    job_id, path = settled(board, outputs=["report"])
+    commit_in(path, ".gitignore", "/report/*.tmp\n")
+    (path / "report").mkdir()
+    if tracked:
+        commit_in(path, "report/marker", "tracked\n")
+    report = path / "report" / "data.tmp"
+    report.write_text("built\n", encoding="utf-8")
     board.finish_step(job_id, "done")
     board.scan()
-    job = board.get(job_id)
-    assert path.exists() and "could not copy" in job.workspace_state
+    assert "could not copy" in board.get(job_id).workspace_state
+    assert report.read_text(encoding="utf-8") == "built\n"
 
 
 def test_a_dangling_output_link_keeps_the_worktree(board):
@@ -291,18 +296,90 @@ def test_a_declared_output_never_written_does_not_keep_the_worktree(board):
     assert board.get(job_id).workspace_state == "removed" and not path.exists()
 
 
-def test_an_ignored_path_outside_the_tool_caches_keeps_the_worktree(board):
+@pytest.mark.parametrize("stage", ["done", "cancelled"])
+def test_ignored_caches_outside_declared_outputs_do_not_block_removal(board, stage):
     job_id, path = settled(board)
-    commit_in(path, ".gitignore", "build/\n")
-    (path / "build").mkdir()
-    (path / "build" / "report.txt").write_text("result\n", encoding="utf-8")
-    board.finish_step(job_id, "done")
-    board.scan()
-    assert path.exists() and board.get(job_id).workspace_state.startswith("kept: ignored")
-    (path / "build" / "report.txt").unlink()
-    (path / "build").rmdir()
+    caches = ("core/.import_linter_cache", "frontend/test-results")
+    commit_in(path, ".gitignore", "".join(f"/{cache}/\n" for cache in caches))
+    for cache in caches:
+        (path / cache).mkdir(parents=True)
+        (path / cache / "data").write_text("rebuildable\n", encoding="utf-8")
+    board.finish_step(job_id, stage)
     board.scan()
     assert board.get(job_id).workspace_state == "removed" and not path.exists()
+
+
+def test_an_ignored_output_file_that_cannot_be_copied_keeps_the_worktree(board):
+    job_id, path = settled(board, outputs=["build/report.txt"])
+    commit_in(path, ".gitignore", "/build/\n")
+    report = path / "build" / "report.txt"
+    report.parent.mkdir()
+    report.write_text("built\n", encoding="utf-8")
+    outputs = path.parent / "outputs"
+    outputs.mkdir(exist_ok=True)
+    (outputs / "build").write_text("blocks copying\n", encoding="utf-8")
+    board.finish_step(job_id, "done")
+    board.scan()
+    assert "could not copy" in board.get(job_id).workspace_state
+    assert report.read_text(encoding="utf-8") == "built\n"
+
+
+def test_a_tracked_output_link_to_an_ignored_file_is_copied_before_removal(board):
+    job_id, path = settled(board, outputs=["report.txt"])
+    commit_in(path, ".gitignore", "/build/\n")
+    (path / "build").mkdir()
+    (path / "build" / "report.txt").write_text("built\n", encoding="utf-8")
+    (path / "report.txt").symlink_to("build/report.txt")
+    git(path, "add", "report.txt")
+    git(path, "commit", "-m", "add report link")
+    board.finish_step(job_id, "done")
+    board.scan()
+    assert board.get(job_id).workspace_state == "removed" and not path.exists()
+    copied = path.parent / "outputs" / "report.txt"
+    assert copied.read_text(encoding="utf-8") == "built\n"
+
+
+@pytest.mark.parametrize("parent_link", [False, True])
+def test_cancelled_job_keeps_outside_output_without_copying_it(board, parent_link):
+    relative = "linked/report.txt" if parent_link else "report.txt"
+    job_id, path = settled(board, outputs=[relative])
+    outside = path.parent / "outside"
+    outside.mkdir()
+    (outside / "report.txt").write_text("outside\n", encoding="utf-8")
+    link = path / ("linked" if parent_link else relative)
+    link.symlink_to(outside if parent_link else outside / "report.txt")
+    git(path, "add", link.name)
+    git(path, "commit", "-m", "add output link")
+    board.finish_step(job_id, "cancelled")
+    board.scan()
+    state = board.get(job_id).workspace_state
+    assert state == f"kept: declared output {relative} resolves outside the worktree"
+    assert path.is_dir() and not (path.parent / "outputs" / relative).exists()
+
+
+@pytest.mark.parametrize("tracked_link", [False, True])
+def test_output_link_chain_is_copied_only_when_head_cannot_restore_it(board, tracked_link):
+    relative = "reports/summary.txt"
+    job_id, path = settled(board, outputs=[relative])
+    if not tracked_link:
+        commit_in(path, ".gitignore", "/current.txt\n")
+    commit_in(path, "data.txt", "result\n")
+    (path / "reports").mkdir()
+    (path / relative).symlink_to("../current.txt")
+    (path / "current.txt").symlink_to("data.txt")
+    git(path, "add", relative)
+    if tracked_link:
+        git(path, "add", "current.txt")
+    git(path, "commit", "-m", "add report links")
+    output = path.parent / "outputs" / relative
+    if tracked_link:
+        output.parent.parent.mkdir(exist_ok=True)
+        output.parent.write_text("blocks copying\n", encoding="utf-8")
+    board.finish_step(job_id, "done")
+    board.scan()
+    assert board.get(job_id).workspace_state == "removed" and not path.exists()
+    if not tracked_link:
+        assert output.read_text(encoding="utf-8") == "result\n"
 
 
 def test_a_folder_git_does_not_know_is_kept_as_an_orphan(board):

@@ -1,10 +1,9 @@
 """The work folder of a code job: a named branch on a fresh base, and its cleanup.
 
-Every git command runs in the job environment, never prompts, and never uses `--force`. A
-folder with uncommitted or untracked files, an ignored path outside the tool caches, an
-uncommitted output that cannot be copied into the job folder, or a branch that is not
-integrated is kept and the reason is recorded; nothing here deletes the job folder, records,
-reviews or logs.
+Every git command runs in the job environment, never prompts, and never uses `--force`.
+Worktrees with uncommitted or untracked files or an output that cannot be saved are kept;
+other ignored files do not block removal. Unintegrated branches are kept. Nothing here
+deletes the job folder, records, reviews or logs.
 """
 
 from __future__ import annotations
@@ -23,18 +22,6 @@ from .jobs import JobConfig, Jobs, JobState
 FETCH_TIMEOUT = 5.0
 LOCAL_TIMEOUT = 30.0
 FALLBACK_BRANCH = "main"
-# Ignored folders a finished code job may rebuild. Any other ignored path may be a result.
-REBUILDABLE_DIRS = frozenset(
-    {
-        ".local",
-        ".venv",
-        "node_modules",
-        "__pycache__",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".mypy_cache",
-    }
-)
 
 
 class WorkspaceError(Exception):
@@ -254,11 +241,6 @@ def _remove(job: JobState, env: Mapping[str, str]) -> str:
     problem = _copy_outputs(job, path, env)
     if problem:
         return f"kept: {problem}"
-    ignored = _git(path, env, "status", "--porcelain", "--ignored=traditional")
-    if ignored.returncode != 0:
-        return f"kept: {_reason(ignored.stderr)}"
-    if stray := _ignored_outside_rebuildable(ignored.stdout):
-        return f"kept: ignored paths outside the tool caches: {stray}"
     proc = _git(job.target, env, "worktree", "remove", os.fspath(path))
     if proc.returncode != 0:
         reason = _reason(proc.stderr)
@@ -282,33 +264,63 @@ def _listed(listing: str, path: Path) -> bool:
 
 
 def _copy_outputs(job: JobState, path: Path, env: Mapping[str, str]) -> str:
-    """Copy each declared output HEAD does not hold into the job folder; '' when all are safe."""
+    """Save declared output data that cannot be restored from HEAD."""
+    if not job.outputs:
+        return ""
+    root = path.resolve()
     folder = path.parent / "outputs"
     for relative in job.outputs:
-        if _git(path, env, "cat-file", "-e", f"HEAD:{relative}").returncode == 0:
-            continue
-        if not os.path.lexists(path / relative):
-            continue  # A declared output never written leaves nothing to lose.
+        source = root / relative
         try:
+            resolved = source.resolve()
+            if not resolved.is_relative_to(root):
+                return f"declared output {relative} resolves outside the worktree"
+            try:
+                source.lstat()
+            except FileNotFoundError:
+                continue  # A declared output never written leaves nothing to lose.
+            if not source.is_file():
+                return f"could not copy the uncommitted output {relative}: not a regular file"
+            entry = source.relative_to(root)
+            saved = (
+                _head_type(root, entry, env) == "blob"
+                if source == resolved
+                else _output_in_head(root, entry, env)
+            )
+            if saved:
+                continue
             target = folder / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path / relative, target)
-        except OSError as exc:
+            shutil.copy2(resolved, target)
+        except (OSError, RuntimeError) as exc:
             return f"could not copy the uncommitted output {relative}: {exc}"
     return ""
 
 
-def _ignored_outside_rebuildable(listing: str) -> str:
-    """The first ignored path whose parts hold no rebuildable folder, or ''."""
-    for line in listing.splitlines():
-        if not line.startswith("!! "):
+def _output_in_head(root: Path, relative: Path, env: Mapping[str, str]) -> bool:
+    """A fresh checkout needs every relative link on the way to the final file."""
+    pending = list(reversed(relative.parts))
+    entry = Path()
+    while pending:
+        part = pending.pop()
+        if part == "..":
+            if entry == Path() or _head_type(root, entry, env) != "tree":
+                return False  # The checkout must have the directory being traversed.
+            entry = entry.parent
             continue
-        name = line[3:].strip().strip('"')
-        parts = [part for part in name.rstrip("/").split("/") if part]
-        if any(part in REBUILDABLE_DIRS for part in parts):
-            continue
-        return name
-    return ""
+        entry /= part
+        if (root / entry).is_symlink():
+            link = (root / entry).readlink()
+            if link.is_absolute() or _head_type(root, entry, env) != "blob":
+                return False
+            entry = entry.parent
+            pending.extend(reversed(link.parts))
+    return _head_type(root, entry, env) == "blob"
+
+
+def _head_type(root: Path, entry: Path, env: Mapping[str, str]) -> str:
+    result = _git(root, env, "cat-file", "-t", f"HEAD:{entry.as_posix()}")
+    return result.stdout if result.returncode == 0 else ""
 
 
 def _delete_if_integrated(job: JobState, env: Mapping[str, str], fetched: set[str]) -> str:
