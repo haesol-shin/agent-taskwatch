@@ -300,6 +300,184 @@ def test_a_full_disk_is_reported_even_when_recoveries_are_used_up(
     assert board.get(job_id).wait_reason == "disk_full"
 
 
+def test_a_dead_step_parks_with_under_two_gib_free(board: Board, monkeypatch) -> None:
+    job_id = board.add()
+    board.scan()
+    _free_space(monkeypatch, {board.root: 1024**3})
+    board.kill(job_id)
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason) == ("user_wait", "disk_full")
+
+
+@pytest.mark.parametrize("where", ["folder", "tmpdir"])
+def test_a_queued_job_waits_below_the_start_floor_then_starts(
+    board: Board, monkeypatch, tmp_path: Path, where: str
+) -> None:
+    job_id = board.add()
+    temp = tmp_path / "tmp"
+    board.config = replace(board.config, private_tmp=False, env={"TMPDIR": str(temp)})
+    low = board.jobs.folder(board.get(job_id)) if where == "folder" else temp
+    free = {low: 5 * 1024**3}
+    _free_space(monkeypatch, free)
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason, job.attempt) == ("queued", "disk_low", 0)
+    assert (job.recoveries, job.reviews_used, job.unit) == (0, 0, "")
+    free.clear()
+    assert board.scan() == [job_id]
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason) == ("work", "")
+
+
+def test_the_start_floor_holds_only_queued_jobs(tmp_path: Path, monkeypatch) -> None:
+    board = Board(tmp_path, slots=1)
+    running = board.add()
+    queued = board.add()
+    assert board.scan() == [running]
+    assert board.get(queued).wait_reason == "slot"
+    _free_space(monkeypatch, {board.root: 5 * 1024**3})
+    assert board.scan() == []
+    assert (board.get(running).stage, board.get(running).wait_reason) == ("work", "")
+    assert board.service.stopped == []
+    assert board.get(queued).wait_reason == "disk_low"
+    board.finish_step(running, "check")
+    assert board.scan() == [running]
+    assert board.get(running).stage == "check"
+
+
+def test_a_started_job_can_resume_below_the_start_floor(board: Board, monkeypatch) -> None:
+    job_id = board.add()
+    assert board.scan() == [job_id]
+    board.finish_step(job_id, "check")
+    assert board.scan() == [job_id]
+    free = {board.root: 1024**3}
+    _free_space(monkeypatch, free)
+    board.kill(job_id)
+    assert board.scan() == []
+    assert board.get(job_id).wait_reason == "disk_full"
+
+    free[board.root] = 5 * 1024**3
+    root = str(board.jobs.state.root)
+    assert cli_main(["--root", root, "resume", job_id, "--reason", "freed space"]) == 0
+    assert board.scan() == [job_id]
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason) == ("check", "")
+
+
+def test_unavailable_temp_directory_blocks_first_launch_until_available(
+    board: Board, monkeypatch, tmp_path: Path
+) -> None:
+    board.config = replace(board.config, private_tmp=False)
+    job_id = board.add()
+    folder = board.jobs.folder(board.get(job_id))
+    free = {folder: 1024**3}
+    asked = _free_space(monkeypatch, free)
+    lookups = []
+
+    def unavailable():
+        lookups.append(tuple(asked))
+        raise FileNotFoundError("no usable temporary directory")
+
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(job_scan, "tempfile", SimpleNamespace(gettempdir=unavailable))
+    assert board.scan() == []
+    assert board.get(job_id).wait_reason == "disk_low"
+    assert not lookups
+
+    free.clear()
+    asked.clear()
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason) == ("queued", "disk_unavailable")
+    assert "no usable temporary directory" in job.error
+    assert lookups == [(folder,)]
+
+    board.config = replace(board.config, env={"TMPDIR": str(tmp_path)})
+    assert board.scan() == [job_id]
+
+
+def test_refused_first_start_still_needs_ten_gib_after_resume(board: Board, monkeypatch) -> None:
+    job_id = board.add()
+    free = {board.root: 11 * 1024**3}
+    _free_space(monkeypatch, free)
+    board.service.start_error = RuntimeError("start refused")
+    assert board.scan() == [job_id]
+    assert board.service.started == []
+
+    board.service.start_error = None
+    free[board.root] = 5 * 1024**3
+    assert board.scan() == []
+    assert board.get(job_id).recoveries == 0
+    free[board.root] = 1024**3
+    assert board.scan() == []
+    assert board.get(job_id).wait_reason == "disk_full"
+
+    free[board.root] = 5 * 1024**3
+    root = str(board.jobs.state.root)
+    assert cli_main(["--root", root, "resume", job_id, "--reason", "freed space"]) == 0
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason, job.attempt) == ("queued", "disk_low", 1)
+    free[board.root] = 10 * 1024**3
+    assert board.scan() == [job_id]
+    assert board.service.started == [board.get(job_id).unit]
+
+
+def test_recovery_waits_for_shared_temp_without_spending_budget(
+    board: Board, monkeypatch, tmp_path: Path
+) -> None:
+    board.config = replace(board.config, private_tmp=False)
+    job_id = board.add()
+    assert board.scan() == [job_id]
+    board.kill(job_id)
+
+    def unavailable():
+        raise FileNotFoundError("no usable temporary directory")
+
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(job_scan, "tempfile", SimpleNamespace(gettempdir=unavailable))
+    for _ in range(MAX_RECOVERIES + 1):
+        assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason, job.recoveries) == ("work", "disk_unavailable", 0)
+    assert "no usable temporary directory" in job.error
+
+    board.config = replace(board.config, env={"TMPDIR": str(tmp_path)})
+    assert board.scan() == [job_id]
+    job = board.get(job_id)
+    assert (job.wait_reason, job.error, job.recoveries) == ("", "", 1)
+
+
+def test_unreadable_shared_tmpdir_defers_first_start(board: Board, monkeypatch) -> None:
+    temp = board.root / "shared-tmp"
+    board.config = replace(board.config, private_tmp=False, env={"TMPDIR": str(temp)})
+    job_id = board.add()
+
+    def usage(path):
+        if path == temp and not temp.exists():
+            raise FileNotFoundError(f"unavailable: {path}")
+        return SimpleNamespace(free=20 * 1024**3)
+
+    monkeypatch.setattr(job_scan.shutil, "disk_usage", usage)
+    assert board.scan() == []
+    job = board.get(job_id)
+    assert (job.stage, job.wait_reason, job.attempt) == ("queued", "disk_unavailable", 0)
+    assert str(temp) in job.error
+    temp.mkdir()
+    assert board.scan() == [job_id]
+
+
+def test_private_tmp_first_start_ignores_shared_tmp_space(board: Board, monkeypatch) -> None:
+    temp = board.root / "shared-tmp"
+    job_id = board.add()
+    folder = board.jobs.folder(board.get(job_id))
+    board.config = replace(board.config, env={"TMPDIR": str(temp)})
+    _free_space(monkeypatch, {folder: 20 * 1024**3, temp: 4 * 1024**3})
+    assert board.scan() == [job_id]
+    assert board.service.private_tmps == [folder / job_scan.PRIVATE_TMP]
+
+
 def test_review_launches_stop_at_the_cap_and_resume_opens_a_fresh_cycle(board: Board) -> None:
     job_id = board.add()
     board.scan()
@@ -812,8 +990,10 @@ def test_scan_events_record_why_a_step_was_relaunched(board: Board) -> None:
     board.scan()
     board.kill(job_id)
     board.scan()
-    kinds = [e["kind"] for e in board.get(job_id).events if e.get("source") == "scan"]
-    assert kinds == ["launched", "service_dead", "launched"]
+    events = board.get(job_id).events
+    dead = next(i for i, event in enumerate(events) if event.get("kind") == "service_dead")
+    relaunch = next(i for i, event in enumerate(events) if event.get("attempt") == 2)
+    assert dead < relaunch
 
 
 # -- the private /tmp of a step ---------------------------------------------------------------
@@ -884,11 +1064,8 @@ def test_the_start_argv_has_no_namespace_properties_without_a_private_tmp(
 ) -> None:
     seen = _run_capture(monkeypatch)
     Systemd(tmp_path).start(_unit_job())
-    assert not [
-        item
-        for item in seen[0]
-        if "BindPaths" in item or "PrivateUsers" in item or "service-type" in item
-    ]
+    assert "--service-type=exec" in seen[0]
+    assert not [item for item in seen[0] if "BindPaths" in item or "PrivateUsers" in item]
 
 
 def test_a_refused_private_tmp_start_names_the_switch(monkeypatch, tmp_path: Path) -> None:
