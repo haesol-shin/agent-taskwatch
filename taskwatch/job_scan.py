@@ -39,7 +39,10 @@ WAKE_DELAY = "2s"
 WAKE_ACCURACY = "1s"
 # A step writes logs, sessions, git objects and temporary files. Below this much free space a
 # relaunch is likely to die on ENOSPC again, so the scan stops instead of burning a recovery.
-DISK_FLOOR_BYTES = 256 * 1024 * 1024
+DISK_FLOOR_BYTES = 2 * 1024**3
+# A new job needs room for its first step too. Below this much free space it stays queued, so a
+# nearly full disk does not strand the jobs that must free it.
+DISK_START_FLOOR_BYTES = 10 * 1024**3
 # systemd splits BindPaths on whitespace and ':', and unquotes and unescapes it, so such a
 # path cannot be passed through as is.
 _UNBINDABLE = frozenset(" \t\n:'\"\\")
@@ -66,11 +69,8 @@ class Systemd:
     def start(self, job: JobState, private_tmp: Path | None = None) -> None:
         """Start the step as a user service; with `private_tmp` its /tmp is that folder.
 
-        The bind needs a user namespace (`PrivateUsers=yes`) because a user manager cannot
-        mount without root. With the default `simple` type, systemd-run reports success
-        before the namespace and the mount are set up, so a refused setup would only show as
-        a dead unit. `exec` makes the start wait for them, so such a host fails here, with
-        the switch named.
+        `exec` acknowledges successful execution rather than a fork. With a private /tmp
+        this also catches a refused namespace or mount before counting the step as started.
         """
         argv = [
             "systemd-run",
@@ -78,12 +78,12 @@ class Systemd:
             "--quiet",
             f"--unit={job.unit}",
             "--property=KillMode=control-group",
+            "--service-type=exec",
         ]
         if private_tmp is not None:
             if _UNBINDABLE & set(str(private_tmp)):
                 raise RuntimeError(f"private /tmp: the path {private_tmp} cannot be bound")
             argv += [
-                "--service-type=exec",
                 "--property=PrivateUsers=yes",
                 f"--property=BindPaths={private_tmp}:/tmp",
             ]
@@ -317,6 +317,9 @@ class _Scan:
         if status in DEAD:
             self._recover(self._event(job, "service_dead"))
         elif status == "active":
+            if job.error.startswith("start_failed:") and not _has_started(job):
+                job = self._event(job, "service_active")
+                self._save(job)
             self._check_stall(job)
         else:
             self._park(job, "service_unknown")
@@ -360,26 +363,45 @@ class _Scan:
         self._save(job)
         return job
 
-    def _full_disk(self, job: JobState) -> str:
-        """The first of the job folder and TMPDIR whose filesystem is under the floor, or ''.
-
-        The private /tmp lives inside the job folder, so the first check covers it.
-        A filesystem that cannot be read is not reported full: nothing proves it.
-        """
+    def _disk_low(
+        self, job: JobState, floor: int, *, check_shared_tmp: bool = True
+    ) -> tuple[Path, int] | None:
+        """Return the first measured shortage, or raise if a required probe fails."""
+        low = _low_space(self.jobs.folder(job), floor)
+        if low is not None or not check_shared_tmp:
+            return low
         temp = job_environment(self.config.env).get("TMPDIR") or tempfile.gettempdir()
-        for path in (self.jobs.folder(job), Path(temp)):
-            try:
-                free = shutil.disk_usage(path).free
-            except OSError:
-                continue
-            if free < DISK_FLOOR_BYTES:
-                return f"disk_full: {path} has {free} bytes free, the floor is {DISK_FLOOR_BYTES}"
-        return ""
+        return _low_space(Path(temp), floor)
+
+    def _start_disk_low(self, job: JobState) -> bool:
+        # The private /tmp is backed by the job folder, already checked above.
+        low = self._disk_low(
+            job, DISK_START_FLOOR_BYTES, check_shared_tmp=not self.config.private_tmp
+        )
+        return low is not None
+
+    def _disk_wait(self, job: JobState, reason: str, error: str = "") -> None:
+        if (job.wait_reason, job.error) != (reason, error):
+            self._save(replace(job, wait_reason=reason, error=error))
+
+    def _full_disk(self, job: JobState) -> str:
+        low = self._disk_low(job, DISK_FLOOR_BYTES)
+        if low is None:
+            return ""
+        path, free = low
+        return f"disk_full: {path} has {free} bytes free, the floor is {DISK_FLOOR_BYTES}"
 
     def _recover(self, job: JobState) -> None:
-        full = self._full_disk(job)
+        try:
+            full = self._full_disk(job)
+            first_wait = not full and not _has_started(job) and self._start_disk_low(job)
+        except OSError as exc:
+            self._disk_wait(job, "disk_unavailable", f"disk_unavailable: {exc}")
+            return
         if full:
             self._park(job, "disk_full", full)
+        elif first_wait:
+            self._disk_wait(job, "disk_low")
         elif job.stage == "review":
             # Each relaunch reserves its own review, so the review cap bounds it.
             if self._confirm_dead(job):
@@ -403,15 +425,23 @@ class _Scan:
     # -- launching --------------------------------------------------------------------------
 
     def _admit(self, job: JobState) -> None:
-        reason = self._blocker(job)
+        try:
+            reason = self._blocker(job)
+        except OSError as exc:
+            self._disk_wait(job, "disk_unavailable", f"disk_unavailable: {exc}")
+            return
         if reason is None:
             self._launch(job, _launch_stage(job))
-        elif job.stage in {"queued", "land"} and job.wait_reason != reason:
-            self._save(replace(job, wait_reason=reason))
+        elif job.stage in {"queued", "land"}:
+            error = "" if job.wait_reason == "disk_unavailable" else job.error
+            self._disk_wait(job, reason, error)
 
     def _blocker(self, job: JobState) -> str | None:
         if job.unit:
             return "unit"
+        # Explicit resume requeues a job, including one whose only start was refused.
+        if job.stage == "queued" and not _has_started(job) and self._start_disk_low(job):
+            return "disk_low"
         if waiting := self._predecessor_wait(job):
             return waiting
         if job.retry_not_before > self.now:
@@ -496,6 +526,7 @@ class _Scan:
             return
         attempt = job.attempt + 1
         due = job.retry_not_before
+        needs_ack = not _has_started(job)
         job = replace(
             job,
             attempt=attempt,
@@ -516,7 +547,7 @@ class _Scan:
         )
         # Reserve before the service call: a lost ack is found later by unit name.
         extra = {"retry_not_before": due} if due else {}
-        job = self._event(job, "launched", stage=stage, **extra)
+        job = self._event(job, "launched", stage=stage, needs_ack=needs_ack, **extra)
         self._save(job)
         self.launched.append(job.id)
         try:
@@ -524,6 +555,9 @@ class _Scan:
         except _SPAWN_ERRORS as exc:
             failed = replace(job, error=f"start_failed: {exc}")
             self._save(self._event(failed, "start_failed", error=str(exc)))
+        else:
+            if needs_ack:
+                self._save(self._event(job, "start_confirmed"))
 
     def _private_tmp(self, job: JobState) -> Path | None:
         if not self.config.private_tmp:
@@ -599,3 +633,30 @@ def _is_gap(job: JobState) -> bool:
 
 def _is_pending(job: JobState) -> bool:
     return job.stage == "queued" or (job.stage in SLOT_STAGES and not job.unit)
+
+
+def _low_space(path: Path, floor: int) -> tuple[Path, int] | None:
+    free = shutil.disk_usage(path).free
+    return (path, free) if free < floor else None
+
+
+def _has_started(job: JobState) -> bool:
+    if job.attempt == 0:
+        return False
+    refused = None
+    oldest = job.attempt + 1
+    for event in reversed(job.events):
+        if event.get("type") in {"worker_launch", "step_exit", "step_failed"}:
+            return True  # Runner evidence survives a lost service acknowledgement.
+        if event.get("source") != "scan":
+            continue
+        kind = event.get("kind")
+        if kind in {"start_confirmed", "service_active"}:
+            return True
+        if kind == "start_failed":
+            refused = event.get("attempt")
+        elif kind == "launched" and isinstance(attempt := event.get("attempt"), int):
+            oldest = attempt
+            if not event.get("needs_ack") and refused != oldest:
+                return True  # Older records did not store successful acknowledgements.
+    return oldest > 1  # Preserve earlier legacy attempts without launch events.

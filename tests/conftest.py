@@ -1,5 +1,6 @@
 import os
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,12 @@ def no_real_wake(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     calls: list[object] = []
     monkeypatch.setattr(job_scan.Systemd, "wake", lambda self: calls.append(self.root))
     return calls
+
+
+@pytest.fixture(autouse=True)
+def enough_disk_space(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only disk-floor tests should depend on the reported free space."""
+    monkeypatch.setattr(job_scan.shutil, "disk_usage", lambda path: SimpleNamespace(free=10**12))
 
 
 @pytest.fixture(autouse=True, scope="session")
