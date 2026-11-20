@@ -35,6 +35,7 @@ class Scope:
     lines: int | None  # added plus deleted lines of the delta; None when unreadable
     first_lines: int | None  # the same for the diff of the first review
     ratio: float | None  # lines / first_lines; None when either is unknown or first is 0
+    sweep: tuple[str, ...] = ()  # F7: ids of repeat findings to search for by cause
 
     def record(self) -> dict:
         """What the review record keeps of this round, so the thresholds can be tuned later."""
@@ -46,6 +47,7 @@ class Scope:
             "lines": self.lines,
             "first_lines": self.first_lines,
             "ratio": self.ratio,
+            "sweep": list(self.sweep),
         }
 
 
@@ -90,17 +92,14 @@ def _named(path: str, scope_text: str, roots: Sequence[str] = ()) -> bool:
     return False
 
 
-def _severe(prior: Sequence[Mapping]) -> bool:
-    return any(f.get("severity") == "P0" for r in prior for f in r.get("findings", ()))
-
-
-def _repeated(prior: Sequence[Mapping]) -> list[str]:
+def _repeated(last: Mapping) -> tuple[str, ...]:
     """Ids of the last review's findings that name an earlier finding as the same defect."""
-    last = prior[-1]
-    return sorted(
-        f"r{last['round']}.{finding['finding']}"
-        for finding in last.get("findings", ())
-        if finding.get("repeat_of")
+    return tuple(
+        sorted(
+            f"r{last['round']}.{finding['finding']}"
+            for finding in last.get("findings", ())
+            if finding.get("repeat_of")
+        )
     )
 
 
@@ -137,14 +136,10 @@ def decide(
 ) -> Scope:
     """The scope of the round that follows the reviews in `prior` (at least one).
 
-    F1 delta file outside what earlier rounds saw (read those files in full, nothing else
-    changes); F2 delta over 50% of the first review's diff or over 400 lines; F3 the base
-    commit differs from the last review's; F5 an earlier round had a P0; F6 the delta touches a
-    security path or a path the approval scope names; F7 a finding the reviewer marked with
-    `repeat_of`. Any of F2, F3, F5, F6 and F7, or a diff that cannot be read, makes the round a
-    full review.
+    See the conditions and their effects in docs/checks.md, "Re-review scope".
     """
     first, last = prior[0], prior[-1]
+    sweep = _repeated(last)
     full: list[str] = []
     if last.get("base") != base:
         full.append(
@@ -153,30 +148,40 @@ def decide(
     try:
         delta = _numstat(repo, env, last["fingerprint"], fingerprint)
         stat = _stat(repo, env, last["fingerprint"], fingerprint)
+    except (FingerprintError, ValueError, KeyError) as exc:
+        reason = f"the latest delta cannot be read, so the round reads everything: {exc}"
+        return Scope("full", (*full, reason), (), (), "", None, None, None, sweep=sweep)
+
+    lines = sum(delta.values())
+    first_lines = None
+    new_files = ()
+    try:
         first_rows = _numstat(repo, env, first.get("base") or base, first["fingerprint"])
+        first_lines = sum(first_rows.values())
         seen = set(first_rows) | set(
             _numstat(repo, env, last.get("base") or base, last["fingerprint"])
         )
+        new_files = tuple(sorted(set(delta) - seen))
     except (FingerprintError, ValueError, KeyError) as exc:
-        reason = f"the diff cannot be read, so the round reads everything: {exc}"
-        return Scope("full", (*full, reason), (), (), "", None, None, None)
-    lines, first_lines = sum(delta.values()), sum(first_rows.values())
-    ratio = round(lines / first_lines, 2) if first_lines else None
-    new_files = tuple(sorted(set(delta) - seen))
-    if lines > MAX_DELTA_LINES or lines > first_lines * MAX_DELTA_RATIO:
         full.append(
-            f"F2: the delta is {lines} lines against {first_lines} in the first review "
-            f"(limits: {MAX_DELTA_RATIO:.0%} of it, {MAX_DELTA_LINES} lines)"
+            "Earlier review history cannot be read. Do not infer which files earlier rounds "
+            f"saw from the missing history: {exc}"
         )
-    if _severe(prior):
-        full.append("F5: an earlier round had a P0 finding")
+    ratio = round(lines / first_lines, 2) if first_lines else None
+    over_ratio = first_lines is not None and lines > first_lines * MAX_DELTA_RATIO
+    if lines > MAX_DELTA_LINES or over_ratio:
+        first_size = "unknown" if first_lines is None else f"{first_lines} lines"
+        full.append(
+            f"F2: the delta is {lines} lines (first review: {first_size}; "
+            f"limits: {MAX_DELTA_RATIO:.0%} of it, {MAX_DELTA_LINES} lines)"
+        )
+    if any(f.get("severity") == "P0" for f in last.get("findings", ())):
+        full.append("F5: the last review had a P0 finding")
     touched = sorted(p for p in delta if SECURITY.search(p) or _named(p, approval_scope, roots))
     if touched:
         full.append(
             f"F6: the delta touches a security or approval-scope path: {', '.join(touched)}"
         )
-    if repeated := _repeated(prior):
-        full.append(f"F7: an earlier defect came back: {', '.join(repeated)}")
     reasons = list(full)
     if new_files:
         reasons.insert(
@@ -184,7 +189,15 @@ def decide(
         )
     mode = "full" if full else "delta"
     return Scope(
-        mode, tuple(reasons), new_files, tuple(sorted(delta)), stat, lines, first_lines, ratio
+        mode,
+        tuple(reasons),
+        new_files,
+        tuple(sorted(delta)),
+        stat,
+        lines,
+        first_lines,
+        ratio,
+        sweep=sweep,
     )
 
 
@@ -211,17 +224,29 @@ def message_lines(scope: Scope, round_number: int, checks: Sequence[Mapping]) ->
     if scope.mode == "full":
         head = [
             f"This is re-review round {round_number}, and a full review: taskwatch found "
-            "a reason to read the whole result again. Review it as in a first review, and "
-            "still close each finding below.",
+            "a reason to read the whole result again. Read all of it and judge it as a later "
+            "round (K-22), closing each finding below.",
             *(f"- {reason}" for reason in scope.reasons),
         ]
+        if scope.lines is None:
+            head.append("Do not treat the missing delta file list as proof a file was untouched.")
+        else:
+            head.append(
+                "For a new P0 or P1 in a file the delta does not touch, give the reason in "
+                "the finding: new evidence, or what the fix changed. Without that reason "
+                "report P1 findings as P2."
+            )
     else:
         head = [
             f"This is re-review round {round_number}. Review the fix, not the whole job again: "
             "close each finding below, read every changed line of the delta, read the users of "
-            "what changed, and read nothing else of an untouched file. Do not reopen settled "
-            "ground."
+            "what changed, and read nothing else of an untouched file outside any sweep "
+            "listed below. Do not reopen settled ground."
         ]
+    head.append(
+        "A P0 stays blocking even without a reason it was not visible before. "
+        "This overrides any copied guideline that would report it as P2."
+    )
     delta: list[str] = []
     if scope.lines is not None:
         ratio = "" if scope.ratio is None else f" ({scope.ratio:.0%} of the first review's diff)"
@@ -229,9 +254,18 @@ def message_lines(scope: Scope, round_number: int, checks: Sequence[Mapping]) ->
             f"Delta since the last review: {scope.lines} lines in {len(scope.files)} files{ratio}.",
             f"Files the delta touches: {', '.join(scope.files) or 'none'}",
         ]
-    if scope.new_files and scope.mode == "delta":
+    if scope.new_files:
         delta.append(
             "No earlier round saw these files. Read each in full, as in a first review: "
             + ", ".join(scope.new_files)
         )
-    return [*head, *delta, check_line(checks)]
+    sweep = []
+    if scope.sweep:
+        sweep = [
+            "",
+            f"Same-cause sweep for repeated findings: {', '.join(scope.sweep)}. Search the "
+            "whole result for the same cause of each repeat and report every location in one "
+            "finding per cause (K-20 and C-7).",
+            "",
+        ]
+    return [*head, *delta, *sweep, check_line(checks)]

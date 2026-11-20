@@ -129,13 +129,16 @@ def test_f3_a_base_that_differs_from_the_last_reviews_is_a_full_review(rnd):
     assert old.mode == "full"  # a record from before the field exists counts as different
 
 
-def test_f5_a_p0_in_any_earlier_round_is_a_full_review(rnd):
-    prior = [review(rnd.first, rnd.base, finding(severity="P0"))]
+@pytest.mark.parametrize(("last_severity", "mode"), [("P0", "full"), ("P1", "delta")])
+def test_f5_only_a_p0_in_the_last_review_forces_a_full_review(rnd, last_severity, mode):
+    second = commit(rnd.repo, {"a.py": lines(20).replace("a2", "fixed")})
+    prior = [
+        review(rnd.first, rnd.base, finding(severity="P0")),
+        review(second, rnd.base, finding(severity=last_severity), round=2),
+    ]
     scope = rnd.decide({"a.py": lines(20).replace("a3", "x")}, prior=prior)
-    assert scope.mode == "full" and any(r.startswith("F5:") for r in scope.reasons)
-    calm = other(rnd, "calm")
-    prior = [review(calm.first, calm.base, finding(severity="P1"))]
-    assert calm.decide({"a.py": lines(20).replace("a5", "x")}, prior=prior).mode == "delta"
+    assert scope.mode == mode
+    assert any(r.startswith("F5:") for r in scope.reasons) == (mode == "full")
 
 
 @pytest.mark.parametrize(
@@ -155,9 +158,10 @@ def test_f6_a_path_the_approval_scope_names_is_a_full_review(rnd):
     )
 
 
-def test_f7_a_reviewer_marked_repeat_is_a_full_review(rnd):
+@pytest.mark.parametrize(("severity", "mode"), [("P1", "delta"), ("P0", "full")])
+def test_f7_adds_a_sweep_without_changing_the_mode(rnd, severity, mode):
     repeat = {
-        **finding("K-8", location="a.py:9"),
+        **finding("K-8", severity=severity, location="a.py:9"),
         "repeat_of": "r1.F1",
         "repeat_reason": "the same defect",
     }
@@ -166,7 +170,14 @@ def test_f7_a_reviewer_marked_repeat_is_a_full_review(rnd):
         review(rnd.first, rnd.base, repeat, round=2),
     ]
     scope = rnd.decide({"a.py": lines(20).replace("a3", "x")}, prior=again)
-    assert scope.mode == "full" and any(r.startswith("F7:") and "r2.F1" in r for r in scope.reasons)
+    assert scope.mode == mode
+    assert scope.record()["sweep"] == ["r2.F1"]
+    text = "\n".join(review_delta.message_lines(scope, 3, []))
+    assert "Same-cause sweep for repeated findings: r2.F1." in text
+    assert "Search the whole result for the same cause" in text
+    assert "report every location in one finding per cause" in text
+    assert "A P0 stays blocking even without a reason it was not visible before." in text
+    assert "This overrides any copied guideline that would report it as P2." in text
 
 
 def test_f7_a_shared_rule_without_repeat_of_is_not_a_repeat(rnd):
@@ -174,14 +185,30 @@ def test_f7_a_shared_rule_without_repeat_of_is_not_a_repeat(rnd):
         review(rnd.first, rnd.base, finding("K-7", location="a.py:1")),
         review(rnd.first, rnd.base, finding("K-7", location="a.py:9"), round=2),
     ]
-    assert rnd.decide({"a.py": lines(20).replace("a3", "x")}, prior=again).mode == "delta"
+    scope = rnd.decide({"a.py": lines(20).replace("a3", "x")}, prior=again)
+    assert scope.mode == "delta" and scope.sweep == ()
+    assert "Same-cause sweep" not in "\n".join(review_delta.message_lines(scope, 3, []))
 
 
 def test_a_diff_that_cannot_be_read_is_a_full_review(rnd):
     prior = [review("0" * 40, rnd.base)]
     scope = rnd.decide({"a.py": lines(20).replace("a3", "x")}, prior=prior)
     assert scope.mode == "full" and scope.lines is None and "cannot be read" in scope.reasons[-1]
-    assert "Delta since" not in "\n".join(review_delta.message_lines(scope, 2, []))
+    message = "\n".join(review_delta.message_lines(scope, 2, []))
+    assert "Delta since" not in message
+    assert "Do not treat the missing delta file list as proof" in message
+
+
+def test_full_round_keeps_the_latest_delta_when_earlier_history_is_unreadable(rnd):
+    prior = [review("0" * 40, rnd.base), review(rnd.first, rnd.base, round=2)]
+    scope = rnd.decide({"added.py": "new\n"}, prior=prior)
+    assert scope.mode == "full"
+    assert "added.py" in scope.stat
+    message = "\n".join(review_delta.message_lines(scope, 3, []))
+    assert "Delta since the last review: 1 lines in 1 files." in message
+    assert "Files the delta touches: added.py" in message
+    assert "Earlier review history cannot be read" in message
+    assert "No earlier round saw these files" not in message
 
 
 def test_new_findings_counts_rule_and_location_pairs_no_round_reported():
@@ -240,8 +267,30 @@ def test_the_round_record_keeps_minutes_new_findings_and_the_ratio(unit_env):
     assert (one["base"], one["delta_ratio"], "rereview" not in one) == (base, None, True)
     assert (two["base"], two["delta_ratio"], two["new_findings"]) == (base, 0.09, 0)
     assert isinstance(two["minutes"], float) and two["minutes"] >= 0
-    assert two["rereview"]["mode"] == "delta" and list(two["rereview"]["files"]) == ["big.txt"]
-    assert (two["rereview"]["lines"], two["rereview"]["first_lines"]) == (2, 22)
+    assert two["rereview"] == {
+        "mode": "delta",
+        "reasons": (),
+        "new_files": (),
+        "files": ("big.txt",),
+        "lines": 2,
+        "first_lines": 22,
+        "ratio": 0.09,
+        "sweep": (),
+    }
+
+
+def test_rereview_uses_a_prior_record_without_sweep(unit_env):
+    first_round(unit_env)
+    second_round(unit_env, {"big.txt": lines(20).replace("a3", "fixed")})
+    prior = unit_env.get().to_json()["reviews"]
+    del prior[-1]["rereview"]["sweep"]
+    unit_env.put("deliver_pending", reviews=tuple(prior))
+    unit_env.scenario([REPLY])
+    prompt = second_round(unit_env, {"big.txt": lines(20).replace("a3", "updated")})
+    assert "Review the fix, not the whole job again" in prompt
+    assert f"Previously reviewed fingerprint: {prior[-1]['fingerprint']}" in prompt
+    assert "re-review round 3" in prompt
+    assert unit_env.get().stage == "deliver_pending"
 
 
 def test_a_security_path_in_the_delta_sends_a_full_review(unit_env):
@@ -249,6 +298,15 @@ def test_a_security_path_in_the_delta_sends_a_full_review(unit_env):
     prompt = second_round(unit_env, {".github/workflows/ci.yml": "on: push\n"})
     assert "and a full review" in prompt and "F6:" in prompt
     assert "Review the fix, not the whole job again" not in prompt
+    assert "Read all of it and judge it as a later round" in prompt
+    assert "Without that reason report P1 findings as P2." in prompt
+    assert "A P0 stays blocking even without a reason it was not visible before." in prompt
+    assert "Delta since the last review: 1 lines in 1 files" in prompt
+    assert "Files the delta touches: .github/workflows/ci.yml" in prompt
+    assert (
+        "No earlier round saw these files. Read each in full, as in a first review: "
+        ".github/workflows/ci.yml" in prompt
+    )
     assert unit_env.get().reviews[-1]["rereview"]["mode"] == "full"
 
 

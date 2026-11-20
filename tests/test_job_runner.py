@@ -850,7 +850,10 @@ def test_pending_async_review_is_not_accepted(env):
     assert job.stage == "review" and job.reviews == () and "timed out" in job.error
 
 
-def test_rereview_sees_prior_findings_and_original_request(env):
+@pytest.mark.parametrize(
+    "notes", [(), ("Keep the existing output.\nIts format is public.", "Defer the rename.")]
+)
+def test_rereview_sees_prior_findings_original_request_and_owner_notes(env, notes):
     env.scenario(
         [
             {"reply": f"{FAIL}\nP1: old finding"},
@@ -860,11 +863,42 @@ def test_rereview_sees_prior_findings_and_original_request(env):
     )
     env.to_review()
     assert env.run("review") == 0 and env.get().stage == "fix"
+    for note in notes:
+        env.put("user_wait", resume_stage="fix")
+        args = ["--root", str(env.tmp / "root"), "resume", env.job.id, "--reason", note]
+        assert cli_main(args) == 0
     assert env.run("fix") == 0 and env.run("check") == 0
     assert env.run("review") == 0
     prompt = env.prompts()[-1]
     assert "re-review round 2" in prompt and "P1: old finding" in prompt
     assert "ORIGINAL PROMPT TEXT" in prompt and env.get().stage == "deliver_pending"
+    heading = "Owner notes (resume messages, in order)"
+    expected = (
+        f"{heading}\n- Keep the existing output.\n  Its format is public.\n- Defer the rename."
+    )
+    for message in env.prompts()[1:]:
+        if notes:
+            assert expected in message
+        else:
+            assert heading not in message
+
+
+def test_owner_notes_budget_keeps_newest_text_first(env):
+    reason = "Keep the rename." + " " * 1484 + " Only if compatibility tests pass."
+    reasons = ("older excluded", "a" * 1600, "é" * 1500, "c" * 1500, "d" * 1400, reason)
+    events = tuple({"type": "resume", "reason": reason} for reason in reasons)
+    job = replace(env.job, events=(*events, {"type": "approve", "reason": "not a resume"}))
+    verify = (
+        "- [Truncated: verify the original resume reason in the job's saved events "
+        "before applying this as an owner decision.] "
+    )
+    assert job_runner._owner_notes(job)[2:] == [
+        verify + "a" * 100,
+        "- " + "é" * 1500,
+        "- " + "c" * 1500,
+        "- " + "d" * 1400,
+        verify + "Keep the rename.",
+    ]
 
 
 def test_async_followup_failure_after_prompt_result_fails_the_step(env):
