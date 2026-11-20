@@ -88,20 +88,20 @@ A finding line may carry `repeat_of`, the id `r<round>.F<n>` of an earlier findi
 
 ### Re-review scope
 
-For a code job, round 2 and later review the fix, not the whole job again. taskwatch, not the reviewer, decides whether the round is a delta round or a full review. The message of every such round holds the prior findings with the worker's record of each, the previously reviewed and current fingerprints, `git diff --stat` and the changed files of the delta (the diff from the last reviewed commit to the current one), the last check result, and the delta as a share of the first review's diff. The steps of a delta round are rules K-20 to K-22 of [the code guidelines](review/code.md).
+For a code job, taskwatch, not the reviewer, decides whether round 2 and later read just the fix (a delta round) or the whole result (a full review). The message of every such round holds the prior findings with the worker's record of each, the previously reviewed and current fingerprints, `git diff --stat` and the changed files of the delta (the diff from the last reviewed commit to the current one), the last check result, and the delta as a share of the first review's diff. The [code guidelines](review/code.md#re-review) give the steps of a delta round (K-20 and K-21) and the judgment of a full review (K-22).
 
-The round is a full review, judged as a first review with each prior finding still closed, when any of these holds. The thresholds are starting guesses, not measurements; tune them on the round records below after about ten jobs.
+A full review reads the whole result and judges it as a later round. The table gives the scope conditions and their effects. The thresholds are starting guesses, not measurements; tune them on the round records below after about ten jobs.
 
 | Code | Holds when | Effect |
 |---|---|---|
-| F1 | the delta touches a file that neither the first review's diff nor the diff up to the last reviewed commit contains | the reviewer reads those files in full as in a first review; the round stays a delta round |
+| F1 | the delta touches a file that neither the first review's diff nor the diff up to the last reviewed commit contains | read those files in full as in a first review; does not force a full review |
 | F2 | the delta is over 50% of the first review's diff, or over 400 lines (added plus deleted) | full |
 | F3 | the base commit the result stands on differs from the one the last review recorded; a rebase onto newer work changes it, and a review record from before this field counts as different | full |
-| F5 | an earlier round had a P0 finding | full |
+| F5 | the last review had a P0 finding | full |
 | F6 | the delta touches a security path (`.github`, `.ssh`, `.env*`, `*.pem`, `*.key`, or a folder or file named `secret*`, `credential*`, `auth*`, `security*`) or a path the approval scope names, relative or absolute under the work folder or the target | full |
-| F7 | a finding of the last review carries `repeat_of`: the reviewer judged it the same unresolved defect as an earlier finding | full |
+| F7 | a finding of the last review carries `repeat_of`: the reviewer judged it the same unresolved defect as an earlier finding | add a whole-result sweep for the same cause (K-20); does not force a full review |
 
-A diff that cannot be read (an unknown commit) is a full review too. Review-only jobs and design and source reviews have no commits to diff; they keep the message they had. The review record keeps the round data: `base`, `minutes` (how long the review step took), `new_findings` (findings whose rule and location no earlier round reported), `delta_ratio`, and for round 2 and later `rereview` with the mode, the conditions that held, the delta files and lines and the first review's lines. `base` is the parent of the oldest commit of the job's branch that no other branch or remote ref holds; it is the commit the job recorded when its work folder was made until the branch is rebased.
+An unreadable delta or unreadable earlier review history also requires a full review. If only the history is unreadable, the message keeps the latest delta and identifies the history gap instead of guessing which files were first seen. Review-only jobs and design and source reviews have no commits to diff; their scope is not computed. The review record keeps the round data: `base`, `minutes` (how long the review step took), `new_findings` (findings whose rule and location no earlier round reported), `delta_ratio`, and for round 2 and later `rereview` with the mode, the conditions that held, the delta files and lines and the first review's lines. The optional `rereview.sweep` list holds the ids of the repeated findings from the last review; older records omit it. `base` is the parent of the oldest commit of the job's branch that no other branch or remote ref holds; it is the commit the job recorded when its work folder was made until the branch is rebased.
 
 ## Scheduler checks
 

@@ -606,8 +606,7 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
     if ctx.stage == "fix":
         lines += ["", "This is a fix round. Fix exactly what follows, then finish."]
         lines.append(_fix_reason(job))
-        if reason := _resume_reason(job):
-            lines += ["", f"The owner resumed the job with: {reason}"]
+        lines += _owner_notes(job)
         lines += _record_lines(ctx)
     if resumed:
         lines += [
@@ -690,12 +689,28 @@ def _fix_reason(job: JobState) -> str:
     return f"The independent review did not pass.\n{problems}\n\nReview:\n{record['body']}"
 
 
-def _resume_reason(job: JobState) -> str:
-    """The owner's last resume note, which a fix prompt repeats to the worker."""
+def _owner_notes(job: JobState) -> list[str]:
+    """Keep the newest reason text within budget, then show it in event order."""
+    notes: list[str] = []
+    remaining = 6000
     for event in reversed(job.events):
-        if event.get("type") == "resume":
-            return str(event.get("reason", "")).strip()
-    return ""
+        if event.get("type") != "resume":
+            continue
+        reason = str(event.get("reason", "")).strip()
+        if not reason:
+            continue
+        limit = min(1500, remaining)
+        note = reason[:limit].rstrip().replace("\n", "\n  ")
+        if len(reason) > limit:
+            note = (
+                "[Truncated: verify the original resume reason in the job's saved events "
+                "before applying this as an owner decision.] " + note
+            )
+        notes.append("- " + note)
+        remaining -= min(len(reason), limit)
+        if not remaining:
+            break
+    return ["", "Owner notes (resume messages, in order)", *reversed(notes)] if notes else []
 
 
 def _subject_lines(ctx: Ctx) -> list[str]:
@@ -900,6 +915,7 @@ def _review_message(
         f"Spec: {job.spec}",
         f"Approval source: {job.approval_source}",
         f"Approval scope: {job.approval_scope}",
+        *_owner_notes(job),
         *(
             [
                 "Spec mode: task_file. The spec holds only Purpose and cause, Owner decisions and "

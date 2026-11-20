@@ -15,7 +15,7 @@ Use this file with the common guidelines when the deliverable is a code change.
 
 **K-2.** Start from the patch. Read the changed code with its callers and the tests that cover it. Read the spec, contract, or user-facing document that describes the changed behavior; search the docs and tests for the changed symbols, messages, and error codes to find it. A dispatch point outside the diff still has to be read before you treat the producing side as correct. When a port or interface changes, read every implementation of it, not only the one the patch edits.
 
-**K-3.** Keep going after the first blocker. Report every finding that meets the reporting bar.
+**K-3.** Finish the whole pass even after finding a blocker, and report every finding that meets the reporting bar in this round. Do not hold a known finding for a later round.
 
 ## Reporting bar
 
@@ -73,7 +73,7 @@ Use these rules when the assignment names public text: the step commit messages,
 
 **K-12.** On a later round, review the change since the prior reviewed result and the resolution of prior findings. Read surrounding code as needed. Do not re-litigate ground a prior round accepted.
 
-**K-13.** A new blocking finding on previously reviewed ground needs an explicit reason it was not visible before, such as the fix or new evidence. Without that reason, report it as P2 and say so.
+**K-13.** A new blocking finding on previously reviewed ground needs an explicit reason it was not visible before, such as the fix or new evidence. Without that reason, report it as P2 and say so. A P0 without that reason stays blocking and is an exception to the rule below against a worse verdict.
 
 **K-14.** Once the prior blockers are resolved, the verdict must not get worse unless a new blocker has that reason. An unresolved prior blocker stays blocking. Do not broaden the scope, add a new requirement, or raise the severity of an item already reported beyond what resolves it.
 
@@ -82,12 +82,13 @@ Use these rules when the assignment names public text: the step commit messages,
 1. Close each prior finding. Run the condition that first showed it, and say in `checked` what you ran.
 2. Read every changed line of the delta. The message names the two fingerprints, the files and the `git diff --stat`.
 3. For each function, configuration key, option or phrase the delta changed, grep for its users and for the documents that quote it, and read those places.
-4. Read nothing else of a file the delta did not touch. The one exception is a file the message says no earlier round saw: read it in full, as in a first review.
-5. The message gives the last check result. Do not run again what it ran.
+4. If the message names files no earlier round saw, read each in full as in a first review.
+5. If the message lists repeated finding ids, search the whole result for the same cause of each repeat and report all its locations in one finding under the [grouping rule](common.md#grouping). Do not read untouched code outside the places already required above or found by the sweep.
+6. The message gives the last check result. Do not run again what it ran.
 
 **K-21.** List in `checked` what you read outside the delta, and in `not_checked` what you skipped. If the delta changed a function, key or phrase and you read none of its users, say why in `not_checked`.
 
-**K-22.** A round the message calls a full review is judged as a first review, and each prior finding is still closed. taskwatch computes the mode from the conditions in [Re-review scope](../checks.md#re-review-scope); do not choose it, and do not shorten a full round because the delta looks small.
+**K-22.** A round the message calls a full review reads the whole result again and closes each prior finding. Judge it as a later round under the [common round rules](common.md#rounds) and the re-review rules above. A file the delta does not touch is reviewed ground, so a new P0 or P1 there needs its reason in the finding: new evidence, or what the fix changed. Without it, report P2. A P0 without that reason stays blocking. Read a file no earlier round saw as in a first review, as in step 4 of the delta-round procedure above. Do not infer a file was untouched or previously reviewed from an unavailable delta or review history. taskwatch computes the mode from the conditions in [Re-review scope](../checks.md#re-review-scope); do not choose it, and do not shorten a full round because the delta looks small.
 
 ## A job with a unit table
 

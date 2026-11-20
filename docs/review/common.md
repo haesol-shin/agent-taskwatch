@@ -4,7 +4,7 @@ Use this file for every review, then the review file the assignment names.
 
 ## Precedence
 
-**C-1.** A decision the requester made overrides this folder. An owner decision is a choice quoted in the approval source or the intent, or quoted as an owner statement in the spec. Any other choice in the spec is the writer's choice and is in scope of the review. If the request contradicts a cited owner decision, report that conflict.
+**C-1.** A decision the requester made overrides this folder. An owner decision is a choice quoted in the approval source or the intent, quoted as an owner statement in the spec, or recorded in the owner notes the message lists. Do not treat a truncated note as a decision until you verify the full resume reason in the job's saved events. Any other choice in the spec is the writer's choice and is in scope of the review. If the request contradicts a cited owner decision, report that conflict.
 
 ## Purpose
 
