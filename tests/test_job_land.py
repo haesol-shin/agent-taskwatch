@@ -4141,3 +4141,53 @@ def test_a_land_command_inside_the_limit_lets_landing_finish(make):
     lab.finish()
     assert lab.writes() == ["pr create", "pr merge"]
     assert lab.land()["install"]["status"] == "succeeded"
+
+
+def amended_spec(lab: Lab) -> dict:
+    path = lab.base / "amended-spec.md"
+    path.write_text((lab.base / "spec.md").read_text() + "\nAmended.\n", encoding="utf-8")
+    return {"spec": str(path)}
+
+
+def test_amend_after_publication_returns_to_fix_on_the_same_pr_without_a_ci_round(make):
+    lab = make(ci_fix_max=2)
+    lab.accept()
+    head = git(lab.tree, "rev-parse", "HEAD")
+    spent = {"reason": "ci_failed", "pr": 17, "round": 1, "head": head, "message": "boom"}
+    published = {
+        "pr": {"number": 17, "url": "https://github.com/sample/project/pull/17"},
+        "H": head,
+        "returns": [spent],
+        "ci_green": {"head": head},
+        "ci_deadline": 99.0,
+        "rerun_round": 1,
+    }
+    job = lab.put("land", land_state=published)
+    amended = lab.jobs.amend(job.id, amended_spec(lab), "plan changed", 50.0)
+    state = lab.land()
+    assert (amended.stage, amended.resume_stage, amended.ended_at) == ("fix", "fix", 50.0)
+    assert state["pr"] == published["pr"] and state["H"] == head
+    assert not {"ci_green", "ci_deadline", "rerun_round"} & state.keys()
+    assert state["returns"] == [
+        spent,
+        {
+            "reason": "amended",
+            "pr": 17,
+            "round": 1,
+            "head": head,
+            "message": "amended: plan changed",
+        },
+    ]
+    assert sum(r["reason"] == "ci_failed" for r in state["returns"]) == 1  # the budget is kept
+    assert amended.events[-1]["return"] == {"reason": "amended", "pr": 17, "round": 1}
+    assert (amended.reviews_used, amended.max_reviews) == (job.reviews_used, job.max_reviews)
+
+
+def test_amend_before_publication_clears_the_landing_state_and_routes_like_check(make):
+    lab = make()
+    lab.accept()
+    job = lab.put("land", land_state={"R": "r" * 40, "phase": "prepared"})
+    amended = lab.jobs.amend(job.id, amended_spec(lab), "plan changed", 50.0)
+    assert (amended.stage, dict(amended.land_state)) == ("fix", {})
+    assert "return" not in amended.events[-1]
+    assert lab.writes() == []

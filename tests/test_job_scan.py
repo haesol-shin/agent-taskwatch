@@ -1637,3 +1637,23 @@ def test_predecessor_cancelled_parks_started_follower_after_confirmed_stop(
     board.service.stop_ok = True
     board.scan()
     assert board.get(second).unit == ""
+
+
+@pytest.mark.parametrize("stage,expected", [("work", "work"), ("fix", "fix"), ("check", "fix")])
+def test_an_amended_running_step_is_stopped_and_relaunched_on_the_amended_plan(
+    board: Board, tmp_path: Path, stage: str, expected: str
+) -> None:
+    job_id = board.add(target="shared")
+    board.scan()
+    board.set(job_id, stage=stage, reviews_used=1, recoveries=1)
+    old_unit = board.get(job_id).unit
+    spec = tmp_path / "amended.md"
+    spec.write_text(VALID_SPEC + "\nAmended.\n", encoding="utf-8")
+    amended = board.jobs.amend(job_id, {"spec": str(spec)}, "plan changed", board.clock)
+    assert board.service.states[old_unit] == "active"  # the amend itself stops nothing
+    assert board.scan() == [job_id]
+    job = board.get(job_id)
+    assert (job.stage, job.attempt, job.ended_at) == (expected, 2, 0.0)
+    assert old_unit in board.service.stopped and job.unit != old_unit
+    assert job.spec == amended.spec and (job.reviews_used, job.recoveries) == (1, 1)
+    board.jobs.verify_inputs(job)

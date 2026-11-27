@@ -303,6 +303,28 @@ A job with `predecessors` gets one block per predecessor in the work and review 
 
 `approval_scope` is a recorded boundary, not operating-system isolation. The runner's shell tools have the user's permissions; instructions and explicit approval records cannot enforce those permissions.
 
+### Amend
+
+`taskwatch amend <job> <file> --reason <text>` ([command](commands.md#amend)) applies a changed plan to an unfinished job without a new id. It takes the submit document shape with only these keys: `spec`, `intent`, `prompt`, `inputs` and `predecessors`. A key outside the list is refused by name. The approved scope never changes through it: `approval_scope`, `target`, `outputs`, `check_command`, `land`, `base`, `public_text`, `max_reviews` and `worker_role` are refused with a pointer to `wait` and `approve --scope`, which stay the only way to widen the scope. So an amendment needs no fresh approval and appends nothing to `approval_source`; an owner decision it carries must be quoted in the spec or intent, where the reviewer reads it, and the review message lists every amendment and says the scope did not change. A spec can still ask for an action outside the scope: the worker instruction and the independent review stop that, as for any spec.
+
+The submit checks run again on the new values: the spec template for a code or design job, nonempty text, the `work` and `review` input roles, and the receipt tokens of `predecessors`. `predecessors` changes only before the job's first launch, keeps the base predecessor and may not make the job wait for itself. A document that changes nothing is refused.
+
+The record keeps the history. Each changed file is copied, never edited, to `inputs/<role>-<n>.a<seq>.txt` (`intent`, `spec`, `work` or `review`, the index in the list, the amendment number) with an exclusive create, and the old copy stays on disk. `input_hashes` follows the current files, so `verify_inputs` still passes. The prompt lives in the record, not in a file: the event holds its old and new hash. One `amend` event holds `seq`, the reason, `stage_before`, `stage_after` and, for each changed key, the old and new sha256 (`inputs.<role>` and `predecessors` hash their list). The review basis hashes the current intent and spec, so a changed spec or intent makes the earlier check and review stale by the existing rules; delivery and landing compare the basis as before.
+
+| Stage at amend | What happens |
+|---|---|
+| `queued`, `approval_wait` | The files are swapped. Nothing restarts and a closed gate stays closed. |
+| `user_wait` | The files are swapped and the stop stays; the owner resumes as before. |
+| `work`, `fix` | The unit is stopped and the same stage starts again in the same session. The message lists each amendment with its reason and a bounded diff of `spec` and `intent`. |
+| `check`, `review` | The unit is stopped. A changed `spec`, `intent`, `prompt` or `work` input goes to `fix`, so the worker adapts before a review is spent; a `review` input alone goes to `check`. A review-only job starts its review again. |
+| `land`, nothing published | The unit is stopped, the landing state is cleared and the job is routed as `check`. |
+| `land`, branch or pull request published, no merge intent | The unit is stopped and the job returns to `fix` on the same branch and pull request with a return record of reason `amended` in `land_state.returns`. It spends no `ci_fix_max` round. |
+| a recorded merge intent or squash commit, `deliver_pending`, `done`, `cancelled` | Refused: a later change is new work. |
+
+A stopped step is stopped the way a step hands over to the next: the amendment closes the attempt (`ended_at`), so the running step can no longer write, and the scan stops its unit before it launches the next step.
+
+Review counts are never written by an amendment: `reviews_used`, `review_cycle_start`, `check_cycle_start`, `max_reviews` and `recoveries` stay as they are, and a review that was running stays counted, as every launched review does ([Recovery and decisions](#recovery-and-decisions)). If the amendment would send a job to `fix`, `check` or a review while `reviews_used` has reached `max_reviews`, the job does not move: the files are swapped and it stops at `user_wait` with `wait_reason: amend_review_exhausted`, the stage it would have gone to as `resume_stage`, and an error that names the amendment and the spent reviews. The limit is never extended; an explicit `resume` opens a new cycle as for any stop.
+
 ### Public text
 
 Code jobs that build a result accept an optional `public_text` list with at most one publication unit covering the complete job result.
@@ -636,6 +658,8 @@ The independent review has its own budget: at most `max_reviews` attempts per cy
 A substantive failed review with a finding that carries `repeat_of` stops the job at `user_wait/root_cause_required` before anything else runs; the reviewer marks the same unresolved defect there, and a shared rule id alone never stops a job. The root-cause note it asks for is keyed by those finding ids and described in [checks](checks.md#finding-records-and-repeated-rules). When the same review also reaches the limit, `root_cause_required` is the reason and the stop notes both.
 
 An explicit `resume` opens a new review cycle at the saved stage: it sets the count to zero, starts the cycle after the last review record, opens a new check budget after the last check record, clears the recovery budget and keeps every review record and event. A job that stopped at `review_exhausted` after a failed review resumes into `fix`; one that stopped for answers without a verdict resumes into `review`. `wait` and `approve` keep the cycle. Nothing else resets it: not a passing check, a scan or a restart.
+
+`amend` keeps the cycle: it never changes the review or check counters ([Amend](#amend)).
 
 A record written before this accounting has `fix_rounds` and no review fields. It is decoded as it is read and never rewritten. Its review cycle begins at job creation or the latest explicit resume, and its count is the number of unique review launches in that cycle when the events prove a complete history (every review record has its launch, and a running review has its own), without the launches that ended in a terminal 429. The stored `fix_rounds` is a lower bound and never the count itself. A launch-free cycle proves zero use only for a never-started job or an explicitly resumed job that has not executed in the new cycle, when the job is queued or awaiting approval and the fix-round lower bound is zero. Approval-only events and a previous cycle's unit awaiting scanner release do not spend the new cycle. Otherwise, an empty or incomplete cycle history counts as exhausted before another model call: a job at `fix` or `review` parks at `user_wait/review_exhausted` for an explicit resume, and any other stage reaches the same stop at its next review. Its `max_reviews` is 3, whatever the host sets later.
 
