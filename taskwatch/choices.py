@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .job_types import CHOICES_FILE as FILE
 from .job_types import builds_design
-from .jobs import Jobs, JobState
+from .jobs import Jobs, JobState, follow_links
 from .pointers import pointer_problem, pointers
 from .review_docs import docs_dir
 from .review_print import MAX_ERRORS, validate
@@ -375,14 +375,14 @@ def brief_expectations(
     records = jobs.load()
     listed, issues = [], []
     for ident in job.predecessors:
-        pred = records.get(ident)
+        pred = follow_links(ident, records.get).job
         if pred is None or not is_design(pred):
             continue
         data, bad = load(Path(pred.workspace) / FILE)
-        issues += [f"predecessor {ident}: {p}" for p in bad]
+        issues += [f"predecessor {pred.id}: {p}" for p in bad]
         picks = _ids(data, "picks")
         listed += [*picks, *_ids(data, "decided")]
-        issues += _unanswered(job, ident, data) if picks else []
+        issues += _unanswered(job, pred.id, data) if picks else []
     return [], listed, issues
 
 

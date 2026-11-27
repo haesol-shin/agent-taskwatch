@@ -20,7 +20,7 @@ from .job_cleanup import PRIVATE_TMP, remove_private_tmp, remove_review_tool_cac
 from .job_delivery import deliver_job, notify_wait
 from .job_env import job_environment
 from .job_workspace import WorkspaceError, repository_key, settle
-from .jobs import MAX_RECOVERIES, JobState, progress_fingerprint
+from .jobs import MAX_RECOVERIES, JobState, Lineage, follow_links, progress_fingerprint
 
 SLOT_STAGES = frozenset({"work", "check", "review", "fix", "land"})
 DONE_STAGES = frozenset({"deliver_pending", "done"})
@@ -239,7 +239,7 @@ class _Scan:
         if (
             job.stage in SLOT_STAGES
             and job.base_predecessor
-            and self._stage(job.base_predecessor) in {"cancelled", "missing"}
+            and _lineage_stage(self._lineage(job.base_predecessor)) in {"cancelled", "missing"}
         ):
             self._park(job, "predecessor_cancelled")
 
@@ -247,7 +247,8 @@ class _Scan:
         """Ask the owner only once every predecessor is `done`, so the brief exists first."""
         if job.stage != "queued" or not job.approval_required:
             return
-        waiting = next((p for p in job.predecessors if self._stage(p) != "done"), None)
+        lineages = (self._lineage(p) for p in job.predecessors)
+        waiting = next((line.id for line in lineages if _lineage_stage(line) != "done"), None)
         if waiting is not None:
             reason = f"predecessor:{waiting}"
             if job.wait_reason != reason:
@@ -259,8 +260,8 @@ class _Scan:
         )
         self._save(self._event(job, "approval_wait"))
 
-    def _stage(self, identifier: str) -> str:
-        return self.all[identifier].stage if identifier in self.all else "missing"
+    def _lineage(self, identifier: str) -> Lineage:
+        return follow_links(identifier, self.all.get)
 
     # -- existing jobs ----------------------------------------------------------------------
 
@@ -453,22 +454,17 @@ class _Scan:
 
     def _predecessor_wait(self, job: JobState) -> str | None:
         for identifier in job.predecessors:
-            prior = self.all.get(identifier)
-            if prior is not None and (
-                prior.stage in DONE_STAGES
-                or (
-                    _launch_stage(job) != "land"
-                    and identifier == job.base_predecessor
-                    and job.land
-                    and prior.land
-                    and (
-                        job.workspace_state in {"prepared", "active"}
-                        or (prior.stage == "land" and not prior.land_state.get("S"))
-                    )
+            lineage = self._lineage(identifier)
+            prior = lineage.job
+            if lineage.landed or (
+                prior is not None
+                and (
+                    prior.stage in DONE_STAGES
+                    or (identifier == job.base_predecessor and _stacks_on(job, prior))
                 )
             ):
                 continue
-            return f"predecessor:{identifier}"
+            return f"predecessor:{lineage.id}"
         return None
 
     def _busy(self, job: JobState) -> tuple[int, set[str]]:
@@ -618,6 +614,26 @@ def _land_unit(job: JobState) -> bool:
             break
     # Without a launch record, keep a possibly live legacy reservation.
     return "land" in (job.stage, job.resume_stage) or bool(job.land_state.get("repository_key"))
+
+
+def _lineage_stage(lineage: Lineage) -> str:
+    """`done` for a hand-landed predecessor, else the stage of the job the id leads to."""
+    if lineage.landed:
+        return "done"
+    return lineage.job.stage if lineage.job else "missing"
+
+
+def _stacks_on(job: JobState, prior: JobState) -> bool:
+    """A landing job may start on its base predecessor's accepted result before it merges."""
+    return bool(
+        _launch_stage(job) != "land"
+        and job.land
+        and prior.land
+        and (
+            job.workspace_state in {"prepared", "active"}
+            or (prior.stage == "land" and not prior.land_state.get("S"))
+        )
+    )
 
 
 def _launch_stage(job: JobState) -> str:

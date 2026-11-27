@@ -773,3 +773,54 @@ def test_accepted_tip_pins_workspace_and_public_text_together(tmp_path, remote, 
     path = tmp_path / "child-worktree"
     job_workspace.create(pinned, path, JobConfig(), ENV, jobs)
     assert git(path, "rev-parse", "HEAD") == accepted
+
+
+def _hand_landed(jobs: Jobs, predecessor: JobState, **link: str) -> None:
+    cancel = {"type": "cancel", "at": 3000.0, "reason": "landed by hand", **link}
+    jobs.save(replace(predecessor, stage="cancelled", land_state={}, events=(cancel,)), 3000)
+
+
+def test_lineage_base_follows_a_hand_landed_predecessor(tmp_path, remote):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote)
+    successor = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="successor",
+        base="@predecessor",
+        predecessors=["predecessor"],
+    )
+    sha = remote.publish("by_hand.txt", "landed by hand\n")
+    git(remote.target, "fetch", "origin", "main")
+    _hand_landed(jobs, predecessor, landed_as=sha)
+    assert job_workspace.prepare(successor, ENV, jobs)["base"] == sha
+
+
+def test_lineage_base_follows_a_superseding_predecessor(tmp_path, remote):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote)
+    successor = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="successor",
+        base="@predecessor",
+        predecessors=["predecessor"],
+    )
+    replacement = replace(
+        predecessor, id="f" * 32, receipt_key="replacement", land_state=predecessor.land_state
+    )
+    jobs.save(replacement, 3000)
+    _hand_landed(jobs, predecessor, superseded_by=replacement.id)
+    assert job_workspace.prepare(successor, ENV, jobs)["base"] == predecessor.land_state["S"]
+
+
+def test_lineage_base_of_a_plain_cancel_is_refused(tmp_path, remote):
+    jobs, predecessor = _landed_predecessor(tmp_path, remote)
+    successor = code_job(
+        tmp_path,
+        remote.target,
+        receipt_key="successor",
+        base="@predecessor",
+        predecessors=["predecessor"],
+    )
+    _hand_landed(jobs, predecessor)
+    with pytest.raises(job_workspace.WorkspaceError, match="verified landing"):
+        job_workspace.prepare(successor, ENV, jobs)

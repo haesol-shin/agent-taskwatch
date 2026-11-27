@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from .activity import activity
 from .job_findings import stop_problems
-from .jobs import JobConfig, Jobs, JobState, load_job_config
+from .jobs import JobConfig, Jobs, JobState, load_job_config, supersede_problem
 from .state import RecordError, _create_new, _make_dirs
 
 # Commands after which a scan runs at once: a step ended, or a job became startable.
@@ -94,7 +95,26 @@ def parser() -> argparse.ArgumentParser:
         action.add_argument("--reason", required=True, help="Recorded with the decision")
         if name == "approve":
             action.add_argument("--scope", help="Replace the approved scope with this exact text")
+        if name == "cancel":
+            link = action.add_mutually_exclusive_group()
+            link.add_argument(
+                "--superseded-by",
+                metavar="JOB",
+                help="A job of the same target that replaces this one; successors follow it",
+            )
+            link.add_argument(
+                "--landed-as",
+                metavar="SHA",
+                type=_commit,
+                help="A commit of origin's default branch that landed this job by hand",
+            )
     return cli
+
+
+def _commit(text: str) -> str:
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", text) is None:
+        raise argparse.ArgumentTypeError("must be 7 to 40 hexadecimal digits")
+    return text.lower()
 
 
 def _seconds(minimum: int):
@@ -262,15 +282,42 @@ def _dispatch(args: argparse.Namespace, root: Path):
         if code:
             raise ValueError(f"job step failed with exit code {code}")
         return None
-    return _action(jobs, args)
+    return _action(jobs, root, args)
 
 
-def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
+def _landed_link(jobs: Jobs, root: Path, args: argparse.Namespace) -> dict:
+    """The `--landed-as` link, checked against origin before the state lock is taken: the
+    fetch can be slow, and a scan must not wait for it."""
+    from .job_env import job_environment
+    from .job_workspace import WorkspaceError, landed_commit
+
+    job = jobs.load()[args.job]
+    try:
+        sha = landed_commit(job.target, args.landed_as, job_environment(load_job_config(root).env))
+    except WorkspaceError as exc:
+        raise ValueError(str(exc)) from None
+    return {"landed_as": sha}
+
+
+def _cancel_link(job: JobState, records: dict[str, JobState], args: argparse.Namespace) -> dict:
+    """The link a cancel records; a refused `--superseded-by` leaves the record unchanged."""
+    if args.superseded_by is None:
+        return {}
+    if problem := supersede_problem(job, args.superseded_by, records):
+        raise ValueError(problem)
+    return {"superseded_by": args.superseded_by}
+
+
+def _action(jobs: Jobs, root: Path, args: argparse.Namespace) -> dict:
     now = time.time()
+    landed = _landed_link(jobs, root, args) if getattr(args, "landed_as", None) else {}
     with jobs.state.lock():
-        job = jobs.load()[args.job]
+        records = jobs.load()
+        job = records[args.job]
         command = args.command
+        link: dict = {}
         if command == "cancel":
+            link = landed or _cancel_link(job, records, args)
             job = replace(job, stage="cancelled", wait_reason=args.reason, retry_not_before=0.0)
         elif command == "wait":
             if job.stage not in {"work", "check", "review", "fix", "land", "queued"}:
@@ -309,7 +356,7 @@ def _action(jobs: Jobs, args: argparse.Namespace) -> dict:
                 check_cycle_start=job.check_cycle_start if landing else len(job.checks),
             )
         entry = sum(e.get("type") in {"resume", "approve"} for e in job.events) + 1
-        event = {"type": command, "at": now, "reason": args.reason}
+        event = {"type": command, "at": now, "reason": args.reason, **link}
         if command in {"resume", "approve"}:
             # A monotonic owner entry is distinct even when two commands share a timestamp.
             event["entry"] = entry

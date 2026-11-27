@@ -16,7 +16,7 @@ from .brief import count_findings, decision_count
 from .job_cursor import decode, encode
 from .job_store import Store, projection, read_index, read_snapshot, validate_event
 from .job_types import job_type_label
-from .jobs import JobState, decode_job
+from .jobs import JobState, decode_job, follow_links
 from .state import RecordError, state_dir
 
 
@@ -199,16 +199,47 @@ def _prepared(ledger: _Ledger) -> tuple[dict, dict]:
     return pending, event
 
 
-def _blocker(job: dict, rows: dict[str, dict]) -> str:
+def _loader(ledger: _Ledger) -> Callable[[str], JobState | None]:
+    """A job from its snapshot; the projection keeps no cancel link, so a cancelled
+    predecessor is read in full."""
+
+    def load(ident: str) -> JobState | None:
+        receipt = ((ledger.index or {}).get("receipts") or {}).get(ident)
+        if receipt is None:
+            return None
+        return _state(read_snapshot(ledger.directory, ident, receipt))
+
+    return load
+
+
+def _lineage_ids(ledger: _Ledger, ident: str) -> list[str]:
+    """Every id the links lead through from `ident`, so each has its snapshot read."""
+    seen: list[str] = []
+    load = _loader(ledger)
+
+    def get(step: str) -> JobState | None:
+        seen.append(step)
+        return load(step)
+
+    follow_links(ident, get)
+    return seen
+
+
+def _blocker(job: dict, rows: dict[str, dict], load: Callable[[str], JobState | None]) -> str:
     """The predecessor that keeps a queued job from ever starting without the owner."""
     for pred in job.get("predecessors", []):
         stage = rows[pred]["projection"]["stage"] if pred in rows else "missing"
+        if stage == "cancelled":
+            lineage = follow_links(pred, load)
+            if lineage.landed:
+                continue
+            pred, stage = lineage.id, lineage.job.stage if lineage.job else "missing"
         if stage in _BLOCKING or stage == "missing":
             return f"{stage} job {pred}"
     return ""
 
 
-def _items(rows: dict[str, dict]) -> list[_Item]:
+def _items(rows: dict[str, dict], load: Callable[[str], JobState | None]) -> list[_Item]:
     items = []
     for ident, row in rows.items():
         job = row["projection"]
@@ -222,7 +253,7 @@ def _items(rows: dict[str, dict]) -> list[_Item]:
         elif (
             stage == "queued"
             or (stage == "land" and job.get("wait_reason", "").startswith("predecessor:"))
-        ) and (blocker := _blocker(job, rows)):
+        ) and (blocker := _blocker(job, rows, load)):
             items.append(_Item((ident, stage, blocker, entry), "BLOCKED", ident, blocker))
         elif stage == "done":
             items.append(_Item((ident, stage, "", entry), _SECTIONS[3], ident))
@@ -258,8 +289,9 @@ def needs(
         stable = ledger.poll()
         if not stable and not ledger.stable():
             continue
-        items = _items(ledger.rows)
-        old = {i.key for i in _items(ledger.baseline or {})}
+        load = _loader(ledger)
+        items = _items(ledger.rows, load)
+        old = {i.key for i in _items(ledger.baseline or {}, load)}
         triggers, evidence = (
             _wake_items(root, ledger, items, old, classified, include_done)
             if stable and wait
@@ -370,11 +402,12 @@ def _state(row: dict) -> JobState:
 
 def _snapshots(ledger: _Ledger, items: list[_Item]) -> dict[str, dict] | None:
     selected = {item.job_id for item in items}
-    for item in items:
-        if item.section == "GATE":
-            selected.update(ledger.rows[item.job_id]["projection"]["predecessors"])
     rows = {}
     try:
+        for item in items:
+            if item.section == "GATE":
+                for ident in ledger.rows[item.job_id]["projection"]["predecessors"]:
+                    selected.update(_lineage_ids(ledger, ident))
         for ident in selected:
             if ident not in ledger.index["receipts"]:
                 continue
@@ -492,10 +525,21 @@ def _finding_count(review: Mapping) -> str:
         return "unknown"
 
 
+def _gate_predecessors(rows: dict[str, dict], job: JobState) -> list[JobState]:
+    """The jobs the owner approves against: each predecessor's live replacement, and none for a
+    missing or hand-landed one, which has no result to read."""
+
+    def get(ident: str) -> JobState | None:
+        return _state(rows[ident]) if ident in rows else None
+
+    lineages = [follow_links(p, get) for p in job.predecessors]
+    return [line.job for line in lineages if line.job is not None and not line.landed]
+
+
 def _gate_lines(
     root: Path, rows: dict[str, dict], job: JobState, job_type: str, cmd: str
 ) -> list[str]:
-    preds = [_state(rows[p]) for p in job.predecessors if p in rows]
+    preds = _gate_predecessors(rows, job)
     if preds:
         after = ", ".join(f"{p.id} ({job_type_label(p)}) {p.stage}" for p in preds)
         lines = [f"job {job.id} {job_type}  after job {after}", f"  goal: {_goal(job)}"]

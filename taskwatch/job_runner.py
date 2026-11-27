@@ -56,6 +56,7 @@ from .jobs import (
     JobConfig,
     Jobs,
     JobState,
+    follow_links,
     progress_fingerprint,
 )
 from .rate_limit import RateLimit, print_rate_limit, scrub
@@ -553,11 +554,17 @@ def _predecessor_lines(ctx: Ctx) -> list[str]:
     records = ctx.jobs.load()
     lines = ["", "Predecessor results (read only; the spec says how to use them):"]
     for identifier in ctx.job.predecessors:
-        pred = records.get(identifier)
+        lineage = follow_links(identifier, records.get)
+        pred = lineage.job
         if pred is None:
-            lines.append(f"- {identifier}: not found")
+            lines.append(f"- {lineage.id}: not found")
             continue
-        lines.append(f"- {pred.id} ({job_type_label(pred)}), stage {pred.stage}")
+        if lineage.landed:
+            landed = f"landed as {lineage.landed} in {pred.target}"
+            lines.append(f"- {identifier}: replaced by hand; {landed}")
+            continue
+        replaces = f", replaces {identifier}" if pred.id != identifier else ""
+        lines.append(f"- {pred.id} ({job_type_label(pred)}), stage {pred.stage}{replaces}")
         lines += [f"  {line}" for line in _result_lines(ctx.jobs, ctx.config, pred)]
     return lines
 

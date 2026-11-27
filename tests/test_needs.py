@@ -705,3 +705,58 @@ def test_needs_exposes_landing_stop_and_retained_merge_install_facts(ledger: Led
     assert "install unknown" in text
     assert "install acknowledgement lost" in text
     assert f"resume {identifier}" in text
+
+
+def cancelled_with(ledger: Ledger, **link: str) -> str:
+    ident = ledger.add(stage="cancelled")
+    ledger.set(ident, events=({"type": "cancel", "at": ledger.clock, **link},))
+    return ident
+
+
+def test_lineage_a_superseded_predecessor_does_not_block(ledger: Ledger) -> None:
+    live = ledger.add(stage="work")
+    old = cancelled_with(ledger, superseded_by=live)
+    follower = ledger.add(stage="queued", submit={"predecessors": [old]})
+    code, text = ledger.list()
+    assert code == 0 and "behind" not in text and follower not in text
+
+
+def test_lineage_a_hand_landed_predecessor_does_not_block(ledger: Ledger) -> None:
+    old = cancelled_with(ledger, landed_as="a" * 40)
+    follower = ledger.add(stage="queued", submit={"predecessors": [old]})
+    code, text = ledger.list()
+    assert code == 0 and follower not in text
+
+
+def test_lineage_a_superseded_chain_ending_in_a_cancel_names_the_last_job(ledger: Ledger) -> None:
+    last = ledger.add(stage="cancelled")
+    middle = cancelled_with(ledger, superseded_by=last)
+    old = cancelled_with(ledger, superseded_by=middle)
+    follower = ledger.add(stage="queued", submit={"predecessors": [old]})
+    code, text = ledger.list()
+    assert code == 0
+    assert f"job {follower} queued behind cancelled job {last}" in text.splitlines()
+
+
+def test_lineage_a_plain_cancel_still_blocks(ledger: Ledger) -> None:
+    old = cancelled_with(ledger)
+    follower = ledger.add(stage="queued", submit={"predecessors": [old]})
+    code, text = ledger.list()
+    assert code == 0
+    assert f"job {follower} queued behind cancelled job {old}" in text.splitlines()
+
+
+def test_lineage_a_gate_shows_the_replacement_of_a_superseded_predecessor(ledger: Ledger) -> None:
+    new = accepted_done(ledger, review="design")
+    (ledger.jobs.folder(ledger.get(new)) / "brief.md").write_text(BRIEF, encoding="utf-8")
+    old = cancelled_with(ledger, superseded_by=new)
+    gate = ledger.add(
+        stage="approval_wait", wait_reason="approval_required", submit={"predecessors": [old]}
+    )
+    code, text = ledger.list()
+    lines = text.splitlines()
+    assert code == 0
+    assert f"job {gate} research  after job {new} (design) done" in lines
+    assert any(line.startswith("  brief: ") and line.endswith(f"brief {new}") for line in lines)
+    assert not any(f"brief {old}" in line for line in lines)
+    assert any(line.startswith("  decisions: 2   then: ") for line in lines)

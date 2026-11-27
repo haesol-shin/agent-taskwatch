@@ -340,3 +340,24 @@ def test_malformed_defaults_file_fails_with_schema_error(
         work, (work, work), ("design.md", "choices.json"), defaults_path=defaults
     )
     assert any(expected in p for p in probs), probs
+
+
+def test_lineage_a_superseded_design_gives_its_picks_to_the_implement_job(tmp_path):
+    jobs, design, _ = _jobs(tmp_path)
+    build = jobs.submit(_payload(tmp_path, "r2", review="code", predecessors=[design.id]), 1002.0)
+    replacement = jobs.submit(
+        _payload(tmp_path, "r3", review="design", outputs=["design.md", "choices.json"]), 1003.0
+    )
+    work = tmp_path / "replacement-work"
+    work.mkdir()
+    new = copy.deepcopy(VALID)
+    new["picks"][0]["id"] = "python.runtime"
+    (work / "choices.json").write_text(json.dumps(new), encoding="utf-8")
+    jobs.save(replace(replacement, stage="done", workspace=str(work)), 1004.0)
+    cancel = {"type": "cancel", "at": 1005.0, "superseded_by": replacement.id}
+    jobs.save(replace(design, stage="cancelled", events=(cancel,)), 1005.0)
+    _, listed, issues = choices.brief_expectations(jobs, build, tmp_path / "w")
+    assert "python.runtime" in listed and "python.dep_manager" not in listed
+    assert issues == [
+        f"the approval source has no PICKS: line for the picks of job {replacement.id}"
+    ]
