@@ -725,41 +725,69 @@ def _amend_summary(job: JobState) -> list[str]:
     ]
 
 
-def _latest(job: JobState) -> dict | None:
-    records = [r for r in (job.checks[-1:] + job.reviews[-1:]) if isinstance(r, Mapping)]
-    return max(records, key=lambda r: r.get("seq", 0), default=None)
+def _fix_history(job: JobState) -> tuple[str, float, Mapping | None]:
+    """Find the latest fix input event and stop at the last completed fix.
+
+    Launch and resume events do not consume input: an interrupted fix still needs it.
+    """
+    latest = ""
+    ci = None
+    for event in reversed(job.events):
+        kind = event.get("type", "")
+        if kind == "step_exit" and event.get("stage") == "fix":
+            return latest, event["at"], ci
+        if kind in {"amend", "check", "review", "ci_fix"} and not latest:
+            latest = kind
+        if kind == "ci_fix" and ci is None:
+            ci = event
+    return latest, 0, ci
 
 
 def _fix_reason(job: JobState) -> str:
-    for event in reversed(job.events):
-        if event.get("type") == "ci_fix":
-            return (
-                "The CI run of the published pull request failed. The same branch and pull "
-                "request stay open; fix the cause and finish.\n" + str(event.get("message", ""))
-            )
-        if event.get("type") == "amend":
-            return (
-                "The approved plan was amended (listed above). Bring the result in line with the "
-                "amended plan, keep what still holds, then finish."
-            )
-        if event.get("type") in {"check", "review"}:
-            break
-    record = _latest(job)
+    latest, fixed_at, ci = _fix_history(job)
+    parts = []
+    if latest == "amend":
+        parts.append(
+            "The approved plan was amended (listed above). Bring the result in line with the "
+            "amended plan, keep what still holds, then finish."
+        )
+
+    latest_review = job.reviews[-1] if job.reviews else None
+    # An accepted FAIL without structured findings can also route to fix.
+    if (
+        isinstance(latest_review, Mapping)
+        and latest_review.get("verdict") == "FAIL"
+        and job_findings.accepted(latest_review)
+    ):
+        review = latest_review
+    else:
+        review = job_findings.last_failed(job.reviews)
+    if review is not None and review["at"] > fixed_at:
+        problems = "\n".join(f"- {p}" for p in review["problems"])
+        parts.append(
+            f"The independent review did not pass.\n{problems}\n\nReview:\n{review['body']}"
+        )
+
+    check = job.checks[-1] if job.checks else None
+    if isinstance(check, Mapping) and not check["ok"] and check["at"] > fixed_at:
+        problems = "\n".join(f"- {p}" for p in check["problems"])
+        parts.append(f"The deterministic check failed.\n{problems}\nFull output: {check['log']}")
+
     failure = job.land_state.get("base_update_failure")
-    if failure and (record is None or failure.get("at", 0) >= record.get("at", 0)):
-        return (
+    if failure and failure.get("at", 0) > fixed_at:
+        parts.append(
             "The check failed on the accepted result merged onto a moved default branch.\n"
             f"New main: {failure.get('M', '(not recorded)')}\n"
             f"Exit code: {failure.get('exit_code', '(not recorded)')}\n"
             f"Full output: {failure.get('log', '(not recorded)')}"
         )
-    if record is None:
-        return "No failure is recorded. Re-verify the result against the spec."
-    if "exit_code" in record:
-        problems = "\n".join(f"- {p}" for p in record["problems"])
-        return f"The deterministic check failed.\n{problems}\nFull output: {record['log']}"
-    problems = "\n".join(f"- {p}" for p in record["problems"])
-    return f"The independent review did not pass.\n{problems}\n\nReview:\n{record['body']}"
+
+    if ci is not None:
+        parts.append(
+            "The CI run of the published pull request failed. The same branch and pull "
+            "request stay open; fix the cause and finish.\n" + str(ci.get("message", ""))
+        )
+    return "\n\n".join(parts) or "No failure is recorded. Re-verify the result against the spec."
 
 
 def _owner_notes(job: JobState) -> list[str]:

@@ -693,6 +693,96 @@ def test_a_failed_review_routes_to_fix_and_a_failed_fix_is_not_a_review(env):
     assert "P1: wrong" in env.prompts()[-1]
 
 
+@pytest.mark.parametrize("completed_fix", [False, True])
+def test_fix_prompt_keeps_only_review_findings_not_followed_by_a_fix(env, completed_fix):
+    finding = "The output must retain the original heading."
+    reply = (
+        f"{FAIL}\n\n### F1\n"
+        '{"finding":"F1","severity":"P1","category":"behavior","rule":"other",'
+        f'"location":"out.txt:1","summary":"{finding}"}}\n'
+    )
+    env.scenario([{"reply": reply}, *([work_turn()] if completed_fix else []), work_turn()])
+    env.to_review()
+    assert env.run("review") == 0
+    assert env.get().stage == "fix" and env.get().reviews[-1]["findings"]
+    if completed_fix:
+        assert env.run("fix") == 0
+        assert finding in env.prompts()[-1]
+    env.seed({"out.txt": "invalid\n"})
+    assert env.run("check") == 0 and env.get().stage == "fix"
+    assert env.run("fix") == 0
+    prompt = env.prompts()[-1]
+    check_log = env.get().checks[-1]["log"]
+    assert "The deterministic check failed." in prompt and f"Full output: {check_log}" in prompt
+    if completed_fix:
+        assert finding not in prompt
+    else:
+        assert prompt.index(finding) < prompt.index("The deterministic check failed.")
+
+
+def test_fix_prompt_keeps_newer_failed_review_without_structured_findings(env):
+    first_problem = "Keep the original heading."
+    second_problem = "Retain the footer as well."
+    first_reply = (
+        f"{FAIL}\n{first_problem}\n\n### F1\n"
+        '{"finding":"F1","severity":"P1","category":"behavior","rule":"other",'
+        '"location":"out.txt:1"}\n'
+    )
+    env.scenario(
+        [{"reply": first_reply}, work_turn(), {"reply": f"{FAIL}\n{second_problem}"}, work_turn()]
+    )
+    env.to_review()
+    assert env.run("review") == 0 and env.get().stage == "fix"
+    assert env.run("fix") == 0 and first_problem in env.prompts()[-1]
+    (env.folder() / "findings.json").write_text(
+        '[{"id":"r1.F1","status":"not_fixed","reason":"Revisit during review."}]\n',
+        encoding="utf-8",
+    )
+    assert env.run("check") == 0 and env.get().stage == "review"
+    assert env.run("review") == 0 and env.get().stage == "fix"
+    assert env.run("fix") == 0
+    prompt = env.prompts()[-1]
+    assert second_problem in prompt
+    assert first_problem not in prompt
+
+
+def test_fix_without_open_failure_uses_the_existing_fallback(env):
+    env.to_review()  # A passing check is not a failure.
+    env.scenario([work_turn()])
+    assert env.run("fix") == 0
+    assert "No failure is recorded. Re-verify the result against the spec." in env.prompts()[-1]
+
+
+@pytest.mark.parametrize("completed_fix", [False, True])
+def test_amend_keeps_only_ci_failures_not_followed_by_a_fix(env, completed_fix):
+    failure = "Required context failed: unit tests"
+    events = [{"type": "ci_fix", "at": 1000.0, "message": failure}]
+    if completed_fix:
+        events.append({"type": "step_exit", "stage": "fix", "at": 1100.0, "code": 0})
+    env.put("fix", events=tuple(events))
+    job = env.jobs.amend(env.job.id, amend_files(env.tmp), "adjust the plan", 3000.0)
+    ctx = job_runner.Ctx(env.jobs, env.config, job, env.folder(), env.tmp / "ws")
+    prompt = job_runner._agent_message(ctx, False)
+    note = "The approved plan was amended (listed above)"
+    assert note in prompt
+    if completed_fix:
+        assert failure not in prompt
+    else:
+        assert prompt.index(note) < prompt.index(failure)
+
+
+def test_amend_keeps_the_open_review_failure(env):
+    env.scenario([{"reply": f"{FAIL}\nKeep the original heading."}, work_turn()])
+    env.to_review()
+    assert env.run("review") == 0
+    env.jobs.amend(env.job.id, amend_files(env.tmp), "adjust the plan")
+    assert env.run("fix") == 0
+    prompt = env.prompts()[-1]
+    assert prompt.index("The approved plan was amended (listed above)") < prompt.index(
+        "Keep the original heading."
+    )
+
+
 @pytest.mark.parametrize("cap", [1, 2, 3])
 def test_the_last_permitted_failed_review_starts_no_fix(env, cap):
     env.scenario([{"reply": f"{FAIL}\nstill wrong"}])

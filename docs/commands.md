@@ -23,7 +23,7 @@ Unless a command says otherwise, it exits `0` on success and `1` when an error i
 
 `taskwatch --root <root> submit <job.json>` durably stores an approved job document and prints the stored record. The job is queued only after the document and its copied inputs are durable. A repeated `receipt_key` returns the original record. The fields are in [Submit an approved job](configuration.md#submit-an-approved-job). The command records the caller's approval assertion and cannot authenticate it.
 
-After a successful submit, the command asks the user systemd manager to run one scan about two seconds later. A failed wake prints `taskwatch: warning: wake failed: ...` and never changes the exit code; the timer still scans. `approve`, `resume` and `run` wake the same way.
+After a successful submit, the command asks the user systemd manager to run one scan about two seconds later. A failed wake prints `taskwatch: warning: wake failed: ...` and never changes the exit code; the timer still scans. `amend`, `approve`, `resume` and `run` wake the same way.
 
 ### show
 
