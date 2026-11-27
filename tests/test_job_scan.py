@@ -1657,3 +1657,82 @@ def test_an_amended_running_step_is_stopped_and_relaunched_on_the_amended_plan(
     assert old_unit in board.service.stopped and job.unit != old_unit
     assert job.spec == amended.spec and (job.reviews_used, job.recoveries) == (1, 1)
     board.jobs.verify_inputs(job)
+
+
+def _cancel(board: Board, job_id: str, **link: str) -> None:
+    board.set(
+        job_id,
+        stage="cancelled",
+        unit="",
+        events=(*board.get(job_id).events, {"type": "cancel", "at": board.clock, **link}),
+    )
+
+
+def test_lineage_successor_follows_a_superseded_predecessor(board: Board) -> None:
+    first = board.add()
+    second = board.add(predecessors=[first])
+    replacement = board.add()
+    _cancel(board, first, superseded_by=replacement)
+    assert board.scan() == [replacement]
+    assert board.get(second).wait_reason == f"predecessor:{replacement}"
+    board.set(replacement, stage="done", unit="")
+    assert board.scan() == [second]
+
+
+def test_lineage_follows_a_chain_of_two_supersedes(board: Board) -> None:
+    first = board.add()
+    second = board.add(predecessors=[first])
+    middle = board.add()
+    last = board.add()
+    _cancel(board, first, superseded_by=middle)
+    _cancel(board, middle, superseded_by=last)
+    board.scan()
+    assert board.get(second).wait_reason == f"predecessor:{last}"
+    board.set(last, stage="done", unit="")
+    assert board.scan() == [second]
+
+
+def test_lineage_successor_starts_after_a_hand_landed_predecessor(board: Board) -> None:
+    first = board.add()
+    second = board.add(predecessors=[first])
+    _cancel(board, first, landed_as="a" * 40)
+    assert board.scan() == [second]
+
+
+def test_lineage_gate_opens_after_a_hand_landed_predecessor(board: Board) -> None:
+    first = board.add()
+    gated = board.add(predecessors=[first], approval_required=True)
+    _cancel(board, first, landed_as="a" * 40)
+    board.scan()
+    assert board.get(gated).stage == "approval_wait"
+
+
+@pytest.mark.parametrize("link", [{}, {"superseded_by": "f" * 32}, {"landed_as": "not a sha"}])
+def test_lineage_plain_cancel_still_blocks(board: Board, link: dict) -> None:
+    first = board.add()
+    second = board.add(predecessors=[first])
+    _cancel(board, first, **link)
+    assert board.scan() == []
+    follower = board.get(second)
+    assert follower.stage == "queued"
+    assert follower.wait_reason == f"predecessor:{link.get('superseded_by', first)}"
+
+
+def test_lineage_a_loop_of_links_blocks_instead_of_hanging(board: Board) -> None:
+    first = board.add()
+    second = board.add(predecessors=[first])
+    other = board.add()
+    _cancel(board, first, superseded_by=other)
+    _cancel(board, other, superseded_by=first)
+    assert board.scan() == []
+    assert board.get(second).stage == "queued"
+
+
+def test_lineage_started_successor_keeps_running_after_a_hand_landed_base(board: Board) -> None:
+    first, second = _stacked_board(board)
+    board.scan()
+    board.set(second, workspace_state="active")
+    _cancel(board, first, landed_as="a" * 40)
+    board.scan()
+    follower = board.get(second)
+    assert (follower.stage, follower.wait_reason) == ("work", "")

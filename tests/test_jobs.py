@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -1501,3 +1502,84 @@ def test_the_amend_command_prints_the_record_and_wakes_the_scan(tmp_path, capsys
     document.write_text(json.dumps({"target": "/elsewhere"}), encoding="utf-8")
     assert main(argv) == 1
     assert "approve --scope" in capsys.readouterr().err
+
+
+def _cancel_cli(root: Path, job_id: str, *flags: str) -> int:
+    return main(["--root", str(root), "cancel", job_id, "--reason", "owner call", *flags])
+
+
+def _two_jobs(tmp_path: Path, **second: object):
+    root = tmp_path / "root"
+    assert main(["--root", str(root), "init"]) == 0
+    jobs = Jobs(root)
+    first = jobs.submit(payload(tmp_path, "m:1"), 10)
+    return root, jobs, first, jobs.submit({**payload(tmp_path, "m:2"), **second}, 11)
+
+
+def test_lineage_cancel_records_the_superseding_job(tmp_path):
+    root, jobs, first, second = _two_jobs(tmp_path)
+    assert _cancel_cli(root, first.id, "--superseded-by", second.id) == 0
+    cancelled = jobs.load()[first.id]
+    assert cancelled.stage == "cancelled"
+    assert cancelled.events[-1]["superseded_by"] == second.id
+    assert _cancel_cli(root, second.id) == 0
+    assert "superseded_by" not in jobs.load()[second.id].events[-1]
+
+
+@pytest.mark.parametrize("other", ["missing", "elsewhere", "itself"])
+def test_lineage_cancel_refuses_a_replacement_that_cannot_stand_in(tmp_path, capsys, other):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    root, jobs, first, second = _two_jobs(tmp_path, target=str(elsewhere))
+    named = {"missing": "f" * 32, "elsewhere": second.id, "itself": first.id}[other]
+    assert _cancel_cli(root, first.id, "--superseded-by", named) == 1
+    assert "taskwatch:" in capsys.readouterr().err
+    assert jobs.load()[first.id] == first
+
+
+def test_lineage_cancel_refuses_a_cycle(tmp_path, capsys):
+    root, jobs, first, second = _two_jobs(tmp_path)
+    assert _cancel_cli(root, first.id, "--superseded-by", second.id) == 0
+    assert _cancel_cli(root, second.id, "--superseded-by", first.id) == 1
+    assert "supersede itself" in capsys.readouterr().err
+    assert jobs.load()[second.id] == second
+
+
+def test_lineage_cancel_takes_one_link_only(tmp_path, capsys):
+    root, jobs, first, second = _two_jobs(tmp_path)
+    with pytest.raises(SystemExit):
+        _cancel_cli(root, first.id, "--superseded-by", second.id, "--landed-as", "a" * 40)
+    assert jobs.load()[first.id] == first
+
+
+def _pushed_repo(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True)
+    repo = make_repo(tmp_path, "repo")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "origin", "main")
+    return repo
+
+
+def test_lineage_cancel_records_a_commit_that_origin_has(tmp_path):
+    repo = _pushed_repo(tmp_path)
+    root, jobs, first, _ = _two_jobs(tmp_path)
+    jobs.save(replace(first, target=str(repo)), 12)
+    sha = git(repo, "rev-parse", "HEAD")
+    assert _cancel_cli(root, first.id, "--landed-as", sha[:10]) == 0
+    assert jobs.load()[first.id].events[-1]["landed_as"] == sha
+
+
+@pytest.mark.parametrize("revision", ["unpushed", "unknown"])
+def test_lineage_cancel_refuses_a_commit_that_origin_lacks(tmp_path, capsys, revision):
+    repo = _pushed_repo(tmp_path)
+    (repo / "later.txt").write_text("local only\n", encoding="utf-8")
+    git(repo, "add", "later.txt")
+    git(repo, "commit", "-m", "local only")
+    root, jobs, first, _ = _two_jobs(tmp_path)
+    first = replace(first, target=str(repo))
+    jobs.save(first, 12)
+    sha = git(repo, "rev-parse", "HEAD") if revision == "unpushed" else "1234567"
+    assert _cancel_cli(root, first.id, "--landed-as", sha) == 1
+    assert "taskwatch:" in capsys.readouterr().err
+    assert jobs.load()[first.id] == first

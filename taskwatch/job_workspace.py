@@ -17,7 +17,7 @@ import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
-from .jobs import JobConfig, Jobs, JobState
+from .jobs import JobConfig, Jobs, JobState, follow_links
 
 FETCH_TIMEOUT = 5.0
 LOCAL_TIMEOUT = 30.0
@@ -141,6 +141,28 @@ def verified_predecessor_base(
     return sha
 
 
+def landed_commit(target: str, revision: str, env: Mapping[str, str]) -> str:
+    """The full sha of a commit that origin's default branch contains, after a fetch."""
+    branch = default_branch(target, env)
+    if problem := fetch(target, env, branch):
+        raise WorkspaceError(f"cannot confirm {revision} on origin/{branch}: {problem}")
+    sha = _resolve(target, env, revision)
+    if sha is None:
+        raise WorkspaceError(f"not a commit of the target: {revision}")
+    if _git(target, env, "merge-base", "--is-ancestor", sha, f"origin/{branch}").returncode:
+        raise WorkspaceError(f"{revision} is not in origin/{branch}")
+    return sha
+
+
+def _landed_base(target: str, predecessor: JobState, sha: str, env: Mapping[str, str]) -> str:
+    """The commit a hand-landed predecessor recorded, when this repository has it."""
+    if repository_key(target, env) != repository_key(predecessor.target, env):
+        raise WorkspaceError("base predecessor belongs to a different repository")
+    if _resolve(target, env, sha) != sha:
+        raise WorkspaceError("base predecessor landed commit is unavailable")
+    return sha
+
+
 def prepare(job: JobState, env: Mapping[str, str], jobs: Jobs | None = None) -> dict:
     """Resolve the immutable base before the runner records its worktree creation intent."""
     if job.workspace_state == "prepared":
@@ -149,10 +171,14 @@ def prepare(job: JobState, env: Mapping[str, str], jobs: Jobs | None = None) -> 
     if job.base_predecessor:
         if jobs is None:
             raise WorkspaceError("predecessor base requires the job store")
-        record = jobs.load().get(job.base_predecessor)
-        if record is None:
+        records = jobs.load()
+        lineage = follow_links(job.base_predecessor, records.get)
+        if lineage.job is None:
             raise WorkspaceError("base predecessor no longer exists")
-        predecessor = verified_predecessor_base(job.target, record, env)
+        if lineage.landed:
+            predecessor = _landed_base(job.target, lineage.job, lineage.landed, env)
+        else:
+            predecessor = verified_predecessor_base(job.target, lineage.job, env)
     sha, note = (predecessor, "") if predecessor else _base(job, env)
     prepared = {"base": sha, "base_note": note, "workspace_state": "prepared"}
     # A unit base given as `@<receipt key>` is the job base: both resolve to this one commit.

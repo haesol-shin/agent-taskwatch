@@ -8,7 +8,7 @@ import string
 import subprocess
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -502,6 +502,67 @@ def load_job_config(root: Path) -> JobConfig:
 def _digest(obj: dict) -> str:
     data = json.dumps(obj, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class Lineage:
+    """Where a predecessor id leads. `job` is the live job it reaches, or the cancelled job a
+    plain cancel left; `landed` is the commit that replaced a hand-landed one."""
+
+    id: str
+    job: JobState | None
+    landed: str = ""
+
+
+def cancel_link(job: JobState) -> Mapping:
+    """The link the last `cancel` event of a cancelled job carries; empty for a plain cancel."""
+    if job.stage != "cancelled":
+        return {}
+    event = next((e for e in reversed(job.events) if e.get("type") == "cancel"), {})
+    landed, successor = event.get("landed_as"), event.get("superseded_by")
+    if isinstance(landed, str) and re.fullmatch(r"[0-9a-f]{40}", landed):
+        return {"landed_as": landed}
+    if isinstance(successor, str) and successor:
+        return {"superseded_by": successor}
+    return {}
+
+
+def follow_links(identifier: str, get: Callable[[str], JobState | None]) -> Lineage:
+    """The one place a predecessor id is followed through `cancel` links to its live job.
+
+    A superseded job leads to its replacement, again and again; a hand-landed one ends the walk
+    as done. A plain cancel, a missing job and a loop stop at the last id reached, so the
+    caller sees a blocked predecessor as it always has."""
+    seen: set[str] = set()
+    while True:
+        job = get(identifier)
+        seen.add(identifier)
+        if job is None:
+            return Lineage(identifier, None)
+        link = cancel_link(job)
+        if "landed_as" in link:
+            return Lineage(identifier, job, link["landed_as"])
+        successor = link.get("superseded_by", "")
+        if not successor or successor in seen:
+            return Lineage(identifier, job)
+        identifier = successor
+
+
+def supersede_problem(job: JobState, successor: str, existing: Mapping[str, JobState]) -> str:
+    """Why `successor` cannot replace `job`, or an empty string."""
+    replacement = existing.get(successor)
+    if replacement is None:
+        return f"superseding job {successor} does not exist"
+    if replacement.target != job.target:
+        return f"superseding job {successor} has a different target"
+    seen: set[str] = set()
+    while successor and successor not in seen:
+        if successor == job.id:
+            return f"job {job.id} would supersede itself"
+        seen.add(successor)
+        step = existing.get(successor)
+        successor = cancel_link(step).get("superseded_by", "") if step else ""
+    return ""
 
 
 class Jobs:
