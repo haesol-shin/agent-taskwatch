@@ -35,6 +35,8 @@ CI_WINDOW = frozenset(
         "rerun_round",
     }
 )
+# Land state that shows a branch, a pull request or a base update already left the machine.
+PUBLICATION = ("push_intent", "pushed", "pr", "base_update")
 # A body link to a commit that exists only locally, which never reaches GitHub. Quotes and
 # angle brackets around the URL (HTML src, angle-bracketed Markdown) are not part of the path.
 BODY_LINK = re.compile(
@@ -62,6 +64,33 @@ def digest(value):
 
 def resume_entry(job):
     return sum(e.get("type") in {"resume", "approve"} for e in job.events)
+
+
+def is_published(state):
+    return any(state.get(key) for key in PUBLICATION)
+
+
+def new_return(state, reason, message, phase=""):
+    """A return record keyed to its PR number and round, for the state it returns from."""
+    returns = list(state.get("returns", ()))
+    return {
+        "reason": reason,
+        "pr": (state.get("pr") or {}).get("number", 0),
+        "round": sum(item.get("reason") == reason for item in returns) + 1,
+        "head": state.get("H", ""),
+        "message": message,
+        **({"phase": phase} if phase else {}),
+    }
+
+
+def amend_return(state, message):
+    """The land state and the record of an amendment that sends a published job back to fix.
+
+    The CI observation restarts like any return to fix. The reason `amended` is not
+    `ci_failed`, so no CI fix round is spent."""
+    record = new_return(state, "amended", message)
+    kept = {key: value for key, value in state.items() if key not in CI_WINDOW}
+    return {**kept, "returns": [*state.get("returns", ()), record]}, record
 
 
 def green_outcome(evidence):
@@ -222,7 +251,7 @@ class Transaction:
             raise LandStop("land_review_stale", "accepted evidence changed after merge")
         from .job_runner import _apply
 
-        if any(self.state.get(key) for key in ("push_intent", "pushed", "pr", "base_update")):
+        if is_published(self.state):
             # Keep branch ownership evidence across check/review, including a checked head
             # that may have reached the remote without an acknowledgement.
             record = self.return_record(
@@ -550,15 +579,7 @@ class Transaction:
 
     def return_record(self, reason, message, phase=""):
         """One return record, keyed to its PR number and round; not yet persisted."""
-        returns = list(self.state.get("returns", ()))
-        return {
-            "reason": reason,
-            "pr": (self.state.get("pr") or {}).get("number", 0),
-            "round": sum(item.get("reason") == reason for item in returns) + 1,
-            "head": self.state.get("H", ""),
-            "message": message,
-            **({"phase": phase} if phase else {}),
-        }
+        return new_return(self.state, reason, message, phase)
 
     def return_for_ci_fix(self, phase, message):
         """Spend one CI fix round on the same branch and PR; False when the budget is spent.

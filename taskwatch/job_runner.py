@@ -6,6 +6,7 @@ A step that fails without a routed outcome records the error and leaves the stag
 scan resumes it. Nothing here calls a model except the omp RPC sessions of work, fix and review.
 """
 
+import difflib
 import fcntl
 import hashlib
 import json
@@ -600,6 +601,7 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
         ]
     for path in job.inputs.get("work", []):
         lines.append(f"Work input: {path}")
+    lines += _amend_lines(job)
     lines += choices.defaults_lines(ctx.jobs.state.root, job)
     lines += _predecessor_lines(ctx)
     lines += ["", _approval_text(ctx)]
@@ -657,6 +659,72 @@ def _record_lines(ctx: Ctx) -> list[str]:
     return lines
 
 
+_AMEND_DIFF_LINES = 40
+_AMEND_DIFF_CHARS = 3000
+
+
+def _amend_lines(job: JobState) -> list[str]:
+    """What the owner changed in the approved plan since the worker last ran, so a resumed
+    session learns it. A job whose worker never ran reads the amended files as they are."""
+    launched = [i for i, event in enumerate(job.events) if event.get("type") == "worker_launch"]
+    if not launched:
+        return []
+    amended = [e for e in job.events[launched[-1] + 1 :] if e.get("type") == "amend"]
+    if not amended:
+        return []
+    lines = [
+        "",
+        "The approved plan was amended after your last session. The intent, spec and inputs",
+        "named above are the current ones: read them again and adapt the result.",
+    ]
+    for event in amended:
+        lines.append(f"- amendment {event['seq']}: {_clip(event['reason'], 1500)}")
+        for key, change in event["changes"].items():
+            if "old_path" in change:
+                lines += _amend_diff(key, change)
+            else:
+                lines.append(f"  {key}: replaced")
+    return lines
+
+
+def _clip(text: str, limit: int) -> str:
+    text = str(text).strip().replace("\n", "\n  ")
+    return text if len(text) <= limit else text[:limit].rstrip() + " [cut]"
+
+
+def _amend_diff(key: str, change: Mapping) -> list[str]:
+    """The bounded diff of one amended file, read from the copies the amendment kept."""
+    try:
+        old = Path(change["old_path"]).read_text(encoding="utf-8").splitlines()
+        new = Path(change["new_path"]).read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError):
+        return [f"  {key}: replaced (the diff is unavailable)"]
+    diff = list(difflib.unified_diff(old, new, "before", "after", lineterm="", n=1))
+    text = "\n".join(diff[:_AMEND_DIFF_LINES])
+    cut = len(diff) > _AMEND_DIFF_LINES or len(text) > _AMEND_DIFF_CHARS
+    body = _clip(text[:_AMEND_DIFF_CHARS], _AMEND_DIFF_CHARS)
+    return [f"  {key}: replaced", *[f"  {line}" for line in body.splitlines()]] + (
+        ["  [diff cut: read the current file]"] if cut else []
+    )
+
+
+def _amend_summary(job: JobState) -> list[str]:
+    """The reviewer's view of the amendments: which keys changed and why, with the reminder that
+    the approved scope did not."""
+    amended = [event for event in job.events if event.get("type") == "amend"]
+    if not amended:
+        return []
+    return [
+        "Plan amendments after approval; the intent, spec and request here are the amended ones "
+        "and the approval scope did not change:",
+        *(
+            f"- amendment {event['seq']} ({', '.join(event['changes'])}): "
+            f"{_clip(event['reason'], 300)}"
+            for event in amended
+        ),
+    ]
+
+
 def _latest(job: JobState) -> dict | None:
     records = [r for r in (job.checks[-1:] + job.reviews[-1:]) if isinstance(r, Mapping)]
     return max(records, key=lambda r: r.get("seq", 0), default=None)
@@ -668,6 +736,11 @@ def _fix_reason(job: JobState) -> str:
             return (
                 "The CI run of the published pull request failed. The same branch and pull "
                 "request stay open; fix the cause and finish.\n" + str(event.get("message", ""))
+            )
+        if event.get("type") == "amend":
+            return (
+                "The approved plan was amended (listed above). Bring the result in line with the "
+                "amended plan, keep what still holds, then finish."
             )
         if event.get("type") in {"check", "review"}:
             break
@@ -916,6 +989,7 @@ def _review_message(
         f"Approval source: {job.approval_source}",
         f"Approval scope: {job.approval_scope}",
         *_owner_notes(job),
+        *_amend_summary(job),
         *(
             [
                 "Spec mode: task_file. The spec holds only Purpose and cause, Owner decisions and "

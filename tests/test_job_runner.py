@@ -1825,3 +1825,71 @@ def test_print_checked_string_requires_every_bot_disposition():
     ]
     verdict["checked"] += "\nBOT_DISPOSITION r3.F1: accepted"
     assert job_runner._bot_acceptance_problems(json.dumps(verdict), candidates) == []
+
+
+# --- amend -----------------------------------------------------------------------------------
+
+
+def amend_files(tmp_path: Path, spec: str = VALID_SPEC + "\nAmended.\n") -> dict:
+    path = tmp_path / "amended-spec.md"
+    path.write_text(spec, encoding="utf-8")
+    return {"spec": str(path)}
+
+
+def test_a_spec_amend_makes_the_result_stale_and_the_old_check_unusable(env):
+    env.to_review()
+    ctx = job_runner.Ctx(env.jobs, env.config, env.get(), env.folder(), env.folder() / "work")
+    assert job_runner._result_stale(ctx) is False
+    assert job_runner._passing_run(ctx) is not None
+    env.jobs.amend(env.job.id, amend_files(env.tmp), "plan changed", 3000.0)
+    amended = job_runner.Ctx(env.jobs, env.config, env.get(), env.folder(), env.folder() / "work")
+    assert job_runner._result_stale(amended) is True
+    assert job_runner._passing_run(amended) is None  # the command would run against a new basis
+
+
+def test_an_amend_closes_the_running_attempt_so_the_runner_writes_nothing(env):
+    env.put("work")
+    amended = env.jobs.amend(env.job.id, amend_files(env.tmp), "plan changed", 3000.0)
+    assert (amended.stage, amended.ended_at) == ("work", 3000.0)
+    assert run_job(env.jobs, env.config, env.job.id, env.attempt) == 2
+    assert env.get() == amended
+
+
+def test_an_amended_job_tells_the_resumed_worker_and_the_reviewer(env):
+    launched = {"type": "worker_launch", "attempt": 1, "stage": "work", "at": 1.0}
+    env.jobs.save(replace(env.get(), stage="fix", attempt=1, events=(launched,)), 1500.0)
+    document = {**amend_files(env.tmp), "prompt": "NEW PROMPT"}
+    amended = env.jobs.amend(env.job.id, document, "the owner chose a new format", 3000.0)
+    ctx = job_runner.Ctx(env.jobs, env.config, amended, env.folder(), env.tmp / "ws")
+    message = job_runner._agent_message(ctx, True)
+    assert "amended after your last session" in message
+    assert "- amendment 1: the owner chose a new format" in message
+    assert "  spec: replaced" in message and "  +Amended." in message
+    assert "  prompt: replaced" in message and message.startswith("NEW PROMPT")
+    assert "The approved plan was amended (listed above)" in message
+    assert f"Spec: {amended.spec}" in message
+    review = job_runner._review_message(ctx, (), False, env.tmp / "rr")
+    assert "- amendment 1 (spec, prompt): the owner chose a new format" in review
+    assert "approval scope did not change" in review and "Approval scope: task-1" in review
+
+
+def test_the_amendment_note_covers_only_what_the_worker_has_not_seen(env):
+    first = env.jobs.amend(env.job.id, amend_files(env.tmp), "before any worker", 2000.0)
+    ctx = job_runner.Ctx(env.jobs, env.config, first, env.folder(), env.tmp / "ws")
+    assert "amended after your last session" not in job_runner._agent_message(ctx, False)
+    launched = {"type": "worker_launch", "attempt": 2, "stage": "work", "at": 2500.0}
+    seen = replace(first, events=(*first.events, launched))
+    ctx = job_runner.Ctx(env.jobs, env.config, seen, env.folder(), env.tmp / "ws")
+    assert "amended after your last session" not in job_runner._agent_message(ctx, False)
+    assert "Plan amendments after approval" in job_runner._review_message(
+        ctx, (), False, env.tmp / "rr"
+    )
+
+
+def test_a_long_amended_spec_diff_is_cut_to_a_bounded_note(env):
+    env.jobs.save(replace(env.get(), attempt=1, events=({"type": "worker_launch"},)), 1500.0)
+    long = VALID_SPEC + "".join(f"line {i}\n" for i in range(200))
+    amended = env.jobs.amend(env.job.id, amend_files(env.tmp, long), "big rewrite", 3000.0)
+    note = "\n".join(job_runner._amend_lines(amended))
+    assert "+line 10" in note and "+line 150" not in note
+    assert "[diff cut: read the current file]" in note and len(note) < 4500

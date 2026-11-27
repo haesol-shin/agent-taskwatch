@@ -15,12 +15,12 @@ from .jobs import JobConfig, Jobs, JobState, load_job_config
 from .state import RecordError, _create_new, _make_dirs
 
 # Commands after which a scan runs at once: a step ended, or a job became startable.
-WAKE_COMMANDS = frozenset({"run", "submit", "approve", "resume"})
+WAKE_COMMANDS = frozenset({"run", "submit", "approve", "resume", "amend"})
 
 
 _GROUPS = """commands by use:
   first use           init, submit, show, brief
-  attention           needs, cancel, wait, approve, resume
+  attention           needs, cancel, wait, approve, resume, amend
   result and text     check, text
   operator            scan, run
 
@@ -76,6 +76,12 @@ def parser() -> argparse.ArgumentParser:
     text.add_argument(
         "--out", type=Path, required=True, help="Folder for title.txt, body.md and commit.txt"
     )
+    amend = _command(commands, "amend", "Change the plan of an approved job in place")
+    amend.add_argument("job")
+    amend.add_argument(
+        "file", type=Path, help="JSON with spec, intent, prompt, inputs, predecessors"
+    )
+    amend.add_argument("--reason", required=True, help="Recorded with the amendment")
     actions = {
         "cancel": "End a job",
         "wait": "Park an unfinished job until the owner approves",
@@ -232,6 +238,9 @@ def _dispatch(args: argparse.Namespace, root: Path):
         return _init(root, args.unit_dir)
     if args.command == "submit":
         return jobs.submit(json.loads(args.file.read_text(encoding="utf-8"))).to_json()
+    if args.command == "amend":
+        document = json.loads(args.file.read_text(encoding="utf-8"))
+        return jobs.amend(args.job, document, args.reason).to_json()
     if args.command == "show":
         now = time.time()
         records = jobs.load()

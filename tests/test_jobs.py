@@ -1206,3 +1206,298 @@ def test_the_host_flow_settings_are_validated(tmp_path, key, value):
     host_config(root, **{key: value})
     with pytest.raises(ValueError, match=key):
         load_job_config(root)
+
+
+# --- amend -----------------------------------------------------------------------------------
+
+COUNTERS = (
+    "reviews_used",
+    "review_cycle_start",
+    "check_cycle_start",
+    "max_reviews",
+    "recoveries",
+)
+
+
+def amendable(tmp_path, **changes):
+    """A code job with work and review inputs, as the scan leaves it at a step."""
+    work, review = tmp_path / "w.txt", tmp_path / "r.txt"
+    work.write_text("work input", encoding="utf-8")
+    review.write_text("review input", encoding="utf-8")
+    jobs = Jobs(tmp_path / "root")
+    data = _code_payload(tmp_path, "amend:1", inputs={"work": [str(work)], "review": [str(review)]})
+    state = {
+        "attempt": 1,
+        "unit": "u",
+        "reviews_used": 1,
+        "review_cycle_start": 0,
+        "check_cycle_start": 0,
+        "recoveries": 2,
+        **changes,
+    }
+    job = replace(jobs.submit(data, 10), **state)
+    jobs.save(job, 11)
+    return jobs, job
+
+
+def new_file(tmp_path, name: str, text: str) -> str:
+    path = tmp_path / "new" / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def doc(tmp_path, *keys: str) -> dict:
+    """A document that changes each named key."""
+    make = {
+        "spec": lambda: new_file(tmp_path, "spec.md", VALID_SPEC + "\nAmended.\n"),
+        "intent": lambda: new_file(tmp_path, "intent.md", "Amended intent"),
+        "work": lambda: {"work": [new_file(tmp_path, "w.txt", "amended work")]},
+        "review": lambda: {"review": [new_file(tmp_path, "r.txt", "amended review")]},
+        "prompt": lambda: "Amended prompt",
+    }
+    document: dict = {}
+    for key in keys:
+        value = make[key]()
+        if key in {"work", "review"}:
+            document.setdefault("inputs", {}).update(value)
+        else:
+            document[key] = value
+    return document
+
+
+@pytest.mark.parametrize(
+    "stage,resume,keys,expected",
+    [
+        ("queued", "work", ("spec",), "queued"),
+        ("approval_wait", "work", ("spec",), "approval_wait"),
+        ("user_wait", "fix", ("spec",), "user_wait"),
+        ("work", "work", ("spec",), "work"),
+        ("fix", "fix", ("intent",), "fix"),
+        ("check", "check", ("spec",), "fix"),
+        ("check", "check", ("review",), "check"),
+        ("review", "review", ("prompt",), "fix"),
+        ("review", "review", ("review",), "check"),
+        ("land", "land", ("work",), "fix"),
+        ("land", "land", ("review",), "check"),
+    ],
+)
+def test_amend_routes_each_stage_and_never_writes_the_counters(
+    tmp_path, stage, resume, keys, expected
+):
+    jobs, job = amendable(tmp_path, stage=stage, resume_stage=resume, review_inflight=1)
+    amended = jobs.amend(job.id, doc(tmp_path, *keys), "plan changed", 50.0)
+    assert jobs.load()[job.id] == amended
+    assert amended.stage == expected
+    waiting = stage in {"queued", "approval_wait", "user_wait"}
+    if waiting:
+        assert (amended.resume_stage, amended.ended_at) == (job.resume_stage, job.ended_at)
+    else:
+        # Fenced: the closed attempt makes the runner stale, the scan stops the unit first.
+        assert (amended.resume_stage, amended.ended_at) == (expected, 50.0)
+        assert amended.unit == "u" and amended.attempt == 1
+    assert [getattr(amended, name) for name in COUNTERS] == [
+        getattr(job, name) for name in COUNTERS
+    ]
+    assert amended.review_inflight == (0 if stage == "review" else 1)
+    event = amended.events[-1]
+    assert (event["type"], event["seq"], event["reason"]) == ("amend", 1, "plan changed")
+    assert (event["stage_before"], event["stage_after"]) == (stage, expected)
+
+
+def test_amend_swaps_the_files_records_old_and_new_hashes_and_keeps_old_copies(tmp_path):
+    jobs, job = amendable(tmp_path, stage="queued")
+    amended = jobs.amend(job.id, doc(tmp_path, "spec", "work"), "new plan", 50.0)
+    assert amended.spec.endswith("inputs/spec-0.a1.txt") and amended.spec != job.spec
+    assert amended.inputs["work"] == (str(Path(job.spec).parent / "work-0.a1.txt"),)
+    assert amended.inputs["review"] == job.inputs["review"] and amended.intent == job.intent
+    # The old copies stay and keep their bytes; the manifest names exactly the current files.
+    assert Path(job.spec).read_text() == VALID_SPEC
+    assert Path(job.inputs["work"][0]).read_text() == "work input"
+    assert amended.input_hashes.keys() == {
+        amended.intent,
+        amended.spec,
+        *amended.inputs["work"],
+        *amended.inputs["review"],
+    }
+    jobs.verify_inputs(amended)
+    changes = amended.events[-1]["changes"]
+    assert changes["spec"]["old"] == job.input_hashes[job.spec]
+    assert changes["spec"]["new"] == amended.input_hashes[amended.spec]
+    assert set(changes) == {"spec", "inputs.work"}
+
+
+def test_a_second_amend_gets_seq_two_and_keeps_both_old_copies(tmp_path):
+    jobs, job = amendable(tmp_path, stage="queued")
+    first = jobs.amend(job.id, doc(tmp_path, "spec"), "one", 50.0)
+    new = new_file(tmp_path, "spec2.md", VALID_SPEC + "\nSecond.\n")
+    second = jobs.amend(job.id, {"spec": new}, "two", 60.0)
+    assert second.events[-1]["seq"] == 2 and second.spec.endswith("spec-0.a2.txt")
+    assert second.events[-1]["changes"]["spec"]["old"] == first.input_hashes[first.spec]
+    assert Path(job.spec).is_file() and Path(first.spec).is_file()
+    jobs.verify_inputs(second)
+
+
+def test_an_interrupted_amend_leaves_copies_that_the_next_amend_skips(tmp_path):
+    jobs, job = amendable(tmp_path, stage="queued")
+    (Path(job.spec).parent / "spec-0.a1.txt").write_text("left by a crash", encoding="utf-8")
+    amended = jobs.amend(job.id, doc(tmp_path, "spec"), "retry", 50.0)
+    assert amended.events[-1]["seq"] == 2 and amended.spec.endswith("spec-0.a2.txt")
+    assert (Path(job.spec).parent / "spec-0.a1.txt").read_text() == "left by a crash"
+
+
+def test_amend_replaces_the_prompt_and_an_input_role_without_touching_the_other(tmp_path):
+    jobs, job = amendable(tmp_path, stage="queued")
+    amended = jobs.amend(job.id, doc(tmp_path, "prompt", "review"), "reword", 50.0)
+    assert amended.prompt == "Amended prompt" and amended.inputs["work"] == job.inputs["work"]
+    assert amended.events[-1]["changes"]["prompt"] == {
+        "old": hashlib.sha256(job.prompt.encode()).hexdigest(),
+        "new": hashlib.sha256(b"Amended prompt").hexdigest(),
+    }
+    assert Path(amended.inputs["review"][0]).read_text() == "amended review"
+
+
+def test_amend_without_a_review_left_stops_and_never_extends_the_limit(tmp_path):
+    jobs, job = amendable(
+        tmp_path, stage="review", resume_stage="review", reviews_used=3, review_inflight=1
+    )
+    amended = jobs.amend(job.id, doc(tmp_path, "spec"), "late change", 50.0)
+    assert (amended.stage, amended.wait_reason) == ("user_wait", "amend_review_exhausted")
+    assert amended.resume_stage == "fix" and amended.ended_at == 50.0
+    assert "amendment 1" in amended.error and "all 3 reviews" in amended.error
+    assert (amended.reviews_used, amended.max_reviews) == (3, 3)
+    assert amended.spec != job.spec  # the inputs are swapped all the same
+    assert [e.get("reason") for e in amended.events if e["type"] == "user_wait"] == [
+        "amend_review_exhausted"
+    ]
+    # A step that needs no review is not stopped.
+    (tmp_path / "b").mkdir()
+    jobs, job = amendable(tmp_path / "b", stage="work", resume_stage="work", reviews_used=3)
+    assert jobs.amend(job.id, doc(tmp_path / "b", "spec"), "ok", 50.0).stage == "work"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "approval_scope",
+        "target",
+        "outputs",
+        "check_command",
+        "land",
+        "base",
+        "public_text",
+        "max_reviews",
+        "worker_role",
+    ],
+)
+def test_amend_refuses_a_scope_key_by_name_and_points_to_the_scope_commands(tmp_path, key):
+    jobs, job = amendable(tmp_path, stage="queued")
+    with pytest.raises(ValueError, match=rf"{key}.*`wait` and `approve --scope`"):
+        jobs.amend(job.id, {**doc(tmp_path, "spec"), key: "x"}, "no", 50.0)
+    assert jobs.load()[job.id] == job
+
+
+@pytest.mark.parametrize(
+    "document,error",
+    [({"receipt_key": "x"}, "receipt_key"), ({}, "amend needs"), (["spec"], "amend needs")],
+)
+def test_amend_refuses_unknown_keys_and_empty_documents(tmp_path, document, error):
+    jobs, job = amendable(tmp_path, stage="queued")
+    with pytest.raises(ValueError, match=error):
+        jobs.amend(job.id, document, "no", 50.0)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"stage": "deliver_pending"},
+        {"stage": "done"},
+        {"stage": "cancelled"},
+        {"stage": "land", "land_state": {"merge_intent": True}},
+        {"stage": "land", "land_state": {"S": "a" * 40}},
+        {"stage": "user_wait", "land_state": {"S": "a" * 40}},
+    ],
+)
+def test_amend_refuses_a_job_that_is_over_or_merging(tmp_path, changes):
+    jobs, job = amendable(tmp_path, **changes)
+    with pytest.raises(ValueError, match="new work|merge is already recorded"):
+        jobs.amend(job.id, doc(tmp_path, "spec"), "late", 50.0)
+    assert jobs.load()[job.id] == job
+
+
+def test_amend_runs_the_submit_validators_and_writes_nothing_on_a_refusal(tmp_path):
+    jobs, job = amendable(tmp_path, stage="queued")
+    folder = jobs.folder(job)
+    before = sorted((folder / "inputs").iterdir())
+    broken = new_file(tmp_path, "broken.md", "# Spec\n\nno headings\n")
+    for document, error in [
+        ({"spec": broken}, "spec-template"),
+        ({"prompt": "  "}, "prompt must be nonempty"),
+        ({"inputs": {"other": []}}, "work/review"),
+        ({"inputs": {"work": [str(tmp_path / "missing.txt")]}}, "No such file"),
+        ({"intent": str(Path(job.intent))}, "inside the job folder"),
+        ({"spec": str(tmp_path)}, "Is a directory"),
+    ]:
+        with pytest.raises((ValueError, OSError), match=error):
+            jobs.amend(job.id, document, "no", 50.0)
+    assert sorted((folder / "inputs").iterdir()) == before and jobs.load()[job.id] == job
+
+
+def test_amend_refuses_a_reason_that_is_blank_and_a_change_that_changes_nothing(tmp_path):
+    jobs, job = amendable(tmp_path, stage="queued")
+    with pytest.raises(ValueError, match="needs a reason"):
+        jobs.amend(job.id, doc(tmp_path, "spec"), "  ", 50.0)
+    same = new_file(tmp_path, "same.md", VALID_SPEC)
+    with pytest.raises(ValueError, match="changes nothing"):
+        jobs.amend(job.id, {"spec": same, "prompt": job.prompt}, "same", 50.0)
+    with pytest.raises(ValueError, match="unknown job"):
+        jobs.amend("0" * 32, doc(tmp_path, "spec"), "x", 50.0)
+
+
+def test_amend_predecessors_only_before_the_first_launch_and_without_a_cycle(tmp_path):
+    jobs = Jobs(tmp_path / "root")
+    first = jobs.submit(_code_payload(tmp_path, "msg-1:1"), 10)
+    second = jobs.submit(_code_payload(tmp_path, "msg-1:2", predecessors=["msg-1:1"]), 20)
+    third = jobs.submit(_code_payload(tmp_path, "msg-1:3"), 30)
+    changed = jobs.amend(third.id, {"predecessors": ["msg-1:1", second.id]}, "chain", 40.0)
+    assert changed.predecessors == (first.id, second.id)
+    assert list(changed.events[-1]["changes"]["predecessors"]["ids"]) == [first.id, second.id]
+    with pytest.raises(ValueError, match="wait for itself"):
+        jobs.amend(first.id, {"predecessors": [third.id]}, "loop", 50.0)
+    with pytest.raises(ValueError, match="unknown predecessors"):
+        jobs.amend(third.id, {"predecessors": ["nope"]}, "bad", 50.0)
+    started = replace(jobs.load()[second.id], attempt=1)
+    jobs.save(started, 60.0)
+    with pytest.raises(ValueError, match="before the job's first launch"):
+        jobs.amend(second.id, {"predecessors": []}, "late", 70.0)
+
+
+def test_amend_keeps_the_base_predecessor(tmp_path):
+    jobs = Jobs(tmp_path / "root")
+    first = jobs.submit(_code_payload(tmp_path, "msg-1:1"), 10)
+    second = jobs.submit(_code_payload(tmp_path, "msg-1:2", base="@msg-1:1"), 20)
+    assert second.base_predecessor == first.id
+    with pytest.raises(ValueError, match="base predecessor"):
+        jobs.amend(second.id, {"predecessors": []}, "drop", 30.0)
+
+
+def test_the_amend_command_prints_the_record_and_wakes_the_scan(tmp_path, capsys, no_real_wake):
+    jobs, job = amendable(tmp_path, stage="queued")
+    document = tmp_path / "amend.json"
+    document.write_text(json.dumps(doc(tmp_path, "intent")), encoding="utf-8")
+    argv = [
+        "--root",
+        str(jobs.state.root),
+        "amend",
+        job.id,
+        str(document),
+        "--reason",
+        "scope kept",
+    ]
+    assert main(argv) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["events"][-1]["type"] == "amend" and printed["intent"].endswith("a1.txt")
+    assert no_real_wake  # `amend` can relaunch a step, so the scan runs at once
+    document.write_text(json.dumps({"target": "/elsewhere"}), encoding="utf-8")
+    assert main(argv) == 1
+    assert "approve --scope" in capsys.readouterr().err

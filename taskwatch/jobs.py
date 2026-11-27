@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -580,6 +580,286 @@ class Jobs:
             if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
                 raise ValueError("copied input does not match its hash")
 
+    def amend(
+        self, job_id: str, document: object, reason: str, now: float | None = None
+    ) -> JobState:
+        """Change the approved plan of a job in place; see docs/configuration.md#amend.
+
+        The new files are versioned copies beside the old ones, `input_hashes` follows them and
+        one `amend` event records the change. The review and check counters are never written.
+        """
+        now = time.time() if now is None else now
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("amend needs a reason")
+        with self.state.lock():
+            existing = self.load()
+            job = existing.get(job_id)
+            if job is None:
+                raise ValueError(f"unknown job: {job_id}")
+            _amend_stage(job)
+            folder = self.folder(job)
+            keys = _amend_keys(document)
+            texts = _amend_texts(job, folder, keys)
+            prompt = _amend_prompt(job, keys)
+            predecessors = _amend_predecessors(job, keys, existing)
+            if not (texts or prompt is not None or predecessors is not None):
+                raise ValueError("the amendment changes nothing")
+            seq = _amend_seq(job, folder / "inputs")
+            written = _amend_write(folder / "inputs", seq, texts)
+            plan = _amend_apply(job, written, prompt, predecessors)
+            fence = _amend_fence(job, set(plan["changes"]), seq, now, reason)
+            event = {
+                "type": "amend",
+                "at": now,
+                "seq": seq,
+                "reason": reason,
+                "stage_before": job.stage,
+                "stage_after": fence["fields"].get("stage", job.stage),
+                "changes": plan["changes"],
+                **fence["event"],
+            }
+            events = [*job.events, event]
+            if fence["fields"].get("wait_reason"):
+                events.append(
+                    {"at": now, "type": "user_wait", "reason": fence["fields"]["wait_reason"]}
+                )
+            amended = replace(job, **plan["fields"], **fence["fields"], events=tuple(events))
+            self.save(amended, now)
+            return amended
+
+
+AMEND_KEYS = ("spec", "intent", "prompt", "inputs", "predecessors")
+# The approved scope: `wait` and `approve --scope` change it, `amend` never does.
+_AMEND_SCOPE = frozenset(
+    {
+        "approval_scope",
+        "target",
+        "outputs",
+        "check_command",
+        "land",
+        "base",
+        "public_text",
+        "max_reviews",
+        "worker_role",
+    }
+)
+_AMEND_STAGES = frozenset({"queued", "approval_wait", "work", "check", "review", "fix", "land"})
+# Changed keys that the worker's result depends on; a review input does not.
+_AMEND_WORK = frozenset({"spec", "intent", "prompt", "inputs.work"})
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _amend_stage(job: JobState) -> None:
+    if job.land_state.get("S") or job.land_state.get("merge_intent"):
+        raise ValueError("a merge is already recorded; a later change is new work")
+    if job.stage not in _AMEND_STAGES and job.stage != "user_wait":
+        raise ValueError(f"a job in {job.stage} cannot be amended; a later change is new work")
+
+
+def _amend_keys(document: object) -> dict:
+    if not isinstance(document, dict) or not document:
+        raise ValueError(f"amend needs a JSON object with some of: {', '.join(AMEND_KEYS)}")
+    refused = sorted(document.keys() & _AMEND_SCOPE)
+    if refused:
+        raise ValueError(
+            f"{', '.join(refused)} belongs to the approved scope and cannot be amended; "
+            "change the scope with `wait` and `approve --scope`"
+        )
+    unknown = sorted(document.keys() - set(AMEND_KEYS))
+    if unknown:
+        raise ValueError(
+            f"amend does not accept {', '.join(unknown)}; it takes {', '.join(AMEND_KEYS)}"
+        )
+    return document
+
+
+def _amend_source(folder: Path, source: object, label: str) -> bytes:
+    """The caller's file, read the way submit reads it, never one inside the job folder."""
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError(f"{label} must be a file path")
+    path = Path(source)
+    if path.resolve().is_relative_to(folder.resolve()):
+        raise ValueError(f"{label} must not be a file inside the job folder")
+    return path.read_bytes()
+
+
+def _role_paths(job: JobState, role: str) -> list[str]:
+    if role in {"intent", "spec"}:
+        return [getattr(job, role)]
+    return list(job.inputs.get(role, ()))
+
+
+def _amend_texts(job: JobState, folder: Path, keys: dict) -> dict[str, list[bytes]]:
+    """The contents that replace a role (`intent`, `spec`, `work`, `review`), validated; a role
+    whose content did not change is left out."""
+    texts = {
+        role: [_amend_source(folder, keys[role], role)]
+        for role in ("intent", "spec")
+        if role in keys
+    }
+    if "inputs" in keys:
+        inputs = keys["inputs"]
+        if not isinstance(inputs, dict) or not inputs or inputs.keys() - {"work", "review"}:
+            raise ValueError("inputs must map work/review to file lists")
+        for role, paths in inputs.items():
+            _strings(paths, role)
+            texts[role] = [_amend_source(folder, path, role) for path in paths]
+    if "spec" in texts and job.review in SPEC_REVIEWS and job.review_target is None:
+        _spec_template(texts["spec"][0].decode("utf-8"), job.spec_mode)
+    return {
+        role: blobs
+        for role, blobs in texts.items()
+        if [_sha(blob) for blob in blobs]
+        != [job.input_hashes[path] for path in _role_paths(job, role)]
+    }
+
+
+def _amend_prompt(job: JobState, keys: dict) -> str | None:
+    if "prompt" not in keys:
+        return None
+    if not isinstance(keys["prompt"], str) or not keys["prompt"].strip():
+        raise ValueError("prompt must be nonempty text")
+    return keys["prompt"] if keys["prompt"] != job.prompt else None
+
+
+def _amend_predecessors(
+    job: JobState, keys: dict, existing: Mapping[str, JobState]
+) -> list[str] | None:
+    """The resolved predecessor ids, only before the job's first launch."""
+    if "predecessors" not in keys:
+        return None
+    if job.attempt:
+        raise ValueError("predecessors can change only before the job's first launch")
+    _strings(keys["predecessors"], "predecessors")
+    data = {"predecessors": list(keys["predecessors"])}
+    _resolve_receipt_tokens(data, existing, DEFAULT_BRANCH_PREFIX)
+    resolved = data["predecessors"]
+    if job.base_predecessor and job.base_predecessor not in resolved:
+        raise ValueError(f"predecessors must keep the base predecessor {job.base_predecessor}")
+    if any(_depends_on(existing, ident, job.id) for ident in resolved):
+        raise ValueError("predecessors would make the job wait for itself")
+    return resolved if resolved != list(job.predecessors) else None
+
+
+def _depends_on(existing: Mapping[str, JobState], start: str, target: str) -> bool:
+    """Whether `start` is `target` or waits, through predecessors, for it."""
+    seen: set[str] = set()
+    pending = [start]
+    while pending:
+        ident = pending.pop()
+        if ident == target:
+            return True
+        if ident not in seen and ident in existing:
+            seen.add(ident)
+            pending.extend(existing[ident].predecessors)
+    return False
+
+
+def _amend_seq(job: JobState, directory: Path) -> int:
+    """One more than the amendments recorded, skipping a number an interrupted amend left files
+    for: the copies are written before the record."""
+    seq = 1 + sum(event.get("type") == "amend" for event in job.events)
+    while any(directory.glob(f"*.a{seq}.txt")):
+        seq += 1
+    return seq
+
+
+def _amend_write(directory: Path, seq: int, texts: dict[str, list[bytes]]) -> dict[str, list]:
+    """Versioned copies, O_EXCL and fsynced; the old copies stay."""
+    written: dict[str, list] = {}
+    for role, blobs in texts.items():
+        written[role] = []
+        for index, data in enumerate(blobs):
+            dest = directory / f"{role}-{index}.a{seq}.txt"
+            _create_new(dest, data, 0o600)
+            written[role].append((str(dest), _sha(data)))
+    return written
+
+
+def _amend_apply(job: JobState, written: dict, prompt: str | None, predecessors) -> dict:
+    """The record fields the new content changes, and one old and new sha256 per changed key."""
+    hashes = dict(job.input_hashes)
+    inputs = {role: list(paths) for role, paths in job.inputs.items()}
+    fields_: dict = {}
+    changes: dict = {}
+    for role, entries in written.items():
+        old_paths = _role_paths(job, role)
+        old = [hashes.pop(path) for path in old_paths]
+        new = [digest for _, digest in entries]
+        hashes.update(dict(entries))
+        if role in {"intent", "spec"}:
+            fields_[role] = entries[0][0]
+            changes[role] = {
+                "old": old[0],
+                "new": new[0],
+                "old_path": old_paths[0],
+                "new_path": entries[0][0],
+            }
+        else:
+            inputs[role] = [path for path, _ in entries]
+            changes[f"inputs.{role}"] = {
+                "old": _digest(old),
+                "new": _digest(new),
+                "paths": inputs[role],
+            }
+    if prompt is not None:
+        fields_["prompt"] = prompt
+        changes["prompt"] = {"old": _sha(job.prompt.encode()), "new": _sha(prompt.encode())}
+    if predecessors is not None:
+        fields_["predecessors"] = tuple(predecessors)
+        changes["predecessors"] = {
+            "old": _digest(list(job.predecessors)),
+            "new": _digest(predecessors),
+            "ids": predecessors,
+        }
+    return {"fields": {**fields_, "inputs": inputs, "input_hashes": hashes}, "changes": changes}
+
+
+def _amend_fence(job: JobState, changed: set[str], seq: int, now: float, reason: str) -> dict:
+    """Where an amended job goes. A step that is queued, waiting for approval or stopped keeps
+    its place. Any other step is fenced: `ended_at` closes its attempt for the runner's
+    compare-and-set and the scan stops its unit before the next launch, the path a step takes
+    when it hands over to the next one. Review counters are never touched, and a job that must go
+    back to `fix` or `check` with no review left stops instead of extending the limit."""
+    stage = job.stage
+    if stage in {"queued", "approval_wait", "user_wait"}:
+        return {"fields": {}, "event": {}}
+    event: dict = {}
+    land: dict = {}
+    published = False
+    if stage == "land":
+        from .job_land import amend_return, is_published
+
+        published = is_published(job.land_state)
+        state: dict = {}
+        if published:
+            state, record = amend_return(job.land_state, f"amended: {reason[:500]}")
+            event["return"] = {key: record[key] for key in ("reason", "pr", "round")}
+        land = {"land_state": state}
+    if job.review_target is not None:
+        target = "review"
+    elif stage in {"work", "fix"}:
+        target = stage
+    else:
+        target = "fix" if published or changed & _AMEND_WORK else "check"
+    route = {"stage": target, "resume_stage": target, "ended_at": now, **land}
+    if stage == "review":
+        route["review_inflight"] = 0
+    if target != "work" and job.reviews_used >= job.max_reviews:
+        route.update(
+            stage="user_wait",
+            wait_reason="amend_review_exhausted",
+            error=(
+                f"amendment {seq} sends the job back to {target}, but all {job.max_reviews} "
+                "reviews of this cycle are spent; the limit is not extended. Resume to open a new "
+                "review cycle"
+            ),
+        )
+    return {"fields": route, "event": event}
+
 
 def _strings(value: object, label: str, *, nonempty: bool = False) -> None:
     if not isinstance(value, list) or (nonempty and not value):
@@ -681,8 +961,8 @@ def spec_problems(text: str, mode: str = "full") -> list[str]:
     return problems
 
 
-def _spec_template(spec: str, mode: str) -> None:
-    problems = spec_problems(Path(spec).read_text(encoding="utf-8"), mode)
+def _spec_template(text: str, mode: str) -> None:
+    problems = spec_problems(text, mode)
     if problems:
         raise ValueError(f"the spec does not follow docs/spec-template.md: {'; '.join(problems)}")
 
@@ -763,7 +1043,7 @@ def _submission(payload: dict) -> dict:
     else:
         _work_fields(data)
         if data["review"] in SPEC_REVIEWS:
-            _spec_template(data["spec"], data["spec_mode"])
+            _spec_template(Path(data["spec"]).read_text(encoding="utf-8"), data["spec_mode"])
     if "base" in data:
         _base_field(data, review_only)
     if "public_text" in data:

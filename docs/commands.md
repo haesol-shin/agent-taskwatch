@@ -9,7 +9,7 @@ Unless a command says otherwise, it exits `0` on success and `1` when an error i
 | Group | Commands |
 |---|---|
 | First use: submit and inspect | [`init`](#init), [`submit`](#submit), [`show`](#show), [`brief`](#brief) |
-| Attention and decisions | [`needs`](#needs), [`cancel`](#cancel-wait-approve-and-resume), [`wait`](#cancel-wait-approve-and-resume), [`approve`](#cancel-wait-approve-and-resume), [`resume`](#cancel-wait-approve-and-resume) |
+| Attention and decisions | [`needs`](#needs), [`cancel`](#cancel-wait-approve-and-resume), [`wait`](#cancel-wait-approve-and-resume), [`approve`](#cancel-wait-approve-and-resume), [`resume`](#cancel-wait-approve-and-resume), [`amend`](#amend) |
 | Result checking and publication text | [`check`](#check), [`text`](#text) |
 | Operator scheduling | [`scan`](#scan), [`run`](#run) |
 
@@ -59,6 +59,12 @@ Each of these four takes the job id and a required `--reason <text>`, rewrites t
 - `taskwatch --root <root> resume <job> --reason <text>` restores a job that is in `user_wait`: it opens a new review cycle at the saved stage and keeps every record. After a root-cause stop it needs a changed, complete note; see [finding records and repeated rules](checks.md#finding-records-and-repeated-rules).
 
 A stage the command refuses is an error, exit `1`, and the record is unchanged. `approve` and `resume` wake a scan; `cancel` and `wait` do not. The choices behind each wait are in [Recovery and decisions](configuration.md#recovery-and-decisions) and [Chains and gates](configuration.md#chains-and-gates).
+
+### amend
+
+`taskwatch --root <root> amend <job> <file> --reason <text>` changes the approved plan of an unfinished job in place: the job keeps its id, its history and its review counts. `<file>` is a JSON object in the submit shape with at least one of `spec`, `intent`, `prompt`, `inputs` (a `work` or `review` file list that replaces that role) and `predecessors` (only before the job's first launch). Paths in it are read the way `submit` reads them, relative to the current folder, and may not lie inside the job's own folder. Every other key is refused by name; the approved scope (`approval_scope`, `target`, `outputs`, `check_command`, `land`, `base`, `public_text`, `max_reviews`, `worker_role`) changes only through `wait` and `approve --scope`.
+
+The command runs the submit checks again on the new values, stores each changed file as a new versioned copy beside the old one, records one `amend` event and prints the new record. A step that is running or already ended is stopped and goes back to the stage the amendment needs; the stage table, the review count rule and the refused stages are in [Amend](configuration.md#amend). `amend` wakes a scan. Exit `1` with the record unchanged when the document, a file or the stage is refused, or when the amendment changes nothing.
 
 ## Result checking and publication text
 
