@@ -24,6 +24,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 - A code review judges the design first, with named dimensions for complexity, data lifetime, failure modes, performance, test validity and extensibility, reads every implementation of a changed port, treats a data lifetime, persistence or concurrency violation on a realistic path as P1, and runs or reproduces the restart, cancel and streaming paths the change adds ([review](docs/review/code.md), [severity](docs/review/common.md)).
 
 ### Fixed
+- A fix message includes every pending review, check and CI failure, even when the approved plan was amended or a newer failure was recorded.
 - Ignored files no longer keep a finished job's worktree once its declared outputs are safe ([cleanup](docs/configuration.md#code-job-work-folders)).
 - After a land unit exits, CI fixes no longer hold up other jobs landing in the same repository; the fixed job queues again and keeps its branch and pull request ([landing](docs/configuration.md#automatic-landing)).
 - A fix adopted after a base update is checked on a commit that carries the unit's written title and body, so a repository check of commit messages no longer stops the job as `land_base_update_failed` ([base update](docs/configuration.md#base-update)).
