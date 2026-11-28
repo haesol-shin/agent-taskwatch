@@ -523,8 +523,11 @@ Work inputs:
   `{ctx.folder / job_findings.FINDINGS_FILE}` before you finish, as the fix message shows.
   A finding the review marks as a repeat also needs a section in
   `{ctx.folder / job_findings.NOTE_FILE}`.
-- While working, run only the tests that cover what you changed. The check command runs once
-  for the committed result: the End command with `--run-command` is that run, and a passing one
+- While working, run only the tests that cover what you changed. Do not run the whole test
+  suite or the job's check command yourself while working. Do not put a short timeout on a
+  test or check run: a slow host is not a failure, and a cut-off run is lost and restarts from
+  the beginning; with the omp bash tool pass `timeout: 0`. The check command runs once for the
+  committed result, through the End command with `--run-command` and no timeout: a passing one
   is reused instead of run again while the result, intent, spec and guidelines do not change.
   Otherwise the check step runs it and keeps the output as the evidence.
 {card_language}- If you delegate to subagents, wait until each one finished.
@@ -601,10 +604,14 @@ def _agent_message(ctx: Ctx, resumed: bool) -> str:
         lines += [f"Brief file: {ctx.folder / 'brief.md'}"]
         lines += [
             "",
-            "While you work, run only the tests that cover what you changed. The check command",
-            "runs once for the committed result: a passing `check --run-command` is that run, and",
-            "the check step reuses it instead of running the command again. Do not run the check",
-            "command a second time.",
+            "While you work, run only the tests that cover what you changed. Do not run the whole",
+            "test suite or the job's check command yourself while working. Do not put a short",
+            "timeout on a test or check run: a slow host is not a failure, and a cut-off run is",
+            "lost and restarts from the beginning; with the omp bash tool pass `timeout: 0`. The",
+            "check command runs once for the committed result, through the End",
+            "`check <job> --run-command` with no timeout: a passing one is that run, and the check",
+            "step reuses it instead of running the command again. Do not run the check command a",
+            "second time.",
         ]
     for path in job.inputs.get("work", []):
         lines.append(f"Work input: {path}")

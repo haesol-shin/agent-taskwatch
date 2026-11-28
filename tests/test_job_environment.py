@@ -128,7 +128,12 @@ def test_workflow_tells_the_worker_to_run_changed_tests_and_the_check_command_on
     text = (env.folder() / "WORKFLOW.md").read_text(encoding="utf-8")
     working, end = text.split("## While working")[1].split("## End")
     assert "only the tests that cover what you changed" in working
-    assert "check command runs once" in working and "--run-command" in working
+    flat = " ".join(working.split())
+    assert "Do not run the whole test suite or the job's check command yourself" in flat
+    assert "Do not put a short timeout on a test or check run" in flat
+    assert "restarts from the beginning" in flat and "`timeout: 0`" in flat
+    assert "check command runs once for the committed result, through the End" in flat
+    assert "`--run-command` and no timeout" in flat
     assert "--run-command" in end
 
 
@@ -145,7 +150,11 @@ def test_work_and_fix_messages_run_only_changed_tests(tmp_path, monkeypatch):
     for message in (work, fix):
         flat = " ".join(message.split())
         assert "run only the tests that cover what you changed" in flat
-        assert "The check command runs once for the committed result" in flat
+        assert "Do not run the whole test suite or the job's check command yourself" in flat
+        assert "Do not put a short timeout on a test or check run" in flat
+        assert "restarts from the beginning" in flat and "`timeout: 0`" in flat
+        assert "The check command runs once for the committed result, through the End" in flat
+        assert "`check <job> --run-command` with no timeout" in flat
         assert "Do not run the check command a second time." in flat
 
 

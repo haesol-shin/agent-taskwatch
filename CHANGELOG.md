@@ -5,6 +5,7 @@ All notable changes to agent-taskwatch are documented here. The format is based 
 ## [Unreleased]
 
 ### Changed
+- `WORKFLOW.md` and the work and fix messages tell the worker not to run the whole suite or the check command while working and not to put a short timeout on a test run, so a slow host no longer cuts off a run and restarts the check ([configuration](docs/configuration.md#checking-a-result-before-it-ends)).
 - Full code re-reviews read the whole result but apply later-round rules. P0 still blocks in both modes, and an unreadable review history does not hide a readable delta. Only a P0 in the last review triggers a full read on severity alone, and repeats trigger a same-cause sweep rather than forcing a full review. First reviews report all known findings that meet the bar. Fixes and reviews carry owner resume notes and mark excerpts that need verification ([re-review scope](docs/checks.md#re-review-scope)).
 - Jobs awaiting their first successful start wait below 10 GiB free, dead runs park below 2 GiB, and failed disk probes defer starts or recovery without spending recovery budget ([configuration](docs/configuration.md#recovery-and-decisions)).
 - A job now has a total check budget (`max_checks`, default 8) for the check steps of its current review cycle: a pass does not reset it, and the run that reaches it stops at `user_wait/check_budget_exhausted` with the used and allowed counts until the owner resumes ([check budget](docs/configuration.md#check-budget)).
